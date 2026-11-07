@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# agentvm-fetch — download every blob of an OCI image, resumably and verifiably.
+#
+# The interesting problem: registries hand out a short-lived anonymous token,
+# and blobs redirect to a CDN that some networks throttle to kilobytes per
+# second. So this script is built around interruption:
+#
+#   * one file per digest under blobs/sha256/, so a partial download resumes
+#   * tokens are refreshed on 401/403 rather than aborting the whole run
+#   * every object is size-checked, and `--verify` additionally re-hashes each
+#     file and compares it to its own digest (content addressing means a
+#     matching hash *is* proof the bytes are intact)
+#
+# Usage:
+#   agentvm-fetch [--repo REPO] [--tag TAG] [--dest DIR] [--verify] [--concurrency N]
+#
+# Defaults come from scripts/lib/common.sh (IMAGE_REPO / IMAGE_TAG).
+
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+. "$HERE/../lib/common.sh"
+
+REPO="${IMAGE_REPO}"
+TAG="${IMAGE_TAG}"
+DEST="$AGENTVM_HOME/image"
+VERIFY=0
+CONCURRENCY=4
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO="$2"; shift 2 ;;
+    --tag) TAG="$2"; shift 2 ;;
+    --dest) DEST="$2"; shift 2 ;;
+    --verify) VERIFY=1; shift ;;
+    --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+need_cmd curl
+need_cmd python3
+
+BLOBS="$DEST/blobs/sha256"
+mkdir -p "$BLOBS"
+
+# ghcr.io wants a scope-scoped token; other registries may not need one at all.
+get_token() {
+  curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" 2>/dev/null \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true
+}
+
+TOKEN="$(get_token)"
+[ -n "$TOKEN" ] || warn "could not get an anonymous token; trying unauthenticated"
+
+# Registry host is whatever the repo's first path segment says.
+REG_HOST="${REPO%%/*}"
+if [ "$REG_HOST" = "$REPO" ]; then
+  die "IMAGE_REPO must look like <host>/<path>, got: $REPO"
+fi
+REPO_PATH="${REPO#*/}"
+
+ACCEPTS=(
+  "application/vnd.oci.image.manifest.v1+json"
+  "application/vnd.oci.image.index.v1+json"
+  "application/vnd.docker.distribution.manifest.v2+json"
+  "application/vnd.docker.distribution.manifest.list.v2+json"
+)
+
+info "fetching manifest for $REPO:$TAG"
+MANIFEST=""
+for acc in "${ACCEPTS[@]}"; do
+  body="$(curl -fsS -H "Authorization: Bearer $TOKEN" -H "Accept: $acc" \
+            "https://$REG_HOST/v2/$REPO_PATH/manifests/$TAG" 2>/dev/null || true)"
+  if printf '%s' "$body" | grep -q '"layers"\|"manifests"'; then MANIFEST="$body"; break; fi
+done
+[ -n "$MANIFEST" ] || die "could not fetch manifest from $REG_HOST for $REPO:$TAG"
+
+printf '%s' "$MANIFEST" > "$DEST/manifest.json"
+
+# If it's a multi-arch index, resolve the arm64 child manifest.
+if printf '%s' "$MANIFEST" | python3 -c 'import sys,json; sys.exit(0 if "manifests" in json.load(sys.stdin) else 1)'; then
+  info "manifest is an index; resolving linux/arm64"
+  CHILD="$(printf '%s' "$MANIFEST" | python3 -c '
+import sys, json
+idx = json.load(sys.stdin)
+for m in idx.get("manifests", []):
+    p = m.get("platform") or {}
+    if p.get("architecture") == "arm64" and p.get("os") == "linux":
+        print(m["digest"]); break
+')"
+  [ -n "$CHILD" ] || die "no linux/arm64 entry in the index"
+  MANIFEST="$(curl -fsS -H "Authorization: Bearer $TOKEN" \
+      -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+      "https://$REG_HOST/v2/$REPO_PATH/manifests/$CHILD")"
+  printf '%s' "$MANIFEST" > "$DEST/manifest.json"
+  ok "resolved to $CHILD"
+fi
+
+# Emit "TYPE DIGEST SIZE" lines. Duplicate digests collapse: a 3 MB layer that
+# appears 12 times in the manifest is one file on disk, not twelve.
+printf '%s' "$MANIFEST" | python3 -c '
+import sys, json
+m = json.load(sys.stdin)
+seen = set()
+out = [("CONFIG", m["config"]["digest"].removeprefix("sha256:"), m["config"]["size"])]
+for l in m["layers"]:
+    d = l["digest"].removeprefix("sha256:")
+    if d not in seen:
+        seen.add(d)
+        out.append(("LAYER", d, l["size"]))
+for t, d, s in out:
+    print(t, d, s)
+' > "$DEST/blobs.txt"
+
+TOTAL_BYTES="$(awk '{s+=$3} END{print s+0}' "$DEST/blobs.txt")"
+UNIQ="$(wc -l < "$DEST/blobs.txt" | tr -d ' ')"
+info "$UNIQ unique objects, $(bytes_human "$TOTAL_BYTES") total"
+
+# Download one object. Returns 2 on auth failure so the caller can refresh.
+fetch_one() {
+  local digest="$1" want="$2" out="$BLOBS/$1"
+  local have=0
+  [ -f "$out" ] && have="$(stat -f%z "$out" 2>/dev/null || echo 0)"
+
+  if [ "$have" -eq "$want" ]; then
+    [ "$VERIFY" -eq 1 ] || return 0
+  elif [ "$have" -gt "$want" ]; then
+    warn "$digest is larger than expected ($have > $want); re-downloading"
+    rm -f "$out"; have=0
+  fi
+
+  local code
+  code="$(curl -sL -C - \
+      -H "Authorization: Bearer $TOKEN" \
+      --connect-timeout 20 --max-time 86400 \
+      --retry 5 --retry-delay 3 --retry-all-errors \
+      -o "$out" -w '%{http_code}' \
+      "https://$REG_HOST/v2/$REPO_PATH/blobs/sha256:$digest" || echo 000)"
+
+  case "$code" in
+    200|206|416) ;;
+    401|403) return 2 ;;
+    *) warn "download of $digest failed (HTTP $code); rerun to resume"; return 1 ;;
+  esac
+
+  have="$(stat -f%z "$out" 2>/dev/null || echo 0)"
+  [ "$have" -eq "$want" ] || { warn "size mismatch for $digest: $have != $want"; return 1; }
+
+  if [ "$VERIFY" -eq 1 ]; then
+    local got
+    got="$(shasum -a 256 "$out" | cut -d' ' -f1)"
+    [ "$got" = "$digest" ] || { warn "hash mismatch for $digest"; return 1; }
+  fi
+  return 0
+}
+
+done_count=0
+while read -r kind digest size; do
+  [ -n "${digest:-}" ] || continue
+  if fetch_one "$digest" "$size"; then
+    done_count=$((done_count + 1))
+  else
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+      info "token expired; refreshing"
+      TOKEN="$(get_token)"
+      fetch_one "$digest" "$size" || die "still failing on $digest after token refresh"
+      done_count=$((done_count + 1))
+    else
+      die "fetch failed on $digest — rerun this script to resume"
+    fi
+  fi
+done < "$DEST/blobs.txt"
+
+ok "fetched $done_count/$UNIQ objects into $DEST"
+
+if [ "$VERIFY" -eq 1 ]; then
+  bad=0
+  while read -r _ digest _; do
+    [ -n "${digest:-}" ] || continue
+    got="$(shasum -a 256 "$BLOBS/$digest" | cut -d' ' -f1)"
+    [ "$got" = "$digest" ] || { echo "  MISMATCH $digest"; bad=$((bad+1)); }
+  done < "$DEST/blobs.txt"
+  [ "$bad" -eq 0 ] && ok "all $(bytes_human "$TOTAL_BYTES") verified against their digests" \
+                    || die "$bad object(s) failed verification"
+else
+  info "skipping content verification (pass --verify to hash every blob)"
+fi
+
+info "next: agentvm-serve, then 'tart clone 127.0.0.1:${LOCAL_REGISTRY_PORT}/${LOCAL_REPO_NAME}:latest $VM_NAME --insecure'"

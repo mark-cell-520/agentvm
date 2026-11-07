@@ -1,0 +1,25 @@
+# secrets and local state — never commit these
+.agentvmrc
+*.key
+*.pem
+*secret*
+.env
+.env.*
+!.env.template
+image/
+*.ipsw
+*.tar.gz
+*.tar
+.DS_Store
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,28 @@
+# agentvm configuration — copy to .agentvmrc and edit.
+# Every value here can also be set as an environment variable.
+
+# --- VM -------------------------------------------------------------------
+VM_NAME=agent
+VM_CPU=2                    # Tart official images need >= 2
+VM_MEMORY_MB=1024           # 1 GiB is enough for a CLI agent; browser tools want more
+VM_DISK_GB=10               # logical target only — see docs/PITFALLS.md
+
+# --- image ----------------------------------------------------------------
+IMAGE_REPO=ghcr.io/cirruslabs/debian
+IMAGE_TAG=latest
+LOCAL_REGISTRY_PORT=5000
+LOCAL_REPO_NAME=debian
+
+# --- paths ----------------------------------------------------------------
+AGENTVM_HOME=$HOME/.agentvm
+TART_BIN=$HOME/.local/bin/tart
+
+# --- guest provisioning ---------------------------------------------------
+AGENTVM_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian/
+AGENTVM_APT_SEC_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian-security/
+
+# --- LLM (used by 50-configure.sh) ---------------------------------------
+# Base URL and model name for an OpenAI-compatible endpoint.
+# LLM_MODEL=MiniMax-M3.1-Flash
+# AGENTVM_LLM_BASE_URL is passed on the command line instead of here, because
+# it is not a secret and you will want to change it per provider.
