@@ -20,17 +20,15 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
-. "$HERE/../lib/common.sh"
+. "$HERE/lib/common.sh"
 
 [ -x "$TART_BIN" ] || die "tart not found at $TART_BIN"
 
-ENV_TEMPLATE="$HERE/../config/env.template"
+# ENV_TEMPLATE 原来在这儿赋值之后再没被引用过——死代码。真正在用的是
+# scripts/lib/patch-agent-config.py。
 CONFIG_PATCH="$HERE/../lib/patch-agent-config.py"
 
-usage() {
-  sed -n '2,26p' "$0"
-  exit "${1:-0}"
-}
+# usage 由 lib/common.sh 提供（打到第一个非注释行为止），这里不重复定义。
 
 LLM_KEY_FILE=""
 LLM_BASE_URL=""
@@ -94,14 +92,24 @@ fi
 # --------------------------------------------------------------- apply -------
 # The guest-side patch script reads /tmp/.llmkey and /tmp/.fssecret, so the
 # secrets never appear in any command line on either side.
+#
+# 非机密的那几个值（URL、模型名、app id、domain）也要先转义再插值。原来
+# `<<EOF` 不加引号，`${LLM_BASE_URL}` 原样进客人机脚本：URL 里带一个双引号
+# 就能在客人机里执行任意命令（`--llm-base-url 'http://x"; touch /tmp/pwn;
+# echo "'`），普通值里的 `$` 和反引号也会被宿主机先展开一遍，报错指不回真因。
+# printf %q 产出的串可以安全地再被 shell 解析一次，这是最短的正确做法。
 info "applying configuration inside guest"
+Q_BASE_URL="$(printf '%q' "$LLM_BASE_URL")"
+Q_MODEL="$(printf '%q' "$LLM_MODEL")"
+Q_APP_ID="$(printf '%q' "$FEISHU_APP_ID")"
+Q_DOMAIN="$(printf '%q' "$FEISHU_DOMAIN")"
 "$TART_BIN" exec "$VM_NAME" sh -s <<EOF
 set -eu
-export AGENTVM_LLM_BASE_URL="${LLM_BASE_URL}"
-export AGENTVM_LLM_MODEL="${LLM_MODEL}"
-export AGENTVM_FEISHU_APP_ID="${FEISHU_APP_ID}"
-export AGENTVM_FEISHU_DOMAIN="${FEISHU_DOMAIN}"
-export AGENTVM_YOLO="${YOLO}"
+export AGENTVM_LLM_BASE_URL=$Q_BASE_URL
+export AGENTVM_LLM_MODEL=$Q_MODEL
+export AGENTVM_FEISHU_APP_ID=$Q_APP_ID
+export AGENTVM_FEISHU_DOMAIN=$Q_DOMAIN
+export AGENTVM_YOLO=${YOLO}
 $(cat "$CONFIG_PATCH")
 EOF
 

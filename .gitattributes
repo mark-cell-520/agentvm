@@ -1,0 +1,16 @@
+# 换行符：bash 脚本在任何平台上都必须是 LF。
+# Windows 上经 Git Bash 运行 CRLF 的脚本会报 "bad interpreter"，
+# 且报错完全不提换行，所以在这里强制，不靠用户记得配。
+*.sh text eol=lf
+
+# Python 与配置统一 LF，避免 Windows 上出现 CRLF 引发的解析差异
+*.py text eol=lf
+*.md text eol=lf
+*.template text eol=lf
+*.example text eol=lf
+.agentvmrc text eol=lf
+
+# 二进制不过滤
+*.png binary
+*.jpg binary
+*.ico binary

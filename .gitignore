@@ -18,8 +18,17 @@ __pycache__/
 .venv/
 venv/
 
+# 构建产物。AgentVM.app 由 app/build.sh 现编，装的时候 install.sh 也会编，
+# 二进制不进仓库——860 KB 的可执行文件在 git 里只会带来「改动看不出改了什么」
+# 的问题，而重新编一次只要十几秒。
+AgentVM.app/
+
 # editors
 *.swp
 *~
 .idea/
 .vscode/
+
+# 排障时的截图和中间产物。76 MB 的 png 进 git 只会让仓库永远这么大，
+# 而它们对任何人都没有复用价值。
+.tmp/

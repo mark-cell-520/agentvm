@@ -19,7 +19,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
-. "$HERE/../lib/common.sh"
+. "$HERE/lib/common.sh"
 
 REPO="${IMAGE_REPO}"
 TAG="${IMAGE_TAG}"
@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --dest) DEST="$2"; shift 2 ;;
     --verify) VERIFY=1; shift ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -45,21 +45,44 @@ need_cmd python3
 BLOBS="$DEST/blobs/sha256"
 mkdir -p "$BLOBS"
 
-# ghcr.io wants a scope-scoped token; other registries may not need one at all.
-get_token() {
-  curl -fsS "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" 2>/dev/null \
-    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' || true
-}
-
-TOKEN="$(get_token)"
-[ -n "$TOKEN" ] || warn "could not get an anonymous token; trying unauthenticated"
-
 # Registry host is whatever the repo's first path segment says.
+# 必须在第一次 get_token 之前算出来：token 端点是由主机名推的，原来这段写在
+# get_token 调用后面，第一次取 token 时 REG_HOST 还是空的。
 REG_HOST="${REPO%%/*}"
 if [ "$REG_HOST" = "$REPO" ]; then
   die "IMAGE_REPO must look like <host>/<path>, got: $REPO"
 fi
 REPO_PATH="${REPO#*/}"
+
+# token 端点按 registry 主机推。原来写死 ghcr.io：`--repo docker.io/library/debian`
+# 时 token 请求打到 ghcr.io、而 scope 是 docker.io 的仓库，服务端返回空，脚本只
+# warn 一句「could not get an anonymous token」，随后所有请求无鉴权，到 manifest
+# 阶段才 die「could not fetch manifest」——报错离真实原因（端点写死）非常远。
+token_endpoint() {
+  case "$REG_HOST" in
+    ghcr.io)
+      echo "https://ghcr.io/token?service=ghcr.io" ;;
+    docker.io|index.docker.io|registry-1.docker.io)
+      echo "https://auth.docker.io/token?service=registry.docker.io" ;;
+    *)
+      echo "https://$REG_HOST/token?service=$REG_HOST" ;;
+  esac
+}
+
+# JSON 一律交给 python3 解析。原来用 sed -n 's/.*"token":"\([^"]*\)".*/\1/p'：
+# 服务端一旦在冒号后加个空格就取不到值，而失败表现是「token 为空」而不是
+# 「解析失败」，根本指不回真因。脚本本来就 need_cmd python3。
+get_token() {
+  curl -fsS "$(token_endpoint)&scope=repository:${REPO}:pull" 2>/dev/null \
+    | python3 -c 'import sys, json
+try:
+    sys.stdout.write(json.load(sys.stdin).get("token") or "")
+except Exception:
+    pass' || true
+}
+
+TOKEN="$(get_token)"
+[ -n "$TOKEN" ] || warn "could not get an anonymous token from $(token_endpoint); trying unauthenticated"
 
 ACCEPTS=(
   "application/vnd.oci.image.manifest.v1+json"
@@ -100,13 +123,18 @@ fi
 
 # Emit "TYPE DIGEST SIZE" lines. Duplicate digests collapse: a 3 MB layer that
 # appears 12 times in the manifest is one file on disk, not twelve.
+# removeprefix 要 Python 3.9+。macOS 自带那个刚好够，但 PATH 前面的
+# ~/.local/bin 里可能是 3.8（Makefile 就把 ~/.local/bin 放到最前），那时会在
+# manifest 解析阶段直接 AttributeError。改成 startswith 判断，3.6 就能跑。
 printf '%s' "$MANIFEST" | python3 -c '
 import sys, json
 m = json.load(sys.stdin)
+def hexdigest(d):
+    return d[7:] if d.startswith("sha256:") else d
 seen = set()
-out = [("CONFIG", m["config"]["digest"].removeprefix("sha256:"), m["config"]["size"])]
+out = [("CONFIG", hexdigest(m["config"]["digest"]), m["config"]["size"])]
 for l in m["layers"]:
-    d = l["digest"].removeprefix("sha256:")
+    d = hexdigest(l["digest"])
     if d not in seen:
         seen.add(d)
         out.append(("LAYER", d, l["size"]))
@@ -119,10 +147,17 @@ UNIQ="$(wc -l < "$DEST/blobs.txt" | tr -d ' ')"
 info "$UNIQ unique objects, $(bytes_human "$TOTAL_BYTES") total"
 
 # Download one object. Returns 2 on auth failure so the caller can refresh.
+# stat 用 `stat -c%s`（GNU）优先，失败再退 BSD 的 `stat -f%z`。原来只写 BSD 版：
+# 在 Linux 上 -f%z 不是文件大小，会落 `|| echo 0`，于是每次都重新下——表现是
+# 「断点续传根本没用」。
+file_size() {
+  stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
 fetch_one() {
   local digest="$1" want="$2" out="$BLOBS/$1"
   local have=0
-  [ -f "$out" ] && have="$(stat -f%z "$out" 2>/dev/null || echo 0)"
+  [ -f "$out" ] && have="$(file_size "$out")"
 
   if [ "$have" -eq "$want" ]; then
     [ "$VERIFY" -eq 1 ] || return 0
@@ -142,10 +177,16 @@ fetch_one() {
   case "$code" in
     200|206|416) ;;
     401|403) return 2 ;;
+    # 404/403 之外，curl 的 33 是「服务器不接受 Range」——重跑还是一样，因为
+    # .part 里已经有内容、还是会带 -C -。原来笼统提示 rerun，用户会无限重跑
+    # 同一个必然失败的尝试。
+    33) warn "server refuses Range for $digest (curl 33)"
+        rm -f "$out"
+        die "删掉了 $out，重跑本脚本重新下（不带续传）" ;;
     *) warn "download of $digest failed (HTTP $code); rerun to resume"; return 1 ;;
   esac
 
-  have="$(stat -f%z "$out" 2>/dev/null || echo 0)"
+  have="$(file_size "$out")"
   [ "$have" -eq "$want" ] || { warn "size mismatch for $digest: $have != $want"; return 1; }
 
   if [ "$VERIFY" -eq 1 ]; then
@@ -180,8 +221,15 @@ if [ "$VERIFY" -eq 1 ]; then
   bad=0
   while read -r _ digest _; do
     [ -n "${digest:-}" ] || continue
+    # 先看文件在不在。原来直接 shasum，文件缺失时在 pipefail 下会让脚本提前退出，
+    # 打出来的不是预期的 MISMATCH 清单。
+    if [ ! -f "$BLOBS/$digest" ]; then
+      echo "  MISSING $digest"
+      bad=$((bad + 1))
+      continue
+    fi
     got="$(shasum -a 256 "$BLOBS/$digest" | cut -d' ' -f1)"
-    [ "$got" = "$digest" ] || { echo "  MISMATCH $digest"; bad=$((bad+1)); }
+    [ "$got" = "$digest" ] || { echo "  MISMATCH $digest"; bad=$((bad + 1)); }
   done < "$DEST/blobs.txt"
   [ "$bad" -eq 0 ] && ok "all $(bytes_human "$TOTAL_BYTES") verified against their digests" \
                     || die "$bad object(s) failed verification"

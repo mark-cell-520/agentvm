@@ -12,7 +12,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
-. "$HERE/../lib/common.sh"
+. "$HERE/lib/common.sh"
 
 PREFIX="${AGENTVM_PREFIX:-$HOME/.local}"
 APPDIR="${AGENTVM_APPDIR:-$HOME/Applications}"
@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --appdir) APPDIR="$2"; shift 2 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -111,4 +111,16 @@ case ":$PATH:" in
   *) warn "add $PREFIX/bin to your PATH, or call $PREFIX/bin/tart directly" ;;
 esac
 
-"$PREFIX/bin/tart" --version && ok "Tart installed"
+# 原来写 `tart --version && ok "Tart installed"`。签名损坏时 tart 被 macOS
+# SIGKILL（退出码 137），&& 短路，set -e 让脚本以 137 静默结束——上一行才刚刚
+# warn 过「bundle signature could not be verified」，用户却只看到安装脚本莫名失败，
+# 没有任何指向签名的诊断。
+if "$PREFIX/bin/tart" --version; then
+  ok "Tart installed"
+else
+  rc=$?
+  die "tart 装好了但跑不起来（退出码 $rc）。通常是签名/重定位问题："
+      "    xattr -dr com.apple.quarantine '$APPDIR/tart.app'"
+      "    codesign --force --deep -s - '$APPDIR/tart.app'"
+      "  详见 docs/WINDOWS-ARM-ON-MACOS.md 的「改完必须重签」。"
+fi

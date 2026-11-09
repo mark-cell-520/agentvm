@@ -7,7 +7,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
-. "$HERE/../lib/common.sh"
+. "$HERE/lib/common.sh"
 
 fail=0
 chk() { # chk <description> <command...>

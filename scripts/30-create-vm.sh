@@ -17,7 +17,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
-. "$HERE/../lib/common.sh"
+. "$HERE/lib/common.sh"
 
 PORT="${LOCAL_REGISTRY_PORT}"
 SOURCE="127.0.0.1:${PORT}/${LOCAL_REPO_NAME}:latest"
@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
     --memory) VM_MEMORY_MB="$2"; shift 2 ;;
     --port) PORT="$2"; SOURCE="127.0.0.1:${PORT}/${LOCAL_REPO_NAME}:latest"; shift 2 ;;
     --from) SOURCE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -43,7 +43,11 @@ if ! curl -fsS "http://127.0.0.1:${PORT}/v2/" >/dev/null 2>&1; then
 fi
 ok "registry reachable on 127.0.0.1:${PORT}"
 
-if "$TART_BIN" list 2>/dev/null | awk '{print $2}' | grep -qx "$VM_NAME"; then
+# tart list 的第一列是 NAME，第二列是 SOURCE。原来写 $2 取到的是源镜像，
+# 「已存在就跳过克隆」那个分支永远不命中，重跑一律死在 tart clone 的
+# 「already exists」上——而 README 明写每一步都可重跑。
+# grep -F：VM 名不是正则，名字里的 `.` 会误匹配（`agent` 对上 `agentx`）。
+if "$TART_BIN" list 2>/dev/null | awk '{print $1}' | grep -Fqx "$VM_NAME"; then
   info "VM '$VM_NAME' already exists; skipping clone"
 else
   info "cloning $SOURCE -> $VM_NAME (uses APFS copy-on-write, so this is fast)"

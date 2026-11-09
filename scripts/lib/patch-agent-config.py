@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 HOME = Path.home()
@@ -28,7 +29,10 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
 ENV_FILE = HERMES_HOME / ".env"
 CONFIG_FILE = HERMES_HOME / "config.yaml"
 
-STAMP = "2026-11-07"
+# 备份名带运行时刻，不是写死的日期。原来是 STAMP = "2026-11-07" 这种常量：
+# 跑第二次 configure 时 .bak-2026-11-07 里存的已经是第一次改过的内容，用户
+# 原档永久丢失，想回滚拿不到。
+STAMP = time.strftime("%Y%m%d-%H%M%S")
 
 
 def read_secret(path: str, min_len: int) -> str:
@@ -45,7 +49,11 @@ def set_env(env_text: str, key: str, value: str) -> str:
     """Replace or append a KEY=value line, preserving the rest of the file."""
     pat = re.compile(rf"(?m)^{re.escape(key)}=.*$")
     if pat.search(env_text):
-        return pat.sub(f"{key}={value}", env_text)
+        # 替换串必须用函数，不能直接传字符串。re.sub 的替换串里 `\1`、`\g<...>`
+        # 是模板语法：密钥 `sk-abc\g<0>def` 会被换成 `MINIMAX_CN_API_KEY=old`
+        # 中间那段（密钥被静默改写），含 `\1` 更是直接 re.error 裸栈。LLM key 和
+        # 飞书 secret 是用户提供的任意字符串，命中概率不低。
+        return pat.sub(lambda _m: f"{key}={value}", env_text)
     if env_text and not env_text.endswith("\n"):
         env_text += "\n"
     return env_text + f"{key}={value}\n"

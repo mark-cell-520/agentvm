@@ -28,8 +28,27 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+# 打印脚本头部的用法注释：从第 2 行打到第一个非注释行为止，然后按给定的
+# 退出码结束（默认 0，出错用法传 1）。
+#
+# 原来每个脚本都写 `sed -n '2,26p' "$0"`，行号是手数的。注释一改行数就漂，
+# --help 开始把 `set -euo pipefail`、`HERE="$(cd ...)"` 这些真实代码一起打出来
+# （实测 `bash scripts/10-install-tart.sh --help` 末尾混着三行代码）。用 awk
+# 按「遇到非注释行就停」来切，改注释不会再破。
+usage() {
+  local f="${BASH_SOURCE[1]:-$0}"
+  awk 'NR > 1 { if ($0 ~ /^#/) { sub(/^# ?/, ""); print } else { exit } }' "$f" >&2
+  exit "${1:-0}"
+}
+
 # Resolve the repo root regardless of where a script is invoked from.
+# 只在 bash 下有效：zsh 里没有 BASH_SOURCE。各脚本 shebang 都是 bash，正常
+# 执行走不到这里；只有被人 `source` 进 zsh 时才中招，那时至少说清楚，别静默
+# 返回空、再让 `cd ""` 给出一个错的根目录。
 agentvm_root() {
+  if [ -z "${BASH_SOURCE[1]:-}" ]; then
+    die "agentvm_root 只在 bash 下有效（这个项目不支持 zsh source）"
+  fi
   cd "$(dirname "${BASH_SOURCE[1]}")/.." && pwd
 }
 
@@ -44,6 +63,25 @@ bytes_human() {
 
 # ------------------------------------------------------------------ config ---
 # Defaults; override via environment or a .agentvmrc in the repo root.
+#
+# 顺序要紧：先 load_rc 读 .agentvmrc，再用 `:=` 补默认值。反过来的话 rc 里
+# 设的值会被 `:=` 当成「已经有人设过了」而保留默认值——用户以为自己的
+# VM_NAME 生效了，实际用的还是 agent，而且没有任何提示。
+# 原来 load_rc 定义了却七个脚本一个都没调用，rc_file 是死代码，
+# config/agentvmrc.example 里那一整页开关全是摆设。现在 source 本文件就会读 rc。
+
+load_rc() {
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")/.." && pwd)"
+  if [ -f "$root/.agentvmrc" ]; then
+    # shellcheck disable=SC1090
+    . "$root/.agentvmrc"
+    info "loaded $root/.agentvmrc"
+  fi
+}
+
+load_rc
+
 : "${AGENTVM_HOME:=$HOME/.agentvm}"
 : "${VM_NAME:=agent}"
 : "${VM_CPU:=2}"
@@ -55,27 +93,17 @@ bytes_human() {
 : "${LOCAL_REGISTRY_PORT:=5000}"
 : "${LOCAL_REPO_NAME:=debian}"
 
-rc_file() {
-  local root; root="$(agentvm_root)"
-  [ -f "$root/.agentvmrc" ] && cat "$root/.agentvmrc"
-}
-
-load_rc() {
-  local root; root="$(agentvm_root)"
-  if [ -f "$root/.agentvmrc" ]; then
-    # shellcheck disable=SC1090
-    . "$root/.agentvmrc"
-    info "loaded $root/.agentvmrc"
-  fi
-}
-
 # ------------------------------------------------------------- secret safe ---
 # Write stdin to a 0600 file. Never put a secret in an argv.
 write_secret() {
   local path="$1"
+  local old_umask; old_umask="$(umask)"
   umask 077
   cat > "$path"
   chmod 600 "$path"
+  # umask 是进程级的，改完必须还原。原来不还原，之后这个脚本建的所有目录和
+  # 文件都变成 700/600——包括本该 755 的安装目录，症状是「装好了但别人读不到」。
+  umask "$old_umask"
 }
 
 # Transport an arbitrary string into a guest/file without it appearing in argv
@@ -84,5 +112,8 @@ write_secret() {
 b64_into_guest() {
   local vm="$1" dest="$2"
   local b64; b64="$(base64 | tr -d '\n')"
-  tart exec "$vm" sh -c "umask 077; printf '%s' '$b64' | base64 -d > '$dest'; chmod 600 '$dest'"
+  # dest 要转义：路径里有空格会把远端命令切断，有单引号更是命令注入。
+  # 用 printf %q 让 bash 生成一个能安全再解析一次的串。
+  local qdest; qdest="$(printf '%q' "$dest")"
+  tart exec "$vm" sh -c "umask 077; printf '%s' '$b64' | base64 -d > $qdest; chmod 600 $qdest"
 }

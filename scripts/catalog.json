@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "updated": "2026-11-09",
+  "virtio": {
+    "url": "https://github.com/qemus/virtiso-arm/releases/download/v0.1.285-1/virtio-win-0.1.285.tar.xz",
+    "sha256": "c6712f8d5730c09c1212be9fc3baa18b78534f3c8c136cf02b2cca46515ca310",
+    "note": "Windows 安装时必须的 virtio 驱动包，来自 GitHub release asset。解开后根下直接是 ARM64/、Balloon/ 等，没有额外一层。"
+  },
+  "distros": [
+    {
+      "id": "win11-24h2-eval",
+      "kind": "windows",
+      "name": "Windows 11 24H2",
+      "subtitle": "Enterprise Evaluation · ARM64",
+      "url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1.240331-1435.ge_release_CLIENTENTERPRISEEVAL_OEMRET_A64FRE_en-us.iso",
+      "sha256": "dad633276073f14f3e0373ef7e787569e216d54942ce522b39451c8f2d38ad43",
+      "size": 4295096320,
+      "default_cpus": 2,
+      "default_ram": "4G",
+      "default_disk": "64G",
+      "default_user": "Docker",
+      "install_minutes": [10, 15],
+      "note": "评估版 90 天有效，免产品密钥。全自动安装，装完即可 SSH 与远程桌面。"
+    },
+    {
+      "id": "ubuntu-24.04",
+      "kind": "linux",
+      "name": "Ubuntu Server 24.04 LTS",
+      "subtitle": "Noble Numbat · ARM64 云镜像",
+      "url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img",
+      "sha256": "50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e",
+      "size": 616522752,
+      "format": "qcow2",
+      "default_cpus": 2,
+      "default_ram": "2G",
+      "default_disk": "32G",
+      "default_user": "ubuntu",
+      "install_minutes": [1, 3],
+      "note": "预装系统，下载即可用，无需跑安装程序。cloud-init 自动建账号。"
+    },
+    {
+      "id": "ubuntu-22.04",
+      "kind": "linux",
+      "name": "Ubuntu Server 22.04 LTS",
+      "subtitle": "Jammy Jellyfish · ARM64 云镜像",
+      "url": "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img",
+      "sha256": "7fc0212296c65f8e20f8e9af89aaab9500ea4ec73cfb245afa0f2b509bb90785",
+      "size": 701041664,
+      "format": "qcow2",
+      "default_cpus": 2,
+      "default_ram": "2G",
+      "default_disk": "32G",
+      "default_user": "ubuntu",
+      "install_minutes": [1, 3],
+      "note": "预装系统，下载即可用，无需跑安装程序。cloud-init 自动建账号。"
+    },
+    {
+      "id": "debian-13",
+      "kind": "linux",
+      "name": "Debian 13",
+      "subtitle": "Trixie · ARM64 云镜像",
+      "url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2",
+      "sha512": "878f563f6c95af7fe1e8e51cd39470a1cdb570dddbee22377c85a347bce9d521d95f2cf0f825a38bc0a757889034fac6d83e932f04a3a122ab08cea68cc9ff8a",
+      "size": 431489024,
+      "format": "qcow2",
+      "default_cpus": 2,
+      "default_ram": "2G",
+      "default_disk": "32G",
+      "default_user": "debian",
+      "install_minutes": [1, 3],
+      "note": "预装系统，下载即可用，无需跑安装程序。cloud-init 自动建账号。"
+    },
+    {
+      "id": "debian-12",
+      "kind": "linux",
+      "name": "Debian 12",
+      "subtitle": "Bookworm · ARM64 云镜像",
+      "url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2",
+      "sha512": "45d5918f1d6272931f87a0a3af8a9fcd4373947369c4d1d2cbad463882d0c3a24acbd6a27cf8b6cd422c23af05d5deaf3cc2d968313649da4d896b707974ad42",
+      "size": 437649408,
+      "format": "qcow2",
+      "default_cpus": 2,
+      "default_ram": "2G",
+      "default_disk": "32G",
+      "default_user": "debian",
+      "install_minutes": [1, 3],
+      "note": "预装系统，下载即可用，无需跑安装程序。cloud-init 自动建账号。"
+    }
+  ]
+}

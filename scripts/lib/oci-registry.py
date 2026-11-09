@@ -130,8 +130,16 @@ class RegistryHandler(BaseHTTPRequestHandler):
                 self._json(416, {"errors": [{"code": "BAD_RANGE"}]})
                 return
             start_s, end_s = m.group(1), m.group(2)
-            start = int(start_s) if start_s else 0
-            end = int(end_s) if end_s else size - 1
+            # suffix range（`bytes=-1024`，要最后 1 KB）不能当成从头取。
+            # 原来 start_s 为空就直接 start = 0，返回的是文件头 1024 字节——
+            # 静默给错数据比报错更糟。Tart 用的是正向 Range 所以碰不到，
+            # 但任何用 curl -r -1024 调试的人都会拿到错内容。
+            if start_s:
+                start = int(start_s)
+                end = int(end_s) if end_s else size - 1
+            else:
+                start = size - int(end_s)
+                end = size - 1
             end = min(end, size - 1)
             if start > end or start >= size:
                 self.send_response(416)
