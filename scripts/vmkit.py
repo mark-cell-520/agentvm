@@ -222,27 +222,41 @@ def find_vmz() -> Path | None:
     为什么不像 find_tool 那样直接 die：vmz 只有 macOS 客人机用得到，
     Windows / Linux 两条路完全不碰它。为一个用不到的工具把整条命令
     毙掉，用户会看到「找不到 vmz」而他根本不想装 macOS。
+
+    候选路径里有**两个编译位置**，所以不能「第一个找到的就算」：
+    `app/build.sh` 编到 `scripts/vmz/vmz`，`install.sh` 编到
+    `~/.agentvm/bin/vmz`。两边各自都会被刷新，也各自会变旧——只按固定顺序
+    取第一个，就会在源码已经改过之后还用着一份旧二进制。实测踩过
+    （2026-11-10）：下载器的 bug 早已修掉、`scripts/vmz/vmz` 是新的，
+    而 find_vmz 落到 `~/.agentvm/bin/vmz` 那份三天前的构建上，于是新代码
+    一行都没跑，故障表现和没修一模一样，白排查了半天。
+
+    所以除了 AGENTVM_VMZ（用户显式指定，最高优先）之外，剩下的候选
+    全部收集起来，取 mtime 最新的那个。
     """
     env = os.environ.get("AGENTVM_VMZ")
     cands: list[Path] = []
     if env:
         cands.append(Path(env))
-    # app 自带的那份。install.sh 会把它编进 Resources/backend/，
-    # app 是自包含的，不依赖用户机器上有没有这个仓库。
-    res = Path(sys.argv[0]).resolve().parent / "vmz"
-    if res.name == "vmkit.py":
-        cands.append(res.parent / "vmz")
+    # HERE 已经是 scripts/ 了，别再拼一次 scripts。原来是
+    # HERE / "scripts" / "vmz" / "vmz"，解析出来是 scripts/scripts/vmz/vmz，
+    # 永远不存在；于是真正该被找到的 scripts/vmz/vmz 从来没进过候选，
+    # 直接落到下面那份旧的。
     cands += [
-        HERE / "scripts" / "vmz" / "vmz",
-        HERE / "bin" / "vmz",
+        HERE / "vmz" / "vmz",
+        HERE.parent / "bin" / "vmz",
         HOME / ".agentvm" / "bin" / "vmz",
         Path("/usr/local/bin/vmz"),
         Path("/opt/homebrew/bin/vmz"),
     ]
-    for c in cands:
-        if c.is_file() and os.access(c, os.X_OK):
-            return c
-    return which("vmz") and Path(which("vmz"))
+    found = [c for c in cands if c.is_file() and os.access(c, os.X_OK)]
+    if env and found:
+        # 显式指定就认它，哪怕它更旧——那是用户自己的选择。
+        return found[0]
+    if not found:
+        w = which("vmz")
+        return Path(w) if w else None
+    return max(found, key=lambda p: p.stat().st_mtime)
 
 
 def human(n: float) -> str:
