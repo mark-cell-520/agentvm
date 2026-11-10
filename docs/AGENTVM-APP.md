@@ -888,6 +888,95 @@ harness 在 `/tmp/vncharness`：一个 python RFB 服务端（自己实现握手
 
 ---
 
+## 鼠标还是不动：上一轮的修法只对 first responder 有效（2026-11-10 第七轮）
+
+用户报：「进入控制台，还是无法进行鼠标移动，问题很多啊，去 github 搜索代码，
+进行全面修复」。
+
+### 定位方式
+
+先做了个假 RFB 服务端（只做握手、回一帧「上白下黑」、把收到的键盘鼠标事件按
+时间顺序写进 JSONL），再把**真实的 ConsoleView.swift + VNCClient.swift** 编进
+一个 harness：`NSHostingView(rootView: ConsoleView(...))` 开一个真窗口，用
+`CGEvent(...)?.post(tap: .cghidEventTap)` 合成鼠标键盘事件驱动它，最后对着服务端
+收到的字节断言。也就是说测的是真代码路径，不是 mock。
+
+跑出来的基线（修复前）：
+
+    事件类型        数量    说明
+    PointerEvent    4       其中 3 个是同一次点击（移动/按下/松开）
+    KeyEvent        3       普通 a 有按下有松开；Cmd+a 只有一个 0x61 按下
+
+- 点击前发的 5 次鼠标移动 → 服务端收到 **0 个** PointerEvent
+- Cmd+a 被当成裸的 0x61 送了进去，而且**永远没有 key-up**（AppKit 在 Command
+  按住期间不补发普通键的 keyUp）——客人机从此认为 a 一直按着
+
+### 根因
+
+`window.acceptsMouseMovedEvents = true` 这条路只把 mouseMoved 送给 **first
+responder**。点击之前 `VNCScreenView` 不是 first responder（SwiftUI 里通常是
+hosting view 或窗口自己），所以移动整个不工作；点击、拖动、滚轮、键盘都正常，
+因为那些走 hit-test，只有 mouseMoved 走 first responder。
+
+修法是改走 `NSTrackingArea`（owner 直接收，不依赖 first responder 也不依赖
+hit-test），这同时是 GitHub 上两个独立的 Swift VNC 客户端
+（biztalk72/VNCClient、loomhand/swift-rfb）唯一使用的方式。细节见 PITFALLS M29。
+
+### 顺带修掉的
+
+    VNCScreenView.updateTrackingAreas  装 .activeAlways 的移动跟踪区域（主修）
+    VNCScreenView.acquireLock          锁定模式才置窗口标志，并存原值、解锁还原
+    VNCScreenView.keyDown              Command 组合键本地吃掉，不进客人机
+    VNCScreenView.keyDown/keyUp        用 held 集合记账，只在真送过按下时才补释放
+    VNCScreenView.resignFirstResponder 释放全部（原来只释放修饰键）
+    VNCScreenView                      窗口失焦通知 / deinit 也走 releaseAllKeys
+    VNCScreenView.scrollWheel          滤掉触控板惯性滚动那一段
+    VNCScreenView.keysym               Command 按住时不按 characters 算 keysym
+    VNCScreenView.viewDidMoveToWindow  补装一次跟踪区域（窗口刚拿到时）
+
+### 两条通路不能同时开
+
+这是实测照出来的一个隐藏坑：跟踪区域加上窗口标志之后，点击后视图成了 first
+responder，两条路都通，**每次移动往客人机送两次一模一样的 PointerEvent**
+（同一份 harness 里点击从 3 个事件变成 6 个）。所以窗口那个标志只在锁定模式下
+才置——锁定模式走窗口级局部监视器，而局部监视器要这个标志才看得见 mouseMoved
+（不置的话 AppKit 压根不生成这类事件，单独测过：只装监视器 = 0 个事件）。
+
+### 验证
+
+端到端 harness 五条断言全过（服务端收到的真实 RFB 字节）：
+
+1. 点击前的移动到达客人机：1 个 PointerEvent（x=646 y=121）——修复前是 0
+2. 一次点击 = 3 个事件（移动/按下/松开），无重复——修复前重复时是 6 个
+3. 滚轮 -3 → 3 次 button 5（掩码 16）+ 3 次释放，方向正确
+4. Cmd+a 完全不进客人机：0 个 KeyEvent——修复前是一个没有 key-up 的 0x61
+5. 普通键 a 有按下有松开：2 个，配对
+
+另外：`make lint` 全绿；./install.sh 装进 /Applications，二进制 md5 与本地构建
+一致；画面方向复测仍是上白下黑（上一轮的 blit 翻转没被破坏）。
+
+顺带查清一件不用担心的事：`CGContext.makeImage()` 是**快照**——实测把上下文
+从纯白改写成纯黑之后，之前取出的图像第 0 字节仍是 255。所以解析线程边画边
+memcpy 不会改写主线程正在显示的图像，不需要为它加每帧拷贝。
+
+### 没验证的
+
+- 没有在真实 GUI 里点过任何一个按钮。Esc 关窗口、按钮位置、滚轮方向、鼠标
+  锁定/释放，都要用户实际点一遍才算数。
+- 安装向导里那块 300px 高的内嵌画面：缩放后能不能点中小按钮，没实测。
+- `.activeAlways` 的代价（控制台不在前台时鼠标划过画面也会带动客人机光标）
+  没有单独测，是按远程桌面窗口的常规行为接受的。
+
+### 环境变化（如实说明）
+
+上一轮结尾还能看到的 fnOS 安装虚拟机（linux1，pid 59232）**现在不在了**，
+`~/.agentvm/vms/` 下只剩 linux2（一个已就绪的 Debian 云镜像，没在跑），
+机器上没有任何 QEMU 进程。这不是本轮造成的：本轮只用过 127.0.0.1:5911 上的
+假 RFB 服务端和自己的测试窗口；`install.sh` 只删 `/Applications/AgentVM.app`，
+`make lint` 不删任何东西。它是在本轮开始前就被移除的，我不知道是谁移除的。
+
+---
+
 ## macOS 客人机（2026-11-10 新增）
 
 ### 为什么 macOS 走 VZ，另外两种走 QEMU

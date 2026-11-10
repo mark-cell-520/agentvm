@@ -353,6 +353,64 @@ final class VNCScreenView: NSView {
     /// 已经送过移动、但 120ms 延迟按压还没发出去的位置。
     private var pendingPress: NSPoint?
 
+    /// 鼠标移动的通道：自己装的那个跟踪区域。
+    ///
+    /// **这是「鼠标移不动」的真正原因，2026-11-10 在本机实测定位。**
+    ///
+    /// 上一轮的修法是 `window.acceptsMouseMovedEvents = true`。端到端实测
+    /// （真 ConsoleView + 假 RFB 服务端 + 合成鼠标事件）证明那条路有个前提：
+    /// 它只把 mouseMoved 送给 **first responder**。而在还没点过任何一下的时候，
+    /// 这个视图不是 first responder（SwiftUI 里通常是 hosting view 或窗口自己），
+    /// 于是 5 次鼠标移动送到服务端是 **0 个 PointerEvent**——点击、拖动、滚轮、
+    /// 键盘全都正常，唯独移动整个不工作，正是用户报的现象。点过一下之后这条通路
+    /// 才通，而「先移动、再点」是人的操作顺序。
+    ///
+    /// NSTrackingArea 不依赖 first responder，也不依赖 hit-test（owner 直接收），
+    /// 所以它才是主通道。biztalk72/VNCClient 的 VNCView.swift 和 loomhand/swift-rfb
+    /// 的 RFBView.swift 两个独立实现都只用它，全程不碰 acceptsMouseMovedEvents。
+    ///
+    /// **两条通路不能同时开。** 同一份实测里，跟踪区域加上窗口标志之后，点击后的
+    /// 每次移动都往客人机送了两次一模一样的 PointerEvent（视图成了 first responder，
+    /// 两条路都通）。所以窗口那个标志只在锁定模式下才置，见 acquireLock()。
+    ///
+    /// **选项必须是 .activeAlways。** 本机 SDK 里 `.activeInKeyWindow` 的位值是 32，
+    /// 实测它在这个视图上不投递（窗口明明是 key 的）；换成 .activeAlways（128）
+    /// 点击前的移动立刻就到了。kanka-jp/konnyaku 的 PR #25 也是被同类问题逼着从
+    /// 「依赖激活态」改成 .activeAlways 的。代价是控制台不在前台时，鼠标划过画面
+    /// 也会带动客人机光标——对一个远程桌面窗口来说这是合理行为。
+    private var moveTracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        installMoveTracking()
+    }
+
+    /// 装（或重装）移动跟踪区域。锁定模式下不装：那时候走 acquireLock() 的
+    /// 窗口级监视器，两条同时开会把一次移动送两遍。
+    private func installMoveTracking() {
+        guard !locked, window != nil else { return }
+        removeMoveTracking()
+        // 只拆自己装的那个。`trackingAreas.forEach(removeTrackingArea)` 会把
+        // SwiftUI 自己的跟踪区域一起拆掉（konnyaku 那么干是因为它是 overlay），
+        // 而这里是内容视图，拆了会影响 SwiftUI 的 hover 行为。
+        //
+        // rect 用 bounds：updateTrackingAreas 被调用时 bounds 已经是最新的，
+        // 视图尺寸变化时 AppKit 会自动再调一次，不用手动重装。
+        let a = NSTrackingArea(rect: bounds,
+                               options: [.mouseMoved, .mouseEnteredAndExited,
+                                         .inVisibleRect, .activeAlways],
+                               owner: self, userInfo: nil)
+        addTrackingArea(a)
+        moveTracking = a
+    }
+
+    private func removeMoveTracking() {
+        if let moveTracking {
+            removeTrackingArea(moveTracking)
+            self.moveTracking = nil
+        }
+    }
+
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         buttons |= 4
@@ -382,6 +440,9 @@ final class VNCScreenView: NSView {
         // 非锁定模式下把鼠标在画面上滑来滑去，客人机里的光标一动不动（只有点下去
         // 那一下才跳过去）——安装器里的悬停高亮、Tooltip 全部无效，而用户完全
         // 看不出是客户端的功劳还是客人机的毛病。
+        //
+        // 而这条代码能不能跑到，取决于 mouseMoved 到底会不会被送到这个视图，
+        // 那又是 moveTracking 那条跟踪区域的事——见那里的长注释。
         if !locked {
             send(event)
             return
@@ -412,6 +473,11 @@ final class VNCScreenView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let client else { return }
+        // 触控板的惯性滚动会再补一大批事件（momentumPhase 非空），照收就是
+        // 手指已经停了、画面还在继续滚好几秒。只认手指真正在划的那段。
+        // 普通鼠标滚轮两个 phase 都是空，不受影响。
+        if event.hasPreciseScrollingDeltas,
+           !event.momentumPhase.isEmpty || event.phase == .ended { return }
         // 精确触控板给的是小数，累加到阈值再发，否则一帧发十几下滚轮事件。
         accumulatedY += event.scrollingDeltaY
         accumulatedX += event.scrollingDeltaX
@@ -439,6 +505,14 @@ final class VNCScreenView: NSView {
 
     // ------------------------------------------------------------ 键盘 --
 
+    /// 当前正按着、并且已经送给客人机的 keysym。
+    ///
+    /// 为什么需要一份名单：AppKit 不保证每个按下去的键都有对应的 keyUp 送到这个
+    /// 视图——Command 按住期间松开的普通键没有 keyUp（loomhand/swift-rfb 的
+    /// RFBView.swift 记过这条），切窗口、点标题栏按钮也不会有。漏一个，客人机就
+    /// 一直认为那个键还按着：装系统时敲一个大写字母能卡住后面全部输入。
+    private var held = Set<UInt32>()
+
     override func keyDown(with event: NSEvent) {
         // Esc 归谁，看锁不锁鼠标：
         //   锁着 -> 释放鼠标。锁定模式没有真实光标，不给一个逃出口等于把用户
@@ -464,8 +538,27 @@ final class VNCScreenView: NSView {
             }
             return
         }
+        // 带 Command 的组合键是本地快捷键，不进客人机。
+        //
+        // 实测踩过（2026-11-10 端到端 harness）：按 Cmd+a，客人机收到了一个裸的
+        // 0x61 按下——Windows/Linux 里那是全选，而用户只是想按个本地快捷键。
+        // XQuartz 的 X11Application.m 和 Chicken 的 EventFilter.m 都是这个做法：
+        // 本地吃掉，down 和 up 都不转发。
+        //
+        // 但不能反过来把这个键记进 held：那会让 keyUp 补发一个客人机从没收到过
+        // 的按下对应的释放（第一版就这么写，harness 里抓到了一个孤立的
+        // 0x61 key-up）。真正要兜的是另一种情况——这个键先是以普通键送下去的
+        // （先按 a，再按着 Cmd 补一下 a），AppKit 又不会在 Command 按住期间补发
+        // 它的 keyUp，所以在这里主动补释放。
+        if event.modifierFlags.contains(.command) {
+            if let ks = keysym(for: event), held.remove(ks) != nil {
+                client?.key(ks, down: false)
+            }
+            return
+        }
         guard let ks = keysym(for: event) else { return }
         client?.key(ks, down: true)
+        held.insert(ks)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -473,7 +566,11 @@ final class VNCScreenView: NSView {
         // 这里不能再发一次释放——客人机会收到一个没有按下的 Esc key-up。
         if event.keyCode == 0x35 { return }
         guard let ks = keysym(for: event) else { return }
-        client?.key(ks, down: false)
+        // 只有确实送过按下才补释放。没送过就发一个 key-up，客人机会看到一个
+        // 凭空松开的键。
+        if held.remove(ks) != nil {
+            client?.key(ks, down: false)
+        }
     }
 
     /// 修饰键不走 keyDown/keyUp，走 flagsChanged。漏了它 Shift 就永远是按下的
@@ -501,29 +598,43 @@ final class VNCScreenView: NSView {
         }
     }
 
-    override func resignFirstResponder() -> Bool {
+    /// 把送下去过的键全部补发释放，见 held。
+    ///
+    /// 修饰键走 prevFlags 那条路（flagsChanged 里维护），普通键走 held 这条路
+    /// （keyDown/keyUp 里维护）。两条路都必须在这里收口，否则客人机留着卡键。
+    private func releaseAllKeys() {
         releaseModifiers()
+        for ks in held {
+            client?.key(ks, down: false)
+        }
+        held.removeAll()
+    }
+
+    override func resignFirstResponder() -> Bool {
+        releaseAllKeys()
         return super.resignFirstResponder()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // updateTrackingAreas() 可能在视图还没有窗口时就被调过一次（那时
+        // installMoveTracking 直接返回了），补装一次。AppKit 只在 bounds 变化时
+        // 自动重调，不会因为「刚拿到窗口」再调一遍。
+        installMoveTracking()
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        // **mouseMoved 要窗口这个标志才分发，而它是 NSWindow 的属性。**
-        // 原来只在 acquireLock() 里置，于是从没锁过鼠标的用户在画面上滑动，
-        // 客人机光标一动不动——只有点下去那一下才跳过去。上面 mouseMoved 里
-        // 「不锁也要把移动发下去」那段修复，在这条路上从来没生效过。
-        // releaseLock() 故意不复位它：解锁之后照样该收到移动。
-        newWindow?.acceptsMouseMovedEvents = true
         // 原来这里还会 makeFirstResponder(self)。那会让键盘焦点从向导的按钮上
         // 被抢走：新建向导的安装页嵌着这块画面，Tab / Enter / Space 全部失灵，
         // 用户没法用键盘走到「下一步」。改成点了画面才抢焦点（mouseDown 里
         // 已经这么做了）。
         //
-        // 切 app 时补发修饰键释放，见 releaseModifiers()。
+        // 切 app 时补发按键释放，见 releaseAllKeys()。
         if let w = newWindow {
             keyObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didResignKeyNotification, object: w, queue: nil)
-            { [weak self] _ in self?.releaseModifiers() }
+            { [weak self] _ in self?.releaseAllKeys() }
         }
     }
 
@@ -536,7 +647,12 @@ final class VNCScreenView: NSView {
         var s = e.charactersIgnoringModifiers ?? ""
         // Shift 时取带修饰符的那一份：keysym 要区分 a 和 A，而
         // charactersIgnoringModifiers 永远给小写。
-        if e.modifierFlags.contains(.shift), let up = e.characters, up.count == 1 {
+        //
+        // Command 按住时不这么做：那个组合键整体是被本地吃掉的（见 keyDown），
+        // 而 Command 会改变 characters 的结果（Cmd+Shift+a 是 'A'），照它算出来
+        // 的 keysym 和按下时记进 held 的那个对不上，补释放时就漏了一个卡键。
+        if e.modifierFlags.contains(.shift), !e.modifierFlags.contains(.command),
+           let up = e.characters, up.count == 1 {
             s = up
         }
         guard let c = s.first else { return nil }
@@ -573,7 +689,19 @@ final class VNCScreenView: NSView {
     private func acquireLock() {
         guard let win = window else { return }
         NSCursor.hide()
-        win.acceptsMouseMovedEvents = true
+        // 锁定模式切到窗口级监视器：相对移动要把指针无限拖出画面，而跟踪区域只
+        // 覆盖自己的 bounds，指针一出画面就再也收不到事件。
+        //
+        // 监视器要窗口这个标志才看得见 mouseMoved（否则 AppKit 压根不生成），
+        // 所以这里必须置。存原值、releaseLock 时还原。
+        // **非锁定模式下不置**：那时它会把 mouseMoved 送给 first responder，和
+        // 跟踪区域那条路重复，一次移动送两遍 PointerEvent（2026-11-10 实测）。
+        if prevAcceptsMouseMoved == nil {
+            prevAcceptsMouseMoved = win.acceptsMouseMovedEvents
+            win.acceptsMouseMovedEvents = true
+        }
+        // 跟踪区域让位，否则锁定模式下两条路同时送。
+        removeMoveTracking()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) {
             [weak self] e in
             if e.window == win { self?.mouseMoved(with: e) }
@@ -584,12 +712,21 @@ final class VNCScreenView: NSView {
         warpToCenter()
     }
 
+    /// `window.acceptsMouseMovedEvents` 的原值，releaseLock 时还原。
+    private var prevAcceptsMouseMoved: Bool?
+
     private func releaseLock() {
         if let monitor {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
         }
+        if let prev = prevAcceptsMouseMoved {
+            window?.acceptsMouseMovedEvents = prev
+            prevAcceptsMouseMoved = nil
+        }
         NSCursor.unhide()
+        // 解锁之后回到跟踪区域那条路。
+        installMoveTracking()
     }
 
     /// 把系统光标掰回视图中心。失败也不致命：指针会被界面边缘挡住，表现为
@@ -609,5 +746,10 @@ final class VNCScreenView: NSView {
         if let monitor { NSEvent.removeMonitor(monitor) }
         // 隐藏过光标就必须配对取消，否则光标会一直留着不见
         if locked { NSCursor.unhide() }
+        // 送出去过的键要补释放：这个视图一消失，客人机那边再也不会收到 keyUp，
+        // 不在这儿收口就会留下一堆卡键（Shift、Ctrl、以及任何正在按的字母）。
+        // 此时连接通常已经被 ConsoleView.onDisappear 断掉了，所以这一步多半
+        // 是空跑——但万一没断，就不该留着卡键。
+        releaseAllKeys()
     }
 }

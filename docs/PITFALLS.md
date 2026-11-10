@@ -1155,3 +1155,40 @@ status 失败 → 主窗口显示「还没有虚拟机」，而 ~/.agentvm/vms �
 用户会以为自己记错，去点新建装出第二份；check 失败 → 每个详情页顶一条
 「宿主机检查没全过」而下面一条明细都没有。操作类命令早就用 handleCommandEvent
 堵过这一类，只是这三条读命令漏了。
+
+## M29. mouseMoved 只送给 first responder——「鼠标移不动」和上一轮的修法为什么都没用（已修）
+
+**这条是用户报「进入控制台还是无法进行鼠标移动」的根因，2026-11-10 在本机实测定位。**
+
+一、上一轮（M26）的修法是 `viewWillMove(toWindow:)` 里
+`newWindow?.acceptsMouseMovedEvents = true`。端到端实测（真 ConsoleView + 假 RFB
+服务端 + 合成鼠标事件）证明那条路有一个没说出口的前提：**它只把 mouseMoved 送给
+first responder**。而点击之前这个视图不是 first responder（SwiftUI 里通常是
+hosting view 或窗口自己），于是 5 次鼠标移动送到服务端是 0 个 PointerEvent。
+点击、拖动、滚轮、键盘全都正常，唯独移动整个不工作——因为那些走 hit-test，只有
+mouseMoved 走 first responder。点过一下之后这条通路才通，而「先移动、再点」正是
+人的操作顺序，所以现象是「完全没法用鼠标」。
+
+二、真正的主通道是 `NSTrackingArea`：owner 直接收，不依赖 first responder，也不
+依赖 hit-test。`biztalk72/VNCClient` 的 VNCView.swift 和 `loomhand/swift-rfb` 的
+RFBView.swift 两个独立实现都只用它，全程不碰 acceptsMouseMovedEvents。
+SwiftTerm 的测试注释把第一条路写得很直白：「acceptsMouseMovedEvents delivers
+mouseMoved to the first responder regardless of the pointer's location」。
+
+三、**选项必须是 .activeAlways。** 本机 SDK 里 `.activeInKeyWindow` 的位值是 32
+（经典头文件里那是 ActiveWhenFirstResponderOnly），实测它在这个视图上不投递——
+窗口明明是 key 的、`isKeyWindow == true`，点击前的移动还是一个都不来。换成
+`.activeAlways`（128）立刻就好。`kanka-jp/konnyaku` 的 PR #25 也是被同类问题逼着
+从「依赖激活态」改成 .activeAlways 的。代价：控制台不在前台时鼠标划过画面也会带动
+客人机光标——对远程桌面窗口来说是合理行为。
+
+四、**两条通路不能同时开。** 跟踪区域加上窗口标志之后，点击后视图成了 first
+responder，两条路都通，每次移动往客人机送两次一模一样的 PointerEvent。修法：
+窗口那个标志只在锁定模式下才置（那时候走窗口级局部监视器，而局部监视器要这个
+标志才看得见 mouseMoved——不置的话 AppKit 压根不生成这类事件），并且存原值、
+解锁时还原，不无条件写 true。
+
+五、顺带在这条路上修掉的：`NSTrackingArea.Options` 的位值在 macOS 27 的 SDK 里
+和经典头文件不一样（activeInKeyWindow 32 / activeInActiveApp 64 / activeAlways 128，
+ActiveWhenFirstResponderOnly 整个被删了），照老教程写的选项组合会 silently 变成
+另一回事。判断某个选项到底生不生效，只能实测。
