@@ -369,8 +369,19 @@ struct VMDetailView: View {
             if !vm.isMacOS {
                 // 无窗口跑的 VM 没有窗口可切，只能重启才能有一个——按钮上要说清楚，
                 // 不然用户点了发现虚拟机重启了，会以为出了故障。
-                Button(vm.headless ? "用系统窗口打开（会重启）" : "用系统窗口打开") {
-                    state.nativeWindow(vm)
+                //
+                // 关机状态下这个按钮的意思是「启动并用系统窗口打开」。原来关机时
+                // 按钮文字和热运行时候一模一样，点下去后端 die「VM 没在运行，
+                // 先 start」——一个死胡同对话框，而用户想要的是看画面。
+                // 2026-11-10 用户截图报的就是这个。
+                Button(vm.running
+                       ? (vm.headless ? "用系统窗口打开（会重启）" : "用系统窗口打开")
+                       : "启动并用系统窗口打开") {
+                    if vm.running {
+                        state.nativeWindow(vm)
+                    } else {
+                        state.startWithWindow(vm)
+                    }
                 }
                 .disabled(state.backend.busy)
             }

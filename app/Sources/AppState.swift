@@ -647,8 +647,30 @@ final class AppState: ObservableObject {
     /// 只能通过重启实现：显示模式（-display）是 QEMU 的启动参数，跑起来之后
     /// 改不了。所以后端会把这次重启说清楚（warn 一句），不是静默重启。
     /// 无窗口跑的 VM 才需要走这条；本来就有窗口的只是带到前台。
+    ///
+    /// **没在运行的时候不走这条。** 原来按钮在关机状态也摆着，点下去后端 die
+    /// 一句「VM 没在运行，先 start」——一个纯报错的对话框，用户除了点「好」
+    /// 什么都不能做，而他的意图（看画面）根本没被回应。2026-11-10 用户截图报
+    /// 的就是这个。这时候调用方应该走 startWithWindow，见那儿。
     func nativeWindow(_ vm: VMInfo) {
         backend.run(["window", "--name", vm.name], onEvent: handleCommandEvent) { [weak self] in
+            self?.refreshStatus()
+        }
+    }
+
+    /// 没在运行的时候「用系统窗口打开」：一步启动 + 原生窗口。
+    ///
+    /// 走 `start --window` 而不是先 start 再 window：后者要等一次完整的启动
+    /// （Linux 要好几十秒）再发第二条命令，中间任何一步失败用户就看到一半；
+    /// 而 `--window` 就是把 headless 置成 false 再启动，一次 QEMU 就带着
+    /// 原生窗口起来，和用户点的是同一个意思。
+    ///
+    /// 已经在跑也不会坏事：后端 start_linux 看到 pid 活着就回一句
+    /// 「VM 已在运行」然后返回，不会起第二个 QEMU。刷新之后按钮自己会变回
+    /// 「用系统窗口打开」。
+    func startWithWindow(_ vm: VMInfo) {
+        backend.run(["start", "--name", vm.name, "--window"],
+                    onEvent: handleCommandEvent) { [weak self] in
             self?.refreshStatus()
         }
     }

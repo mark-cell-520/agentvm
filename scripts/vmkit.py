@@ -3018,7 +3018,14 @@ def cmd_window(args) -> int:
             "VZVirtualMachineView，不存在第二种显示方式。\n"
             "在 app 里点「打开窗口」即可。")
     if not qemu_pid(vm):
-        die("VM 没在运行，先 start")
+        # 原来只有一句「VM 没在运行，先 start」。那是写给命令行读者看的，
+        # 而 app 把后端的 stderr 原样弹成对话框——用户看到的就是一句英文味
+        # 儿的指令，既没有按钮也没有下一步。2026-11-10 用户截图报的就是这个
+        # （点关机状态下的「用系统窗口打开」）。app 侧已经改成本条命令不达这儿，
+        # 但命令行和别的方式还是会到，所以这句话得是能照着做的一条路。
+        die(f"{args.name} 没在运行，没有窗口可打开。\n"
+            f"要带着原生窗口起来：\n"
+            f"  {_self_cmd()} start --name {args.name} --window")
     if vm.get("headless"):
         warn("要切换成窗口模式，得重启一次虚拟机")
         cmd_stop(args)
@@ -3888,7 +3895,9 @@ def cmd_open(args) -> int:
     """
     vm = load_vm(args.name)
     if not qemu_pid(vm):
-        die("VM 没在运行，先 start")
+        # 同 cmd_window：这句话会被 app 原样弹成对话框，不能写成命令行口气。
+        die(f"{args.name} 没在运行，没有窗口可切到前台。\n"
+            f"在 app 里选中它，点「启动并用系统窗口打开」。")
     # headless 跑的 VM 没有窗口可带到前台。原来这里照样 activate 然后报
     # 「已带到前台」，用户到处找窗口找不到——launchd 开机自启和安装阶段
     # 都是这条路径，说谎比说没有办法更糟。
@@ -3928,8 +3937,17 @@ def cmd_screenshot(args) -> int:
     # macOS 自带的 sips 转成 png——转不了就留 PPM，并如实说清楚给的是什么。
     ppm = out.with_suffix(".ppm") if out.suffix.lower() == ".png" else out
     mon = d / "monitor.sock"
+    # 先看进程，再看套接字文件。原来只看文件在不在，而 QEMU 退出时不清理它
+    # （2026-11-10 实测：linux1 关着机，monitor.sock 和 qemu.pid 都还留着），
+    # 于是这条检查永远通过，一路走到 screendump 才失败，报的是「没抓到画面，
+    # VM 可能刚退出或没配 framebuffer 设备」——真相是它根本没起动过，那句话
+    # 把人往 framebuffer 配置上引。
+    if not qemu_pid(vm):
+        die(f"{args.name} 没在运行，没有画面可截。\n"
+            f"在 app 里选中它，点「启动并用系统窗口打开」，或者先启动再看画面。")
     if not mon.exists():
-        die("VM 没在运行（monitor 套接字不在），先 start")
+        die(f"{args.name} 在跑，但 monitor 套接字不在（{mon}）。\n"
+            f"这台不是用 vmkit 起的，或者套接字被删了——没有它截不了图。")
     if not screendump(mon, ppm):
         # 失败就必须失败，不能回头用上一次留下的旧文件：一张过期画面比没有
         # 画面更容易让人判断错客人机停在哪。
