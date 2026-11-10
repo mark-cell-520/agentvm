@@ -124,8 +124,73 @@ def qga_shutdown(sock, timeout: float = 10.0) -> None:
     和 monitor 的 system_powerdown 的区别：那个是「电源键事件」，要客人机里
     有交互会话去接，停在登录界面时没人接，等到超时只能强杀；这个是直接告诉
     agent 关机，systemd 会走完整的 stop 流程，该 flush 的都会 flush。
+
+    **这一条命令收不到响应，而这正是它成功的标志**（2026-11-10 实测）。
+
+    qemu-ga 收到 guest-shutdown 就直接调 reboot(RB_POWER_OFF)，客人机内核
+    随即开始停止系统，qemu-ga 进程自己也在被停的进程里，virtio-serial 连接
+    被对端关掉。宿主机这边读到的是 EOF，一行 JSON 都没有：
+
+        guest-ping       -> b'{"return": {}}\n'      有响应
+        guest-shutdown   -> b''                      EOF，没有响应
+
+    所以这里不能复用 qga_request：它把「读到空行」当成「agent 没在跑」，
+    qga_shutdown_wait 收到这个错就返回假、往下降级，而虚拟机其实已经在优雅
+    关机了——后面的 SSH、ACPI、kill -9 全是在一台正在关机的机器上补刀，
+    qcow2 照样留下脏数据，恰好是这个函数想避免的那件事。实测那次：agent
+    明明已经把 VM 关到退出，宿主机却报「关机没成」再补一个 kill -9。
+
+    判定成功的唯一信号是「命令写进去了，然后连接被对端关闭」。仍会看一句
+    响应：qemu-ga 5.2 以下没有这条命令，会回 {"error": ...}，那是真失败，
+    不能当成成功咽下去。
     """
-    qga_request(sock, {"execute": "guest-shutdown"}, timeout=timeout)
+    path = Path(sock)
+    if not path.exists():
+        raise QGAError(f"guest agent 套接字不存在：{path}")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sk:
+            sk.settimeout(timeout)
+            sk.connect(str(path))
+            f = sk.makefile("rwb")
+            try:
+                f.write(json.dumps({"execute": "guest-shutdown"},
+                                   ensure_ascii=False).encode("utf-8"))
+                f.write(b"\n")
+                f.flush()
+                # EOF 返回 b''，不抛异常；超时才抛 socket.timeout。
+                line = f.readline()
+            finally:
+                f.close()
+    except socket.timeout:
+        # socket.timeout 在 3.10+ 是 TimeoutError，是 OSError 的子类，所以这个
+        # except 必须排在 OSError 前面，否则超时会被当成「连不上」报出去。
+        raise QGAError(
+            f"guest agent {timeout:g} 秒没响应（{path}）。命令可能没送到，"
+            f"客人机没开始关机") from None
+    except OSError as e:
+        raise QGAError(
+            f"连不上 guest agent（{path}）：{e}。QEMU 没带这个 chardev、或者"
+            f"socket 没人 accept 时也是这个错") from None
+
+    if not line.strip():
+        # 连接被对端关掉、一个字都没回——正常路径，见 docstring。
+        return
+    # 回了东西：只有一种情况，就是它不认识这条命令。按错误报出去，
+    # 让调用方降级，别把「VM 毫无变化」说成关机成功。
+    try:
+        resp = json.loads(line.decode("utf-8", "replace"))
+    except ValueError:
+        raise QGAError(
+            f"guest agent 对 guest-shutdown 返回的不是 JSON：{line[:200]!r}") from None
+    if isinstance(resp, dict) and "error" in resp:
+        err = resp["error"]
+        if isinstance(err, dict):
+            raise QGAError(
+                f"guest agent 报错：{err.get('class')}: {err.get('desc')}"
+                f"（qemu-ga 5.2 以下没有 guest-shutdown）")
+        raise QGAError(f"guest agent 报错：{err}")
+    # 有 {"return": ...}：说明这个 agent 变体真的会回应，照收。
+    return
 
 
 def qga_network_interfaces(sock, timeout: float = 10.0) -> list:

@@ -552,3 +552,83 @@ YAML 注入」），而引号外跟内容是同一个病的另一个实例。
 
 **影响范围.** 只有 `linux_seed()` 这两行。改完之后 user-data 和 meta-data
 都用 `yaml.safe_load` 验过能解析，`passwd` 里的 `p@ss #word` 也还是原值。
+
+## M8. Debian 13 云镜像的 apt 在 QEMU 里下载完就挂住，cloud-init 永远不完成
+
+**症状.** 2026-11-10 装 `debian-13`（trixie genericcloud arm64），SSH 12 秒
+就通、`vmkit.py install` 打印「已就绪」，但 `guest ping` 报「guest agent 不可达」，
+`qemu-guest-agent` 一个字节都没装上。`cloud-init status` 一直是 `running`。
+
+**排查过程与已排除的几条路.** 按顺序查的，每条都有实测证据，记下来免得下次重走：
+
+1. **不是网络慢。** 宿主机 `curl` 从同一个 VM 里下同一个文件 0.91 秒拿到
+   9.6 MB（`http://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.xz`），
+   换 `mirrors.ustc.edu.cn` 是 0.63 秒。https 同样 1.59 秒 13 MB。
+2. **不是 IPv6。** `getent hosts deb.debian.org` 只返回 AAAA 记录
+   （`2a04:4e42:8c::644`），而 QEMU user networking 没有 IPv6 路由，
+   apt 又没有 curl 的 Happy Eyeballs——看着像根因。但 `Acquire::ForceIPv4=true`
+   加上之后照样挂。
+3. **不是 mirrorlist 机制。** Debian 云镜像用 `/etc/apt/mirrors/debian.list`
+   加 `mirror+file` 方法重定向，换成写死的 `sources.list` 后仍挂。
+4. **不是 `_apt` 沙箱用户。** `-o APT::Sandbox::User=root` 禁用降权后仍挂。
+5. **不是并发。** `-o Acquire::Queue-Mode=access` 串行化之后仍挂。
+
+**真正的位置.** `apt-get -o Debug::Acquire::http=1 update` 的输出停在
+`Get:13 ... trixie/main arm64 Packages [9614 kB]`——**下载已经完成了**，
+大小和 curl 拿到的一致。此时 `ss -tnp` 显示那条到 Fastly（`199.232.162.132:80`）
+的连接是 `ESTAB`、`Recv-Q=0`、`Send-Q=0`，apt 主进程和各个方法进程全部阻塞在
+`do_select`，而 `sqv`（apt 2.9 的签名验证器，`/usr/lib/apt/methods/sqv`）
+CPU 时间是 `00:00:00`——一个跑了十几分钟却一秒 CPU 都没用过的进程。
+
+**结论.** 挂在 apt 下载完成之后的 sqv 验证上，是 Debian trixie 的 apt 2.9
+在这个 VM 环境里的内部问题，与本项目的 QEMU 参数、网络、cloud-init 配置都无关。
+没有找到不需要关闭签名验证的规避手段，所以不默认改 seed——为装一个包
+全局禁掉 `APT::Get::AllowUnauthenticated` 不划算。
+
+**影响与现状.** 只影响 Debian 系：`qemu-guest-agent` 装不上，于是
+`vmkit.py guest` 子命令和 stop 的「agent 优先」关机在 Debian 上不可用，
+stop 会走 SSH 那条路（照样能优雅关机）。Ubuntu 24.04 与 22.04 实测不受影响，
+cloud-init 十几秒内就把包装好了。VM 本身完全可用，登得进去、有网、能 SSH。
+
+**怎么让这件事当场可见.** `start_linux()` 在 SSH 就绪后多探一次 guest agent
+（`_warn_if_no_guest_agent`）：不通就明说「cloud-init 可能还在装包或装失败了」
+并给出客人机里的排查命令，而不是让「已就绪」把两种情况混成一句。装好包之后
+`guest ping` 会自己通，不需要重装 VM。
+
+**待验证.** apt 挂起是否只出现在 trixie 的 apt 2.9。bookworm（debian-12）
+用的是 apt 2.6，没有 sqv，理论上不受影响——但 debian-12 本轮没有完整装过，
+这条是推断不是实测。
+
+## M9. Windows RDP：guest 内完全正常，但宿主机经 hostfwd 连不上
+
+**症状.** 2026-11-10 装通 Windows 11 24H2 ARM64 后，宿主机连
+`127.0.0.1:21000`（QEMU hostfwd 到 guest 的 3389）发 RDP X.224 连接请求，
+拿到的是 0 字节，补发一次变成 `ECONNRESET`。
+
+**已确认正常的部分.** 四条都查过，都不是问题：
+
+1. hostfwd 参数是对的：`user,id=net0,hostfwd=tcp:127.0.0.1:21000-:3389,
+   hostfwd=udp:127.0.0.1:21000-:3389,hostfwd=tcp:127.0.0.1:20000-:22`。
+2. guest 里 3389 在 `::` 和 `0.0.0.0` 上都 Listen，`TermService` 是 Running。
+3. 防火墙三条 RDP 入站规则全部启用，Profile 覆盖 Domain/Private/Public。
+   guest 的网络类别是 Public——临时把 Public 防火墙整个关掉再测，
+   宿主机侧依然是 0 字节，所以不是防火墙。
+4. **从 guest 内部连自己的 3389 有正常响应**（TPKT/X.224 二进制应答），
+   连 `10.0.2.15:3389` 也有。RDP 服务本身是好的。
+
+**卡在哪.** slirp 从宿主机往 guest 的 3389 建连接这一跳。同一个 hostfwd
+机制下 SSH（`20000 -> guest:22`）完全正常，说明不是 slirp 整体坏了，
+而是这一条链路特有的失败。根因未定位，没有继续挖——`ss -tnp` 只能看到
+宿主机侧，guest 侧看不到 slirp 发起的连接最终怎么了。
+
+**现在能用的两条路.**
+
+1. **VNC（推荐）.** `22000`，RFB 3.8，安全类型 `01 01`（即 None，无认证），
+   实测握手正常。它是 QEMU 层的 framebuffer 服务，根本不经过 guest 网络，
+   所以不受这个问题影响。注意 QEMU 的 VNC 不给新客户端推首帧，
+   连上后画面是空的，要等客人机重绘（见 M 系列前面记的 VNC 三个坑）。
+2. **SSH.** `20000`，正常，管理员权限。
+
+**判断.** 记成已知限制，不阻塞 Windows 装机。真要 RDP，
+在同一台机器上跑 `Microsoft Remote Desktop` 连 `127.0.0.1:21000`
+能否绕过 slirp 这一跳，本轮没有实测（会弹 GUI 窗口）。

@@ -1358,6 +1358,7 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
     while time.time() < deadline:
         if linux_ssh_ready(vm):
             ok(f"SSH 已就绪，用时 {int(time.time() - t0)} 秒")
+            _warn_if_no_guest_agent(vm)
             return
         if not qemu_pid(vm):
             die(f"QEMU 中途退出了，看 {d / 'qemu.log'}")
@@ -1366,6 +1367,45 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
         time.sleep(3)
     warn("等了 5 分钟 SSH 仍未就绪。VM 还在跑，用 open 看窗口，"
          f"或 screenshot 抓画面，或看 {d / 'qemu.log'}")
+
+
+def _warn_if_no_guest_agent(vm: dict) -> None:
+    """SSH 通了之后探一次 guest agent，不通就说清楚。
+
+    SSH 就绪不等于 guest agent 可用，而这两件事在日志里原来长得一模一样
+    （都是「已就绪」）。差在哪：SSH 由云镜像自带，agent 要 cloud-init 现装
+    ——apt 慢或挂住时，VM 早就能登录了，agent 还要再等几分钟，甚至永远装不上。
+
+    实测踩过（2026-11-10，Debian 13）：SSH 12 秒通、install 打印「已就绪」，
+    而 cloud-init 的 apt-get update 卡在 sqv 里十几分钟没动，qemu-guest-agent
+    一个字节都没装上。宿主机这边 `guest ping` 报「套接字不存在」，
+    `stop` 于是从 agent 那条路降级——排障时没有任何线索指向 apt。
+
+    这里只 warn 不 die：agent 不影响 SSH 和窗口，VM 是可用的；而等它装上
+    是分钟级的事，卡在 install 里反而更糟。超时给 5 秒：agent 在跑时
+    ping 是毫秒级，5 秒足够区分「没装」和「慢」。
+    """
+    if vm.get("kind") != "linux":
+        return
+    sock = qga_sock_path(vm)
+    if not sock.exists():
+        # socket 都不在说明 QEMU 没带这个 chardev，那是装机参数问题，
+        # 不是客人机没装包——两种说法给用户指的方向完全不同。
+        warn(f"没有 guest agent 套接字（{sock}）。这台 VM 起不来"
+             f"qemu-guest-agent，guest 子命令和 agent 优先的关机都用不了。")
+        return
+    try:
+        qa = qga()
+    except OSError:
+        return
+    if qa.qga_ping(sock, timeout=5):
+        return
+    warn("guest agent 还不通。SSH 已经能用，但 cloud-init 可能还在装包"
+         "（qemu-guest-agent），也可能装失败了。\n"
+         "    在客人机里看：cloud-init status && systemctl status "
+         "qemu-guest-agent\n"
+         "    装好了之后 guest 子命令和 stop 的 agent 优先关机才会生效，"
+         "在那之前 stop 会走 SSH 那条路。")
 
 
 # ----------------------------------------------------------- Windows 安装 --
@@ -1487,6 +1527,10 @@ def qga_shutdown_wait(vm: dict, wait: int = 120) -> bool:
         log("guest agent 可达，让它走自己的关机流程")
         qa.qga_shutdown(sock)
     except qa.QGAError as e:
+        # ping 刚通，所以原因不可能是「agent 没在跑」——那是上一行已经排除
+        # 掉的。这里的真实原因只剩：连不上、超时、或这个 agent 版本不认识
+        # guest-shutdown。文案要能指回去，别再让人去 guest 里查一个已经
+        # 证明在跑的服务。
         warn(f"guest agent 关机没成：{e}")
         return False
     for _ in range(wait):
@@ -2603,7 +2647,7 @@ def cmd_guest(args) -> int:
             return 0
         if args.action == "shutdown":
             qa.qga_shutdown(sock)
-            log("已让客人机关机")
+            log("已通知客人机关机，它正在走自己的停止流程（进程退出要等几秒到几十秒）")
             return 0
     except qa.QGAError as e:
         die(str(e))
@@ -2882,6 +2926,24 @@ def cmd_snapshot(args) -> int:
         rc = _relay(proc, "snapshot")
         if rc != 0:
             die(f"快照操作失败（退出码 {rc}）")
+        return 0
+
+    # Windows 那块盘是 raw（安装器直接写块设备，qcow2 它不认），qemu-img
+    # snapshot 对它无效。但 winarm 有整套 APFS copy-on-write 克隆的快照实现
+    # （cp -c，秒级、增量），以前只有 vmkit 这一个入口时它完全摸不到——
+    # `snapshot create` 对 Windows VM 说的是「没有可拍快照的 qcow2 盘」，
+    # 而能力一直在，只是没接上。这里补上转发。
+    #
+    # 两边的词不一样：vmkit 说 create/apply，winarm 说 save/restore。
+    # 映射在这儿做，别让用户记两套动词。
+    if vm.get("kind") == "windows":
+        w = winarm()
+        os.environ.update(winarm_env(vm, True))
+        act = {"create": "save", "apply": "restore"}.get(args.action, args.action)
+        try:
+            w.cmd_snapshot(w.Cfg(), act, args.tag or "")
+        except w._Die as e:
+            die(str(e))
         return 0
 
     if args.action == "list":
