@@ -1274,3 +1274,47 @@ QEMU，刷新之后按钮自己变回「用系统窗口打开」。
 刚退出或没配 framebuffer 设备」——把人往 framebuffer 配置上引，而真相是它根本没
 起动过。改成先查进程（`qemu_pid`，它同时回答「在不在」「是不是僵尸」「是不是
 QEMU」），再查套接字。
+
+## M32. 「反应很慢」：每帧都过一遍 SwiftUI，光这一项就占掉每帧 12 毫秒里的绝大部分（已修）
+
+**2026-11-10 第十一轮。用户原话：「在虚拟机内，反应很慢，基本没法用鼠标，跟之前
+最早版本的性能根本没法比，没法用，彻底重构」。**
+
+一、先量再改。做了个假 RFB 服务端全速灌帧，把真实的 ConsoleView + VNCClient 编进
+harness，用 `getrusage` 数 app 自己烧的 CPU。基线（800×600）：33fps、39% CPU，
+折合每帧 12 毫秒 CPU；1920×1080：25fps、47%，每帧 18.8 毫秒。
+
+二、根因：**每帧都走了一遍 SwiftUI。** `VNCClient.frame` 是 `@Published`，而
+`VNCScreen` 是 `NSViewRepresentable` 且 `@ObservedObject var client`——于是一帧
+到达就是「objectWillChange → body 重算 → diff → updateNSView → needsDisplay」，
+整棵视图树（头部六七个控件、footer、representable）每秒失效几十次。真正拷字节的
+活儿（recv 1.9MB、blit memcpy、makeImage）只占零头。
+
+三、修法：`frame` 改成普通属性，加一个主线程回调 `onFrame`，画面视图在里面直接
+`needsDisplay`。SwiftUI 从此不出现在每帧那条路上；只有 guestWidth / connected /
+statusText 这些几秒才变一次的还走 @Published。
+
+四、实测（同一个 harness、同一台机器、同样的假服务端）：
+
+    800×600   每帧 CPU  12.0ms → 3.6ms    进程总 CPU  39% → 8%
+    1920×1080 每帧 CPU  18.8ms → 9.7ms    进程总 CPU  47% → 25%
+
+五、**没有据此下结论说「用户的卡顿治好了」。** 两件事没做到，如实记着：
+1. 没有真虚拟机在跑（linux1 关机），所以「客人机那一侧有多慢」完全没量过。
+   而 fnOS 装在 2 核 2G 上，那一侧很可能才是大头。
+2. 屏幕锁着（前台是 loginwindow），所有要合成系统输入的测试都跑不了。
+   **这一条逼着把端到端 harness 整个改成直接投递 NSEvent**——不再依赖 app 是
+   前台、屏幕锁没锁、有没有别人在用鼠标。实测这些条件不满足时，合成事件会凭空
+   消失，服务端一个 PointerEvent 都收不到，看上去和「app 根本不发鼠标事件」
+   一模一样（差点又误判成 app 的毛病）。
+
+六、顺带修掉一个真能感觉到的延迟：点下去的时候如果 200ms 内刚移过鼠标，就不再憋
+那 120ms 的延迟按压——客人机早就看见指针到位了。实测（按住不放才走得到那条路，
+快速点击会被 mouseUp 立刻补发 down+up 而绕过节流）：按住 0.85 秒没移过 → 按下
+139ms 后到；刚移过 50ms → 1ms 后到。
+
+七、**两个看着像瓶颈其实不是的，别再去优化**（都实测过）：
+1. framebuffer 大小不是瓶颈：1080p 每帧 CPU 只比 800×600 多 6 毫秒，而帧率一样。
+2. 请求节流不是瓶颈：20ms 下限和 2ms 下限交替跑三次，结果完全一样（24fps、
+   1.03 秒 CPU）。中间有一次测出 301fps，是脏数据（服务端没干净重启，旧连接
+   还在服务），别信。harness 的帧率上限是那个 Python 假服务端自己，不是 app。

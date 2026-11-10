@@ -195,6 +195,9 @@ private struct VNCScreen: NSViewRepresentable {
     func makeNSView(context: Context) -> VNCScreenView {
         let v = VNCScreenView()
         v.client = client
+        // 每帧自己要重画，绕开 SwiftUI 的发布通道。见 VNCClient.frame 的注释：
+        // 那是「反应很慢」的一部分，2026-11-10 实测每帧 12 毫秒 CPU 里的大头。
+        v.onFrame = { [weak v] in v?.needsDisplay = true }
         v.onLock = { locked = $0 }
         v.embedded = embedded
         return v
@@ -219,6 +222,10 @@ final class VNCScreenView: NSView {
         didSet { needsDisplay = true }
     }
     var onLock: ((Bool) -> Void)?
+    /// 新帧到了就要重画。由 VNCScreen 接上，见 VNCClient.frame 的注释。
+    var onFrame: (() -> Void)? {
+        didSet { needsDisplay = true }
+    }
 
     var locked = false {
         didSet {
@@ -312,6 +319,20 @@ final class VNCScreenView: NSView {
         // 真实用户本来就是先移动再点，所以这里照做，不赌客人机的脾气。
         client?.pointer(x: Int(p.x.rounded()), y: Int(p.y.rounded()), mask: buttons)
         buttons |= 1
+        // **刚刚才把指针移送到这儿，就不再憋那 120ms。**
+        //
+        // 那 120ms 本来是为了迁就图形安装器「要先看见指针到位才认点击」。而现在
+        // 鼠标移动本来就实时送给客人机（M29 之后就是了），只要 200ms 内移过，
+        // 客人机早就看见指针在这个位置上了，前提已经满足，再憋只是让每一次点击
+        // 都慢半拍。2026-11-10 用户报「反应很慢，基本没法用」——每点一下多等
+        // 120 毫秒正是其中一笔，而且是用户完全能感觉到的一笔。
+        //
+        // 反过来，指针已经在按钮上停了很久（用户盯着屏幕找人），或者压根没移过
+        // （刚连上、或者用键盘 Tab 走过去再回车），还是照老样子憋 120ms。
+        if Date().timeIntervalSince(lastMoveSentAt) <= 0.2 {
+            client?.pointer(x: Int(p.x.rounded()), y: Int(p.y.rounded()), mask: buttons)
+            return
+        }
         pendingPress = p
         // 120ms 后如果还没松开，就真发一次按下。
         //
@@ -326,6 +347,9 @@ final class VNCScreenView: NSView {
                                  mask: self.buttons)
         }
     }
+
+    /// 最近一次把指针位置送给客人机的时间。见 mouseDown 里那 120ms 的判断。
+    private var lastMoveSentAt = Date.distantPast
 
     override func mouseUp(with event: NSEvent) {
         let p = guestPoint(convert(event.locationInWindow, from: nil))
@@ -480,6 +504,7 @@ final class VNCScreenView: NSView {
         guestCursor.y += (now.y - center.y) / scale
         client?.pointer(x: Int(guestCursor.x.rounded()),
                         y: Int(guestCursor.y.rounded()), mask: buttons)
+        lastMoveSentAt = Date()
         warpToCenter()
     }
 
@@ -494,6 +519,7 @@ final class VNCScreenView: NSView {
         if buttons != 0 { flushPendingPress() }
         let p = guestPoint(convert(event.locationInWindow, from: nil))
         if !locked { guestCursor = p }
+        lastMoveSentAt = Date()
         client.pointer(x: Int(p.x.rounded()), y: Int(p.y.rounded()),
                        mask: buttons)
     }

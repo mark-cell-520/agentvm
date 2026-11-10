@@ -26,7 +26,21 @@ final class VNCClient: ObservableObject {
 
     // ------------------------------------------------------------ 对外状态 --
 
-    @Published private(set) var frame: CGImage?
+    /// 最新一帧。
+    ///
+    /// **故意不是 @Published。** 画面是每秒几十次在变的东西，而 @Published 每改
+    /// 一次，SwiftUI 就把整棵视图树失效一遍：body 重算、diff、updateNSView，
+    /// 一个都不少。2026-11-10 实测（800×600 全速灌帧）：走 @Published 每帧要烧
+    /// 12 毫秒 CPU，其中绝大部分是这条 SwiftUI 通道，真正拷字节的活儿只占零头。
+    /// 用户报「反应很慢」有一部分就在这儿。
+    ///
+    /// 改成主线程回调 onFrame，画面视图自己 needsDisplay——SwiftUI 完全不出现在
+    /// 每帧那条路上。只有 guestWidth / connected / statusText 这些几秒才变一次的
+    /// 东西还走 @Published。
+    private(set) var frame: CGImage?
+
+    /// 新的一帧到了，主线程调用。画面视图在这儿直接要重画。
+    var onFrame: (() -> Void)?
     @Published private(set) var guestWidth = 0
     @Published private(set) var guestHeight = 0
     @Published private(set) var connected = false
@@ -569,7 +583,10 @@ final class VNCClient: ObservableObject {
         lastFrameAt = Date()
         guard let img = ctx?.makeImage() else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.frame = img
+            guard let self else { return }
+            self.frame = img
+            // 直接要重画，不经过 SwiftUI 的发布通道（见 frame 的注释）。
+            self.onFrame?()
         }
     }
 }
