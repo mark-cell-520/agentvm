@@ -1192,3 +1192,57 @@ responder，两条路都通，每次移动往客人机送两次一模一样的 P
 和经典头文件不一样（activeInKeyWindow 32 / activeInActiveApp 64 / activeAlways 128，
 ActiveWhenFirstResponderOnly 整个被删了），照老教程写的选项组合会 silently 变成
 另一回事。判断某个选项到底生不生效，只能实测。
+
+## M30. 延迟按压把拖动整个吃掉；keysym 对不上就卡键；锁定模式两条路又同时开了（已修）
+
+**2026-11-10 第八轮。这一轮是在 M29 修完之后，用同一个端到端 harness 把输入
+通路整条跑一遍跑出来的——三个真毛病，全都是「协议字节对得上、语义是反的」那一类，
+只看代码看不出来。**
+
+一、**120ms 延迟按压把拖动整个吃掉了。** `mouseDown` 为了迁就图形安装器（要看到
+指针先移到按钮上才认这一下点击），按下之后憋 120ms 才真发 button-1。问题在于
+`buttons |= 1` 是立刻置上的，于是这 120ms 里每次拖动都带着 button1 的掩码发出去了，
+而客人机还没收到过按下。harness 实测到的完整顺序是：
+
+    移动@A(无键) → 拖动@B(带键) → 按下@A(带键) → 松开@A(无键)
+
+中间那些移动全白费，松开还回到按下点——拖选文字、拖安装器的滚动条整个不工作，
+而单击是好的（单击根本碰不到这条路径），所以极难归因。修法：`send()` 是所有指针
+事件的唯一出口，在那儿放一个「只要掩码非零就先把憋着的按下发掉」。**不能只堵
+`mouseDragged`**：实测合成事件在按住左键移动时是以 `mouseMoved`（不是
+mouseDragged）送到视图的，只堵 dragged 堵不住。松开那一侧也要改：按下补在按下点，
+松开放开手指的位置，原来两下都发在按下点上。
+
+二、**keysym 对不上就是永久卡键。** 原来用 `Set<UInt32>` 记「送下去过的 keysym」，
+keyUp 时再按 keysym 找回来发释放。可 keysym 是按下那一刻按修饰键算出来的：
+Shift+a 送下去的是 'A'(0x41)，而用户常常先松 Shift 再松 a——那一刻 keyUp 的
+modifierFlags 里已经没有 Shift，照 `characters` 算出来是 'a'(0x61)，对不上，
+释放永远发不出去。harness 实测：Shift 按下、A 按下、Shift 松开、a 松开，服务端
+只收到 A 的按下，没有松开；全局配对检查抓到 `0x41 剩 1 个按下没释放`。
+修法：**按虚拟键码记账**（`[UInt16: UInt32]`，键码 → keysym）。按下和松开必须是
+同一个物理键，而键码才是那个在修饰键变了之后仍然稳定不变的东西。同一个改动顺带
+修掉了「同一个 keysym 按两次只释放一次」。
+
+三、**锁定模式下两条通路又同时开了，而且是我自己刚引入的。** M29 第四点记着
+「两条通路不能同时开」，当时只拆了跟踪区域。这一轮为了「按 Esc 能释放鼠标」在
+`acquireLock()` 里加了 `win.makeFirstResponder(self)`（点「锁定鼠标」按钮之后
+first responder 是那个按钮，Esc 送不到画面视图上，而按钮的提示文字写着「按 Esc
+释放」）——于是一锁定，视图既是 first responder、窗口标志又置着，局部监视器转发的
+事件顺着响应链又进一次 `mouseMoved`。实测同一点连发三次，客人机收到 7 个
+PointerEvent，每步位移翻倍，指针像脱缰一样冲到屏幕边缘被夹住。
+修法：局部监视器 `return nil` 把事件吃掉，不再往下传。
+
+四、顺带修掉的：`viewWillMove(toWindow:)` 每次都用新的 observer 覆盖
+`keyObserver`，老窗口的 token 一直到 deinit 才移除，回调还会打过来。
+
+五、这一轮同时立下了 harness 自己的三条规矩（都是这一轮踩出来的，不遵守就会
+把 harness 的假象当成 app 的毛病）：
+1. **主线程一秒都不能堵。** 原来用 `usleep` 分隔合成事件，而 harness 自己就是那个
+   app——主线程睡着时 run loop 不转，AppKit 会把排队的 mouseMoved / flagsChanged
+   合并掉：5 个移动只剩最后 1 个，Shift+a 变成裸 a。改成挂主队列的重复定时器。
+2. **合成修饰键不能设空 flags。** `CGEvent(keyboardEventSource:virtualKey:keyDown:)`
+   之后设 `e.flags = []` 会把事件的修饰符字段抹掉，app 那边一个修饰键都看不到。
+   只在非空时才设。
+3. **合成 Command 要用真的 Command 键事件。** 在 'a' 那个事件上设
+   `flags = .maskCommand` 会把系统里的 Command 弄成粘滞——实测下一个测试段落才
+   收到 0xffeb 按下，而用户根本没按过 Command。按键码 0x37 真的按下去再起来。

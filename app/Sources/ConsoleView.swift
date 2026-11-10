@@ -339,11 +339,14 @@ final class VNCScreenView: NSView {
         // 极难归因。
         if let pending = pendingPress {
             pendingPress = nil
+            // 按下补在按下点（那是用户想点的东西），松开放开手指的位置。
+            // 原来两下都发在 pending 上：拖动结束时客人机看到的是「在 A 按下、
+            // 在 A 松开」，中间那些带着 button1 的移动全都白费——拖选文字、
+            // 拖滚动条整个不工作。
             client?.pointer(x: Int(pending.x.rounded()), y: Int(pending.y.rounded()),
                             mask: buttons | 1)
             buttons &= ~1
-            client?.pointer(x: Int(pending.x.rounded()), y: Int(pending.y.rounded()),
-                            mask: buttons)
+            client?.pointer(x: Int(p.x.rounded()), y: Int(p.y.rounded()), mask: buttons)
             return
         }
         buttons &= ~1
@@ -352,6 +355,13 @@ final class VNCScreenView: NSView {
 
     /// 已经送过移动、但 120ms 延迟按压还没发出去的位置。
     private var pendingPress: NSPoint?
+
+    /// 把憋着的那次按下立刻发掉（如果还没发）。拖动和松开都要先调它。
+    private func flushPendingPress() {
+        guard let q = pendingPress else { return }
+        pendingPress = nil
+        client?.pointer(x: Int(q.x.rounded()), y: Int(q.y.rounded()), mask: buttons)
+    }
 
     /// 鼠标移动的通道：自己装的那个跟踪区域。
     ///
@@ -433,7 +443,17 @@ final class VNCScreenView: NSView {
         send(event)
     }
 
-    override func mouseDragged(with event: NSEvent) { send(event) }
+    override func mouseDragged(with event: NSEvent) {
+        // 120ms 的延迟按压还没发出去就拖动：先把按下补在按下点上，再送这次拖动。
+        //
+        // 原来直接 send(event)，而 mouseDown 早就把 buttons 的第 0 位置上了——
+        // 于是客人机看到一个「带着 button1 的移动」跑在按下前面，接着按下才到
+        // （还在按下点），最后松开又回到按下点。中间那些移动全白费：拖选文字、
+        // 拖安装器的滚动条，整个不工作。2026-11-10 端到端 harness 实测到的顺序
+        // 是：移动@A(无键) → 拖动@B(带键) → 按下@A(带键) → 松开@A(无键)。
+        flushPendingPress()
+        send(event)
+    }
 
     override func mouseMoved(with event: NSEvent) {
         // 不锁鼠标时也要把移动发下去。原来是 `guard locked else { return }`：
@@ -465,6 +485,13 @@ final class VNCScreenView: NSView {
 
     private func send(_ event: NSEvent) {
         guard let client else { return }
+        // 只要这一下带着按键，就得保证「按下」已经先送出去了。
+        //
+        // 放在这个唯一出口上，而不是只放在 mouseDragged 里：实测合成事件在按住
+        // 左键移动时是以 mouseMoved（不是 mouseDragged）送到视图的，只堵
+        // mouseDragged 堵不住。不堵的后果是客人机看到一个「带着 button1 的移动」
+        // 跑在按下前面，接着按下才到，整段拖动白做（见 mouseDragged 的注释）。
+        if buttons != 0 { flushPendingPress() }
         let p = guestPoint(convert(event.locationInWindow, from: nil))
         if !locked { guestCursor = p }
         client.pointer(x: Int(p.x.rounded()), y: Int(p.y.rounded()),
@@ -505,13 +532,21 @@ final class VNCScreenView: NSView {
 
     // ------------------------------------------------------------ 键盘 --
 
-    /// 当前正按着、并且已经送给客人机的 keysym。
+    /// 当前正按着、并且已经送给客人机的键：**虚拟键码 → keysym**。
     ///
     /// 为什么需要一份名单：AppKit 不保证每个按下去的键都有对应的 keyUp 送到这个
     /// 视图——Command 按住期间松开的普通键没有 keyUp（loomhand/swift-rfb 的
     /// RFBView.swift 记过这条），切窗口、点标题栏按钮也不会有。漏一个，客人机就
     /// 一直认为那个键还按着：装系统时敲一个大写字母能卡住后面全部输入。
-    private var held = Set<UInt32>()
+    ///
+    /// **键码当键，不是 keysym 当键。** 原来用 `Set<UInt32>` 存 keysym，而 keysym
+    /// 是按下那一刻按修饰键算出来的：Shift+a 送下去的是 'A'(0x41)，可用户常常先
+    /// 松 Shift 再松 a，那一刻 keyUp 的 modifierFlags 里已经没有 Shift，照
+    /// characters 算出来是 'a'(0x61)——对不上，释放永远发不出去，客人机认为 A
+    /// 一直按着。2026-11-10 端到端 harness 实测：Shift 按下、A 按下、Shift 松开、
+    /// a 松开，服务端只收到 A 的按下，没有松开。同一个物理键的按下和松开必须能
+    /// 对上，而键码才是那个稳定不变的东西。
+    private var held = [UInt16: UInt32]()
 
     override func keyDown(with event: NSEvent) {
         // Esc 归谁，看锁不锁鼠标：
@@ -551,24 +586,29 @@ final class VNCScreenView: NSView {
         // （先按 a，再按着 Cmd 补一下 a），AppKit 又不会在 Command 按住期间补发
         // 它的 keyUp，所以在这里主动补释放。
         if event.modifierFlags.contains(.command) {
-            if let ks = keysym(for: event), held.remove(ks) != nil {
+            // 只补释放、不记按下：这个键在此之前是以普通键送下去的（先按 a，
+            // 再按着 Cmd 补一下 a），AppKit 又不会在 Command 按住期间补发它的
+            // keyUp，所以在这儿主动收口。见 held 的注释。
+            if let ks = held.removeValue(forKey: event.keyCode) {
                 client?.key(ks, down: false)
             }
             return
         }
         guard let ks = keysym(for: event) else { return }
         client?.key(ks, down: true)
-        held.insert(ks)
+        held[event.keyCode] = ks
     }
 
     override func keyUp(with event: NSEvent) {
         // Esc 的按下被 keyDown 提前消费掉了（关窗口 / 释放鼠标 / 嵌入时补发），
         // 这里不能再发一次释放——客人机会收到一个没有按下的 Esc key-up。
         if event.keyCode == 0x35 { return }
-        guard let ks = keysym(for: event) else { return }
         // 只有确实送过按下才补释放。没送过就发一个 key-up，客人机会看到一个
         // 凭空松开的键。
-        if held.remove(ks) != nil {
+        //
+        // 按键码取，不按 keysym 取：松手那一刻的修饰键可能已经变了（先松 Shift
+        // 再松字母就是），照 keysym 找会找不到，客人机就一直卡着那个键。
+        if let ks = held.removeValue(forKey: event.keyCode) {
             client?.key(ks, down: false)
         }
     }
@@ -604,7 +644,7 @@ final class VNCScreenView: NSView {
     /// （keyDown/keyUp 里维护）。两条路都必须在这里收口，否则客人机留着卡键。
     private func releaseAllKeys() {
         releaseModifiers()
-        for ks in held {
+        for ks in held.values {
             client?.key(ks, down: false)
         }
         held.removeAll()
@@ -632,6 +672,13 @@ final class VNCScreenView: NSView {
         //
         // 切 app 时补发按键释放，见 releaseAllKeys()。
         if let w = newWindow {
+            // 换窗口先把上一个观察者摘掉。原来直接覆盖 keyObserver：老窗口的
+            // token 一直到 deinit 才移除，而它的回调还会打过来（窗口已经换了，
+            // releaseAllKeys 打的是一条没人看的连接）。
+            if let keyObserver {
+                NotificationCenter.default.removeObserver(keyObserver)
+                self.keyObserver = nil
+            }
             keyObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didResignKeyNotification, object: w, queue: nil)
             { [weak self] _ in self?.releaseAllKeys() }
@@ -688,6 +735,13 @@ final class VNCScreenView: NSView {
 
     private func acquireLock() {
         guard let win = window else { return }
+        // 锁定期间键盘焦点必须在这个视图上。
+        //
+        // 「锁定鼠标」是个按钮：点它之后 first responder 是那个按钮，而不是画面
+        // 视图。这时候按 Esc，事件送到按钮上，哪儿也不去——而按钮的提示文字明明
+        // 写着「按 Esc 释放」。用户按了一通没反应，只能去找「释放鼠标」按钮点。
+        // 所以一锁定就把焦点抢回来（Esc 的处理在 keyDown 里）。
+        win.makeFirstResponder(self)
         NSCursor.hide()
         // 锁定模式切到窗口级监视器：相对移动要把指针无限拖出画面，而跟踪区域只
         // 覆盖自己的 bounds，指针一出画面就再也收不到事件。
@@ -704,8 +758,16 @@ final class VNCScreenView: NSView {
         removeMoveTracking()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) {
             [weak self] e in
-            if e.window == win { self?.mouseMoved(with: e) }
-            return e
+            guard let self, e.window == win else { return e }
+            self.mouseMoved(with: e)
+            // **吃掉，不再往下传。**
+            //
+            // 锁定期间这个视图是 first responder（acquireLock 开头抢的，为了收
+            // Esc），而窗口的 acceptsMouseMovedEvents 又置着——事件顺着响应链
+            // 会再进一次 mouseMoved。2026-11-10 端到端实测：不return nil 时，
+            // 同一点连发三次，客人机收到 7 个 PointerEvent，每步位移翻倍，
+            // 指针像脱缰一样冲到屏幕边缘被夹住。
+            return nil
         }
         guestCursor = NSPoint(x: (client?.guestWidth ?? 0) / 2,
                               y: (client?.guestHeight ?? 0) / 2)
