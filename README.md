@@ -160,9 +160,21 @@ macOS 虚拟机，app 一退出它就停。Windows/Linux 那套「安装甩后�
 画面是 app 内嵌的原生视图——比 VNC 清楚也快，但只能用 app 看。命令行也
 没有窗口可切。
 
-**3. 磁盘要留够。** IPSW 25.6 GB，装完之后系统盘实际写三十多 GB，峰值 60 GB
-以上。下载是 6 个连接并发的（实测单连接 1 MB/s、并发聚合 18.8 MB/s，
-25.6 GB 从 7 小时变成 23 分钟），中断了重跑会接着下。装完 IPSW 就可以删了。
+**3. 磁盘要留够。** 恢复镜像 25.6 GB，装完之后系统盘实际写三十多 GB。
+下载是单连接的（实测并发反而更慢，见下），中断了重跑会接着下。
+
+恢复镜像有全局缓存：`~/.agentvm/images/ipsw/`，和 Linux 云镜像、Windows ISO、
+virtio 驱动同一个待遇——一个文件全机器共用，随虚拟机的创建与删除生灭无关。
+装第二台 macOS 虚拟机时它直接被硬链过来，0 字节新占空间，那 25.6 GB 的下载
+也整段跳过（实测省 20 分钟以上）。缓存命中时 `install` 一开头就会说
+「复用本地恢复镜像 … 预计 5 到 10 分钟（镜像已在本地，不含下载）」，
+磁盘预估也跟着从 60 GB 降到 28 GB。
+
+**关于下载速度，别再往上加连接。** 2026-11-10 在 Apple CDN 上复测：
+串行单连接下四个 100 MB 段，2.8 / 3.1 / 3.0 / 5.5 秒（19 到 36 MB/s）；
+6 个 curl 并发、每段 100 MB，段耗时 8.8 到 16.2 秒，聚合 37 MB/s；
+2 个并发时每段 12.2 到 17.9 秒，比串行还慢。CDN 是按客户端限速的，
+加连接只是把每条的份额摊薄。所以下载就是一条 curl 连接加 `-C -` 续传。
 
 装完第一次启动会自动建账号、打开远程登录（SSH），不用进 Setup Assistant 手动点。
 
@@ -331,12 +343,16 @@ A macOS guest runs on Virtualization.framework, which comes with three limits
 the framework imposes, not this project choosing: it lives and dies with the app
 process (a VZ machine cannot be handed across processes, so closing the window
 shuts it down); it has no VNC, so its picture is a native view inside the app
-rather than the embedded RFB client; and it needs 60 GB of headroom, because the
-IPSW is 25.6 GB and the installed system writes another thirty-odd. The first
-boot creates the account and turns on remote login, so there is no Setup
-Assistant to click through. macOS licensing permits macOS VMs only on Apple
-hardware, and this repo ships no Apple software — the IPSW is fetched from
-Apple's servers for your specific machine.
+rather than the embedded RFB client; and its restore image is 25.6 GB with
+another thirty-odd written by the installed system. The image is cached once in
+`~/.agentvm/images/ipsw/` and hard-linked into each VM directory, so a second
+macOS guest costs 0 bytes and skips the download entirely. The download is a
+single curl connection on purpose — measured 2026-11-10 on Apple's CDN, six
+parallel range requests aggregate no more than one serial connection, and two
+are slower than one. The first boot creates the account and turns on remote
+login, so there is no Setup Assistant to click through. macOS licensing permits
+macOS VMs only on Apple hardware, and this repo ships no Apple software — the
+IPSW is fetched from Apple's servers for your specific machine.
 
 A Windows-on-ARM port runs on Hyper-V with an ARM64-native Linux guest. It is
 written against Hyper-V's command-line semantics but **has not been run on real

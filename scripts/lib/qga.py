@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shlex
 import socket
 import time
@@ -47,6 +48,11 @@ from pathlib import Path
 
 class QGAError(RuntimeError):
     """guest agent 不可用、超时，或返回了 error。message 直接给人看。"""
+
+
+# 一个字符串「看着像一整条 shell 命令行」的判据：有空白，或者含任一 shell
+# 元字符。用于区分「用户把整条命令引成了一个参数」和「这就是一个参数」。
+_SHELL_LINE_RE = re.compile(r"""[\s|&;<>()$`\\"'*?\[\]#~%]""")
 
 
 def qga_request(sock, payload: dict, timeout: float = 10.0) -> dict:
@@ -237,21 +243,30 @@ def qga_exec(sock, argv, timeout: float = 60.0) -> dict:
         ——排障时最想要的恰好就是那两段输出。
       * 输出在 status 里是 base64 编码的（agent 是 root，直接塞 JSON 会碰上
         二进制字节），必须解。
+
     argv 给字符串时按 `sh -c` 跑，和 tart exec 那边的用法保持一致。给列表时
     第一个元素不是绝对路径也套一层 `sh -c`：qemu-ga 的 guest-exec 对裸命令名
     的处理各版本不一样（新的用 g_spawn 带 G_SPAWN_SEARCH_PATH，PATH 里找得到；
     老的只 execv，非绝对路径直接报 Invalid parameter），套一层 sh 两条路都通，
     而且顺手把管道、重定向、shell 内建命令都带上——排障时最常用的恰恰是这些。
+
+    **列表只有一个元素、而它看着像一整条命令行时，直接当命令行用，不要
+    shlex.quote 它。** 实测踩过（2026-11-10）：`vmkit.py guest --name d1 exec
+    "uname -a && df -h /"` 是用户最自然的写法，argparse 收成
+    `["uname -a && df -h /"]`；走 shlex.join 会得到
+    `'/bin/sh' '-c' "'uname -a && df -h /'"`，sh 把那个带引号的串当成命令名，
+    报 `/bin/sh: 1: uname -a && df -h /: not found`——一句话被拆成三个词却
+    一个都没执行。多个元素的列表仍然逐个 quote 再拼回去，那样 `echo "a b"`
+    才能还原成原来那条命令行。
     """
     if isinstance(argv, str):
-        argv = ["/bin/sh", "-c", argv]
-    else:
-        argv = [str(a) for a in argv]
+        argv = [argv]
+    argv = [str(a) for a in argv]
     if not argv:
         raise QGAError("要给要执行的命令")
-    if not argv[0].startswith("/"):
-        # shlex.quote 逐个参数再拼回去，是为了把 `echo "a b"` 这类还原成
-        # 原来那条命令行，而不是让 sh 把它拆成两个参数。
+    if len(argv) == 1 and _SHELL_LINE_RE.search(argv[0]):
+        argv = ["/bin/sh", "-c", argv[0]]
+    elif not argv[0].startswith("/"):
         argv = ["/bin/sh", "-c", shlex.join(argv)]
     r = qga_request(sock, {
         "execute": "guest-exec",

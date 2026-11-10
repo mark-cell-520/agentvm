@@ -718,7 +718,18 @@ case "delete":
             MacEmit.error("没有 \(name) 这个虚拟机")
         }
         try FileManager.default.removeItem(at: dir)
-        MacEmit.log("\(name) 已删（\(dir.path)整个目录）", level: "info")
+        // 说清「什么被释放了、什么没有」。恢复镜像在全局缓存里是硬链，
+        // 删 VM 只是少一个链接，25.6 GB 那份数据还在（别的虚拟机可能正指着
+        // 它）。原来只说「整个目录」，用户会以为那 25.6 GB 也回来了。
+        let cache = MacVMPaths.ipswCacheDir
+        let shared = (try? FileManager.default.contentsOfDirectory(atPath: cache.path))?
+            .filter { !$0.hasPrefix(".") } ?? []
+        var msg = "\(name) 已删（\(dir.path) 整个目录）"
+        if !shared.isEmpty {
+            msg += "。恢复镜像仍在全局缓存 \(cache.path)（\(shared.joined(separator: "、"))），"
+                + "硬链删掉不影响它，别的 macOS 虚拟机还在用"
+        }
+        MacEmit.log(msg, level: "info")
         MacEmit.w(["t": "deleted", "name": name])
     } catch let e as MacVMError {
         MacEmit.error(e.message)

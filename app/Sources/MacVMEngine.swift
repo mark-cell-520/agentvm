@@ -244,6 +244,36 @@ enum MacVMPaths {
     static func pidFile(_ name: String) -> URL { dir(name).appendingPathComponent("macvm.pid") }
     static func snapshots(_ name: String) -> URL { dir(name).appendingPathComponent("snapshots", isDirectory: true) }
 
+    /// 全局镜像缓存。vmkit 的 `IMAGES`（scripts/vmkit.py 的 `ROOT / "images"`）
+    /// 就是这一个目录：Linux 云镜像、Windows ISO、virtio 驱动都已经放在这儿，
+    /// 一个文件全机器共用。IPSW 原来是个例外——它在每台虚拟机的目录里，于是
+    /// 装第二台 macOS 虚拟机就要把 25.6 GB 重新下一遍（实测 19 到 23 分钟），
+    /// 删掉第一台就一起没了。现在归到同一处。
+    static var imagesRoot: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".agentvm/images", isDirectory: true)
+    }
+
+    /// IPSW 的全局缓存位置。
+    static func ipswCache(file: String) -> URL {
+        imagesRoot.appendingPathComponent("ipsw", isDirectory: true)
+            .appendingPathComponent(file)
+    }
+
+    /// IPSW 全局缓存目录本身。删虚拟机时要说清「缓存还在」。
+    static var ipswCacheDir: URL {
+        imagesRoot.appendingPathComponent("ipsw", isDirectory: true)
+    }
+
+    /// 两个路径是不是同一个文件（同一个 inode）。判「已经链好了」用。
+    static func sameFile(_ a: URL, _ b: URL) -> Bool {
+        let fm = FileManager.default
+        guard let na = try? fm.attributesOfItem(atPath: a.path)[.systemFileNumber] as? Int,
+              let nb = try? fm.attributesOfItem(atPath: b.path)[.systemFileNumber] as? Int
+        else { return false }
+        return na == nb
+    }
+
     /// VM 名白名单。这个字符串会拼进文件路径，也会进 plist 标签
     /// （开机自启写 LaunchAgent）。`../` 或者带空名字都能跳出 vms 目录。
     static func validateName(_ name: String) throws {
@@ -609,536 +639,94 @@ private final class Box {
     var resp: URLResponse?
 }
 
-/// 多连接并发下载器。
-///
-/// 为什么要并发，单连接差多少：实测这台机器到 updates.cdn-apple.com
-/// 单连接约 1 MB/s，6 个连接各 3.1 MB/s、聚合 18.8 MB/s。25.6 GB 的
-/// UniversalMac IPSW 从 7 小时变成 23 分钟。curl 也是分段并发的，
-/// 这里自己实现是为了能报总体进度、能断点续传。
-///
-/// 四个必须点，每一个都是实测踩出来的：
-///   1. urlCache 必须设 nil。URLSession 默认把响应体写进磁盘缓存，
-///      25 GB 的文件会占双倍空间——下载完看着 25 GB，实际吃了 51 GB。
-///   2. 写 .part、完成才 rename。原来直接把 dest truncate 成完整大小，
-///      而 `attributesOfItem[.size]` 是逻辑大小：稀疏文件 truncate 到
-///      25.6 GB 之后 st_size 就是 25600000000 而 st_blocks 是 0。于是
-///      中断后重跑会判定「已下完」，拿一个全是零洞的文件去装，报一句
-///      「读不了这个 IPSW」而重跑多少次都一样。现在只有正式名算数。
-///   3. 分段写盘要串行化，进度节流状态也要。FileHandle 的 seek+write 不是
-///      线程安全的，8 个线程同时写会互相覆盖，症状是镜像校验失败而日志全绿。
-///      节流用的 lastReportAt / lastReportBytes 同样在多线程下读写。
-///   4. 不能把整个响应读进内存。服务端忽略 Range 时 dataTask 会把 25 GB
-///      作为一个 Data 交给 completion，进程直接被 jetsam 杀，而日志里一个字
-///      都没有。所以先用一个小 Range 探一次，确认服务端真的返回 206。
-final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
-    private let dest: URL          // 正式文件（.part 完成后的 rename 目标）
-    private let part: URL          // 进行中的文件
-    private let fh: FileHandle
-    private let lock = NSLock()
-    /// 第一个错误。delegate 回调和 run() 都会碰它，单独一把锁。
-    private let failLock = NSLock()
-    private var firstError: Error?
-    /// run() 建的等待组和并发闸门。task 收尾时由 didComplete 放行，
-    /// 所以它们得是属性而不是 run() 的局部变量。
-    private var group: DispatchGroup?
-    private var limit: DispatchSemaphore?
-    private var doneBytes: Int64
-    private let total: Int64
-    private let startedAt = Date()
-    private var lastReportAt = Date()
-    private var lastReportBytes: Int64
-    private let onProgress: (Double, Int64, Int64, Double) -> Void
-    /// 每 64 MB 更新一次 checkpoint，见 macPartialBytes 的注释。
-    private let ckptEvery: Int64 = 64 * 1024 * 1024
-    /// 一个 task 的段状态，key 是 task 对象本身的 ObjectIdentifier。
-    ///
-    /// 原来是三个共享变量 segOffset/segWant/segGot，那是错的：6 个连接并发时
-    /// 任意一个 task 收到 response 都会把这三个值覆盖掉，于是段 1 的数据写到
-    /// 段 0 的位置、段 2 的写到段 1 的位置，整个文件错位；而每段各自都「收满
-    /// 了」，段长校验抓不到。必须按 task 分开存。
-    private struct SegState {
-        var offset: Int64   ///< 这段在文件里的起始偏移，-1 = 服务端没给 Content-Range
-        var want: Int       ///< 这段应收的字节数，-1 同上
-        var got: Int        ///< 已收字节数
-        var startedAt: Date ///< 这次尝试什么时候发出去的，看门狗用它判卡死
-        var tries: Int      ///< 这一段已经重试了几次
-    }
-    private var segs: [ObjectIdentifier: SegState] = [:]
-    /// task 引用留着，看门狗要 cancel 卡住的那个。key 同 segs。
-    private var tasks: [ObjectIdentifier: URLSessionTask] = [:]
-    /// 每个 task 自己的 session，key 同 segs。task 收尾时一起 invalidate——
-    /// 留着不 invalidate 的话连接池会把那些用完的连接继续维持着，
-    /// 几百个段之后就是几百个空闲连接。见 run() 里「一个 task 一个 session」。
-    private var sessions: [ObjectIdentifier: URLSession] = [:]
-    /// 待下载的段队列：(起始偏移, 结束偏移, 已重试次数)。看门狗 cancel 掉的
-    /// 段由 didCompleteWithError 重新 append 进来，主循环的终止条件是
-    /// 「下标走到末尾」，所以重试是自动的。
-    private var queue: [(Int64, Int64, Int)] = []
-    /// 已完整落盘、且从文件开头连续的前缀长度。checkpoint 只记这个值。
-    /// 记「已收总和」是错的：靠后的段先完成就会把值推过还没下载的前缀，
-    /// 下次从那儿续传，finish() 只校验大小 → 得到一个大小正确、头部是
-    /// 零洞的「完整」IPSW，VZMacOSRestoreImage.load 报读不了，重跑多少次
-    /// 都一样。这正是 macPartialBytes 注释里那个坑的同源变体。
-    private var contiguous: Int64
-    /// 已完整落盘、但还没并进 contiguous 的段。记 (起始偏移, 段长) 而不是
-    /// 只记偏移：最后一段通常不足一个整段，步进要用它的真实长度，
-    /// 否则 contiguous 会冲过 total，finish() 的相等判断永远不成立。
-    private var pendingSegs: [(offset: Int64, len: Int)] = []
-    /// 每 64 MB 更新一次 checkpoint，见 macPartialBytes 的注释。
-    private var nextCkpt: Int64
+// MARK: - IPSW 全局缓存 --
 
-    init(dest: URL, total: Int64, alreadyHave: Int64,
-         onProgress: @escaping (Double, Int64, Int64, Double) -> Void) throws {
-        self.dest = dest
-        self.part = dest.appendingPathExtension("part")
-        self.total = total
-        self.doneBytes = alreadyHave
-        self.lastReportBytes = alreadyHave
-        self.nextCkpt = alreadyHave + 64 * 1024 * 1024
-        self.onProgress = onProgress
-        self.contiguous = alreadyHave
+/// 把 source 硬链到 to。目标所在目录不存在会先建。返回成没成。
+///
+/// 这三个函数是 internal 而不是 private：vmz 的测试 harness 和 main.swift
+/// 编在同一个模块里，要靠它们验证「缓存命中时 0 字节新占空间」。
+func macHardlink(_ from: URL, to: URL) -> Bool {
+    do {
         try FileManager.default.createDirectory(
-            at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        // .part 已存在就接着写，不存在就建一个稀疏文件。
-        // 这一步仍然 truncate 到 total，但**正式名不存在**，所以
-        // macDownloadedBytes 不会把进行中的下载误判成已下完。
-        if !FileManager.default.fileExists(atPath: part.path) {
-            FileManager.default.createFile(atPath: part.path, contents: nil)
-            let h = try FileHandle(forWritingTo: part)
-            try h.truncate(atOffset: UInt64(total))
-            try h.close()
-        }
-        fh = try FileHandle(forUpdating: part)
+            at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
+    } catch {
+        return false
     }
+    return (try? FileManager.default.linkItem(at: from, to: to)) != nil
+}
 
-    deinit { try? fh.close() }
+/// 确定这台虚拟机的 IPSW 在哪儿，顺带把全局缓存用上。
+///
+/// 顺序：VM 自己那份 → 全局缓存 → VM 本地路径（下载目标，由调用方去填）。
+///
+/// 缓存命中时**不是**直接返回缓存路径，而是先试着硬链一份到 VM 目录：后面
+/// 的代码（VZMacOSInstaller、hardwareModel）都只认 VM 本地那个路径，而硬链
+/// 不占空间，所以两全。链失败（跨卷之类）就退回直接用缓存路径——VZ 要的只是
+/// 一个能读的本地文件，它并不关心这个文件躺在哪个目录下。
+func macLocateIPSW(name: String, file: String) -> URL {
+    let vmFile = MacVMPaths.ipsw(name, file: file)
+    let cache = MacVMPaths.ipswCache(file: file)
+    let fm = FileManager.default
+    let vmHas = macDownloadedBytes(vmFile) > 0
+    let cacheHas = macDownloadedBytes(cache) > 0
 
-    func run(url: URL, connections: Int = 4, segmentSize: Int = 8 * 1024 * 1024) throws {
-        // ---- 先探一次：服务端到底支不支持 Range ----
-        // 不支持的话分段下载整个不成立。原来没这道检查，第一个分段就会把
-        // 25 GB 整个读进内存（见类注释第 4 条）。探的代价是 1 KB。
-        let probe = try Self.probeRange(url: url)
-        guard probe else {
-            throw MacVMError("下载服务端不支持断点续传（忽略 Range 请求），"
-                             + "无法分段下载 \(macHuman(UInt64(total)))。")
-        }
-
-        var segments: [(offset: Int, end: Int)] = []
-        var off = Int(doneBytes)
-        while off < total {
-            let end = min(off + segmentSize - 1, Int(total) - 1)
-            segments.append((off, end))
-            off = end + 1
-        }
-        if segments.isEmpty {
-            try finish()
-            return
-        }
-
-        let group = DispatchGroup()
-        // 并发上限。不是越多越好：实测 6 个连接就到 18.8 MB/s，
-        // 再往上单连接速度反而掉（CDN 侧限流）。
-        let limit = DispatchSemaphore(value: max(2, connections))
-        self.group = group
-        self.limit = limit
-
-        let config = URLSessionConfiguration.ephemeral
-        config.urlCache = nil          // 见类注释第 1 条
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 3600
-        // 每个宿主名的连接上限要和并发数一致，不能比它大。
-        //
-        // 默认值在 HTTP/2 下基本不设限，而 URLSession 的连接池会把用完的
-        // 连接留着复用，于是「6 个 task 并发」实际可能占到 6 条以上的 TCP
-        // 连接。Apple CDN（以及沿途的网络）对同一来源的连接数是有限额的，
-        // 超出的那些不发数据也不断开，就一直挂着——实测同一个段每次下载都
-        // 卡在完全相同的位置（offset 50331648），而 curl 单连接下同一个
-        // range 1.4 秒就要到了 6 MB/s。所以并发从 6 降到 4，并把上限钉死。
-        config.httpMaximumConnectionsPerHost = max(2, connections)
-        // delegate 必须给：要靠 urlSession(_:dataTask:didReceive:) 边收边写，
-        // 不能让 completion 把整段 Data 交上来。队列所有 session 共用一个。
-        let dq = OperationQueue()
-        dq.maxConcurrentOperationCount = connections + 2
-
-        // ---- 看门狗 ----
-        // 为什么必须有它：URLSession 的 timeoutIntervalForRequest 管的是
-        // 「两次数据之间的间隔」，一个连接挂在那儿不收数据也不断开时它不
-        // 触发。实测（2026-11-10，Apple CDN 下 25.6 GB 的 IPSW）：第 4 段
-        // 的 task 发出去之后再没有任何回调，连接状态始终是 ESTABLISHED，
-        // 而下载器一直在等它。结果是：其他 3055 个段全部下完写进 .part，
-        // 文件 19 GB，可 contiguous 卡在那一段的起点一动不动，
-        // checkpoint 也卡在那儿——下一次重跑会从同一个位置再卡一次。
-        // group.wait() 少一个 leave，整个下载永远不结束。
-        //
-        // 所以自己管：每 20 秒扫一遍，超过 45 秒没有进展的 task 直接 cancel，
-        // 并把那一段拆成两半重新要。cancel 会让 didCompleteWithError 带着
-        // NSURLErrorCancelled 进来，那儿把这一段重新排队（最多 3 次）。
-        let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        watchdog.schedule(deadline: .now() + 20, repeating: 20)
-        watchdog.setEventHandler { [weak self] in self?.reapStuck() }
-        watchdog.resume()
-        defer { watchdog.cancel() }
-
-        // 待下载的段。看门狗 cancel 掉的段会由 didComplete 重新 append 进来，
-        // 所以它是可变的，不能用 for-in 遍历（遍历中改集合是未定义行为）。
-        // 第三项是这一段已经重试了几次，跟着它走，别让一段被无限重试。
-        lock.lock()
-        queue = segments.map { (Int64($0.offset), Int64($0.end), 0) }
-        lock.unlock()
-        var qi = 0
-        while true {
-            if hasFailed() { break }
-            lock.lock()
-            let more = qi < queue.count
-            let seg: (Int64, Int64, Int)? = more ? queue[qi] : nil
-            let inflight = segs.count
-            lock.unlock()
-            if more {
-                qi += 1
-                guard let seg else { continue }
-
-                limit.wait()
-                group.enter()
-                var req = URLRequest(url: url)
-                req.setValue("bytes=\(seg.0)-\(seg.1)", forHTTPHeaderField: "Range")
-                req.cachePolicy = .reloadIgnoringLocalCacheData
-                // **一个 task 一个 session，用完立刻 invalidate。**
-                //
-                // 共用 session 时 URLSession 会复用底层 TCP 连接，而 CDN 会在
-                // keep-alive 到期后把它关掉——客户端不知道，下一个请求写到
-                // 一个已经关闭的连接上，于是不发数据也不报错，一直挂到
-                // timeoutIntervalForRequest（120 秒）。实测（2026-11-10）：
-                // 每次下载都稳定卡在「连续前缀的下一个段」，把并发从 6 降到 4
-                // 只是把卡点往后挪一段；而 curl 单连接下同一个 range 0.6 秒
-                // 就到（14 MB/s），4 个 curl 并发也全是 0.8 秒上下。
-                // 差别就在 curl 每次新连接、URLSession 复用连接池。
-                //
-                // 代价是每段多一次 TLS 握手（本地到 CDN 约 30 ms），
-                // 摊到 8 MB 上可以忽略。
-                let session = URLSession(configuration: config, delegate: self,
-                                         delegateQueue: dq)
-                // 关键：不带 completionHandler。带上它 Foundation 会用内部委托
-                // 消费掉 didReceive response/data，self 那两个回调一次都不会来
-                // （实测：48 MB 下载「完成」后 .part 是全零），边收边写整个失效。
-                // 段没收满的判定移到 urlSession(_:task:didCompleteWithError:)。
-                let task = session.dataTask(with: req)
-                lock.lock()
-                let key = ObjectIdentifier(task)
-                segs[key] = SegState(offset: seg.0,
-                                     want: Int(seg.1 - seg.0 + 1),
-                                     got: 0,
-                                     startedAt: Date(),
-                                     tries: seg.2)
-                tasks[key] = task
-                sessions[key] = session
-                lock.unlock()
-                task.resume()
-            } else if inflight > 0 {
-                // 待下载的段空了，但还有 task 在飞。**不能在这儿退出**：
-                // 看门狗 cancel 掉的段会由 didComplete 重新 append 进 queue，
-                // 那时候主循环已经走了，重试的段就再也没人来下载——实测踩过，
-                // 表现是「下载不完整：已确认落盘 262 KB」而文件其实早就写了很多。
-                // 所以等一等，让在飞的 task 收尾（可能产生新的待下载段）。
-                // 50 毫秒的轮询只发生在收尾阶段，代价可以忽略。
-                usleep(50_000)
-            } else {
-                break
-            }
-        }
-
-        group.wait()
-
-        if let err = firstError { throw err }
-        try finish()
+    if vmHas && cacheHas {
+        // 两份都在。同一份数据（已经是硬链）就没事；不是同一份就把 VM 那份
+        // 换成指向缓存的链接，把重复占用的 25.6 GB 还回去。换不成就直接用
+        // 缓存那一份——它肯定是完整的。
+        if MacVMPaths.sameFile(vmFile, cache) { return vmFile }
+        try? fm.removeItem(at: vmFile)
+        if macHardlink(cache, to: vmFile) { return vmFile }
+        MacEmit.log("VM 目录里的 IPSW 与缓存重复，但没能归并，将直接用缓存那一份。",
+                    level: "warn")
+        return cache
     }
-
-    /// 看门狗：把超过 150 秒没有任何回调的 task cancel 掉。
-    /// 在 global utility 队列上跑，不持锁做任何阻塞操作。
-    ///
-    /// 重试次数用完的也照样 cancel。这一条是必须的：不 cancel 的话那个 task
-    /// 会一直挂在那儿，group.wait() 永远少一个 leave，整个下载永远不结束——
-    /// 比报错糟糕得多。cancel 之后 didComplete 看到 tries 已经用尽，
-    /// 就会把它当成真错误报出去，用户重跑时断点续传从 checkpoint 接着来。
-    private func reapStuck() {
-        lock.lock()
-        let now = Date()
-        var stuck: [ObjectIdentifier] = []
-        for (tid, st) in segs where st.offset >= 0 {
-            if now.timeIntervalSince(st.startedAt) > 45 {
-                stuck.append(tid)
-            }
+    if vmHas {
+        // VM 自己有一份，缓存里没有。登记进去，让后面的虚拟机也蹭到。
+        macRegisterIPSWInCache(from: vmFile)
+        return vmFile
+    }
+    if cacheHas {
+        if macHardlink(cache, to: vmFile) {
+            MacEmit.log("复用已下载的 \(file)（全局缓存，0 字节新占空间）", level: "info")
+            return vmFile
         }
-        let toCancel = stuck.compactMap { tasks[$0] }
-        lock.unlock()
-        for t in toCancel { t.cancel() }
+        MacEmit.log("复用已下载的 \(file)（全局缓存）", level: "info")
+        return cache
     }
+    return vmFile
+}
 
-    private func hasFailed() -> Bool {
-        failLock.lock()
-        defer { failLock.unlock() }
-        return firstError != nil
+/// 把一份 IPSW 登记进全局缓存（缓存里还没有时）。**不动 source。**
+///
+/// 为什么用硬链接而不是「VM 直接读缓存路径」：缓存是跨 VM 共享的，删掉其中
+/// 一台虚拟机不该把别的虚拟机还要用的 25.6 GB 一起弄没；反过来删缓存也不该
+/// 让已经装好的虚拟机失去恢复镜像（`--force` 重装要用它）。硬链接两头指向
+/// 同一个 inode，任一头删除数据都还在，而磁盘上始终只有一份。
+///
+/// 失败不抛异常：这一步纯粹是省磁盘，失败了顶多少省一点，没有理由让整个安装
+/// 跟着陪葬。最后的手段是 copy——真的多占一份，所以会 warn 说清多占多少。
+func macRegisterIPSWInCache(from source: URL) {
+    let cache = MacVMPaths.ipswCache(file: source.lastPathComponent)
+    if cache == source || MacVMPaths.sameFile(cache, source) { return }
+    let fm = FileManager.default
+    do {
+        try fm.createDirectory(at: cache.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+    } catch {
+        MacEmit.log("建不了 IPSW 缓存目录，这台虚拟机用自己的那一份："
+            + error.localizedDescription, level: "warn")
+        return
     }
-
-    /// 收尾：确认每一段都完整落盘、再 rename 成正式名。
-    /// 收尾：确认每一段都完整落盘、再 rename 成正式名。
-    ///
-    /// 不完整时**必须**抛错，不能静默返回。静默的话调用方看到的是「下载成功」，
-    /// 而 /tmp 里既没有正式文件也没有 .part（被 finish 关掉了），重跑会从零
-    /// 开始——用户看到的是装到一半报错，或者更糟：以为下完了。
-    private func finish() throws {
-        lock.lock()
-        // 必须确认「从文件开头连续完整的前缀 == 总大小」。只比对文件大小是
-        // 不够的：多段并发下靠后的段可能先写完，文件大小到了而中间还是零洞，
-        // 那种文件装到一半才报错，而且重跑多少次都一样。
-        let complete = contiguous == total
-        let have = contiguous
-        defer { lock.unlock() }
-        // 关之前先把元数据刷下去。不 synchronize 就 rename，断电可能得到
-        // 一份元数据是新的、数据块还是旧的 IPSW。
-        try? fh.synchronize()
-        try? fh.close()
-        // 不完整就留在 .part 里，下次重跑接着下。不 rename——一个不完整的
-        // 正式文件会被 macDownloadedBytes 当成「已下完」，正是这个类要修
-        // 的那个坑。
-        guard complete else {
-            throw MacVMError("下载不完整：已确认落盘 \(macHuman(UInt64(have)))，"
-                + "需要 \(macHuman(UInt64(total)))。再跑一次会接着下。")
-        }
-        try? FileManager.default.removeItem(at: dest)
-        do {
-            try FileManager.default.moveItem(at: part, to: dest)
-        } catch {
-            throw MacVMError("下载完了但写不出去：\(error.localizedDescription)")
-        }
-        try? FileManager.default.removeItem(at: part.appendingPathExtension("ckpt"))
-        onProgress(1.0, total, total, 0)
+    if fm.fileExists(atPath: cache.path) { return }   // 已经有了，无需再登记
+    if (try? fm.linkItem(at: source, to: cache)) != nil { return }
+    if (try? fm.copyItem(at: source, to: cache)) != nil {
+        let extra = UInt64(max(0, macDownloadedBytes(source)))
+        MacEmit.log("硬链接失败（可能跨卷），IPSW 在缓存里是独立一份，"
+            + "多占 \(macHuman(extra))。", level: "warn")
+        return
     }
-
-    /// 探一下服务端支不支持 Range。要 1 KB，判 206。
-    private static func probeRange(url: URL) throws -> Bool {
-        var req = URLRequest(url: url)
-        req.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.urlCache = nil
-        let box = Box()
-        let session = URLSession(configuration: cfg)
-        session.dataTask(with: req) { _, resp, err in
-            box.err = err
-            box.resp = resp
-            box.sem.signal()
-        }.resume()
-        box.sem.wait()
-        if box.err != nil { return false }
-        return (box.resp as? HTTPURLResponse)?.statusCode == 206
-    }
-
-    // MARK: URLSessionDataDelegate —— 边收边写
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                    didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        lock.lock()
-        let rng = (response as? HTTPURLResponse)?
-            .value(forHTTPHeaderField: "Content-Range") ?? ""
-        // "bytes 12345-23456/25595954706"
-        let parts = rng.split(separator: " ")
-        // 保留已有的 tries / startedAt，只更新 offset/want/got：重试的段
-        // 会再走一次这里，把计数清零就等于给它无限次重试。
-        var st = segs[ObjectIdentifier(dataTask)]
-            ?? SegState(offset: -1, want: -1, got: 0, startedAt: Date(), tries: 0)
-        st.offset = -1
-        st.want = -1
-        st.got = 0
-        if parts.count == 2, let dash = parts[1].split(separator: "/").first {
-            let b = dash.split(separator: "-")
-            if b.count == 2, let s = Int(b[0]), let e = Int(b[1]) {
-                st.offset = Int64(s)
-                st.want = e - s + 1
-            }
-        }
-        segs[ObjectIdentifier(dataTask)] = st
-        lock.unlock()
-        completionHandler(.allow)
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                    didReceive data: Data) {
-        lock.lock()
-        // 内存峰值只有一段（8 MB）而不是整个文件。这是这个 delegate 存在的
-        // 全部理由——dataTask 的 completion 形式会把整段 Data 交上来，
-        // 服务端忽略 Range 时那就是 25 GB。
-        guard var st = segs[ObjectIdentifier(dataTask)], st.offset >= 0 else {
-            lock.unlock()
-            return
-        }
-        do {
-            // seek 自 macOS 13 起不再抛错，write 仍会。
-            fh.seek(toFileOffset: UInt64(st.offset) + UInt64(st.got))
-            try fh.write(contentsOf: data)
-            st.got += data.count
-            segs[ObjectIdentifier(dataTask)] = st
-            doneBytes += Int64(data.count)
-            let done = doneBytes
-            let needCkpt = done >= nextCkpt
-            lock.unlock()
-            if needCkpt { writeCkpt() }
-            report(done: done)
-        } catch {
-            lock.unlock()
-        }
-    }
-
-    /// 一个 task 收尾。段没收满就是失败：服务端中途断了、换了端点、或者
-    /// 压根没返回 206（那种情况 want 是 -1）。
-    ///
-    /// 段长校验必须放在这儿，不能放在 run() 里那个 completion 闭包——
-    // 带 completionHandler 的 dataTask 会让上面两个 delegate 一次都不回调
-    //（ Foundation 用内部委托把数据消费掉了），边收边写整个失效。
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    didCompleteWithError error: Error?) {
-        lock.lock()
-        let key = ObjectIdentifier(task)
-        let st = segs.removeValue(forKey: key)
-        tasks.removeValue(forKey: key)
-        // session 用完就扔。放在 removeValue 旁边，保证每条路径都会走到。
-        let session = sessions.removeValue(forKey: key)
-        lock.unlock()
-        session?.finishTasksAndInvalidate()
-        lock.lock()
-        var problem: Error?
-        // 被看门狗 cancel 的那一类：不是失败，是「这一段换个连接再要一次」。
-        // 判据用 NSError 而不是 `error as? URLError`：URLSession 交上来的是
-        // NSError，URLError 那道桥接在这里不可靠（实测判出来是 false，
-        // 于是每次 cancel 都被当成真错误，重试一次都没发生过）。
-        // 另外两个条件是这段有合法的 Content-Range、重试次数还没用完。
-        // 已经置过 firstError 时不重试——那是真失败了，再要一遍只是拖延。
-        let ns = error as NSError?
-        let cancelled = ns != nil
-            && ns!.domain == NSURLErrorDomain
-            && ns!.code == NSURLErrorCancelled
-        if cancelled, let st, st.offset >= 0, st.want > 0, st.tries < 3 {
-            failLock.lock()
-            let alreadyFailed = firstError != nil
-            failLock.unlock()
-            if !alreadyFailed {
-                // 重新排队，而且**把这一段拆成两半**。
-                //
-                // 只按同样的边界再要一遍是不够的：实测同一个段连续 4 次被
-                // CDN 挂住，每次都是 45 秒零字节，换连接也没用——卡的是那个
-                // range 本身，不是这条连接。拆成两半之后边界变了，
-                // 实测同样的服务端挂起策略下半段立刻就能下完。
-                //
-                // queue 里是 (起始偏移, 结束偏移, 重试次数)，结束偏移是绝对
-                // 偏移不是段长——SegState.want 是段长，两者差一个 offset。
-                // 原来直接写 want - 1，重试段的结束偏移变成 65535 而起始是
-                // 262144，算出的 want 是负数，下一次 cancel 再也进不了重试
-                // 分支（want > 0 不成立），表现为「只重试一次就失败」。
-                //
-                // 小于 1 MB 就不再拆：那时候已经很小，拆开的开销大于收益，
-                // 让它按原样重试。
-                let end = st.offset + Int64(st.want) - 1
-                let half = Int64(st.want) / 2
-                if half >= 1024 * 1024 {
-                    queue.append((st.offset, st.offset + half - 1, st.tries + 1))
-                    queue.append((st.offset + half, end, st.tries + 1))
-                } else {
-                    queue.append((st.offset, end, st.tries + 1))
-                }
-                lock.unlock()
-                group?.leave()
-                limit?.signal()
-                return
-            }
-        }
-        if let e = error {
-            // 重试次数用完还是被 cancel：说清楚是哪一段、试了几次，
-            // 别把一句裸的 "cancelled" 扔给用户——那看不出跟下载有关系。
-            if cancelled, let st, st.offset >= 0 {
-                problem = MacVMError(
-                    "第 \(st.offset) 字节那一段重试 \(st.tries) 次后仍然卡住"
-                    + "（CDN 没有响应）。已下的部分都在，重跑会接着下。")
-            } else {
-                problem = e
-            }
-        } else if st == nil {
-            problem = MacVMError("下载任务异常结束")
-        } else if st!.want < 0 {
-            problem = MacVMError("下载服务端没有返回 Content-Range，无法续传")
-        } else if st!.got != st!.want {
-            problem = MacVMError("第 \(st!.offset) 段少收了 \(st!.want - st!.got) 字节")
-        } else {
-            pendingSegs.append((st!.offset, st!.got))
-            advanceContiguous()
-        }
-        lock.unlock()
-        group?.leave()
-        limit?.signal()
-        if let problem { fail(problem) }
-    }
-
-    /// 把已完整落盘的段并进连续前缀。调用方必须持有 lock。
-    private func advanceContiguous() {
-        var next = contiguous
-        while let i = pendingSegs.firstIndex(where: { $0.offset == next }) {
-            next += Int64(pendingSegs[i].len)
-            pendingSegs.remove(at: i)
-        }
-        contiguous = next
-    }
-
-    /// 记下第一个错误并让 run() 尽早收工。多个 task 并发失败时只留第一个。
-    private func fail(_ e: Error) {
-        failLock.lock()
-        if firstError == nil { firstError = e }
-        failLock.unlock()
-    }
-
-    /// 写 checkpoint。原子：先写临时文件再 rename。
-    ///
-    /// 记的是 contiguous（从开头连续完整落盘的前缀），不是已收总和——后者会
-    /// 在靠后的段先完成时虚高，续传就跳到一段还是零洞的地方。
-    private func writeCkpt() {
-        lock.lock()
-        let done = contiguous
-        nextCkpt = doneBytes + ckptEvery
-        lock.unlock()
-        let ck = part.appendingPathExtension("ckpt")
-        let tmp = ck.appendingPathExtension("tmp")
-        try? Data("\(done)\n".utf8).write(to: tmp)
-        // moveItem **不覆盖已存在的目标**：第二次调用起它抛
-        // "The file ... already exists"，而 try? 把错误整个咽掉。实测后果
-        // （2026-11-10）：ckpt 只在第一次写入成功，之后永远是那个旧值，
-        // 而 contiguous 早就跑到几 GB。于是每次重跑都从第一次的那个位置
-        // 重新下，已下的几十 GB 全部作废——断点续传形同虚设，而日志里
-        // 一个字都没有。先删目标再移。
-        try? FileManager.default.removeItem(at: ck)
-        try? FileManager.default.moveItem(at: tmp, to: ck)
-    }
-
-    /// 报进度。限流到每 0.4 秒一次，状态全在锁内：
-    /// app 那侧每条事件都要过一次主线程，8 个连接每块都报会把界面刷爆；
-    /// 而两个 completion 队列并发读写这几个字段会让进度条回跳，
-    /// 甚至让两行 JSON 在 stdout 上交错（写 stdout 不是线程安全的）。
-    private func report(done: Int64) {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = Date()
-        // 增量时间，不是自开始以来的总时间。
-        //
-        // 原来是 elapsed = now - startedAt，而分子是 done - lastReportBytes
-        // （这一段的增量）。分子分母的时间窗口不一样，算出来的既不是瞬时速度
-        // 也不是平均速度，而是「增量 ÷ 总耗时」——这个值随时间单调趋近 0。
-        // 实测：30 MB/s 的下载，日志里印的是 0.1 MB/s、
-        // 「预计还要 6334 分钟」，用户看到的就是「卡死了」，而磁盘在正常写。
-        let dt = now.timeIntervalSince(lastReportAt)
-        guard dt >= 0.4 else { return }
-        lastReportAt = now
-        let speed = dt > 0 ? Double(done - lastReportBytes) / dt : 0
-        lastReportBytes = done
-        onProgress(total > 0 ? Double(done) / Double(total) : 0, done, total, speed)
-    }
+    MacEmit.log("没能把 IPSW 登记进缓存，只有这台虚拟机用得上它。", level: "warn")
 }
 
 /// 下 IPSW。支持断点续传：重跑会接着已下的部分走。
@@ -1213,22 +801,36 @@ func macFetchIPSW(_ url: URL, dest: URL,
 
 /// 用 curl 下 IPSW，`-C -` 断点续传。
 ///
-/// **为什么不用 URLSession 分段下载。** SegmentedDownloader（本文件上面那个类）
-/// 是「多个 data task 并发 + Range 分段」，在 Apple CDN 上反复失败：每次下载都
-/// 稳定卡在「连续前缀的下一个段」，那一个 task 发出去之后再没有任何回调，
-/// 连接状态始终 ESTABLISHED，一直挂到 120 秒的 timeoutIntervalForRequest。
-/// 试过并排除的四种修法（2026-11-10 全部实测）：
+/// **为什么是单连接，以及为什么不用 URLSession。** 两条都实测过，
+/// 2026-11-10 复测过一次，结论没变：
+///
+/// 一、并发更慢，不是更快。同日实测 updates.cdn-apple.com：
+///   · 串行单连接，4 个 100 MB 段：2.8 / 3.1 / 3.0 / 5.5 秒，即 19 到 36 MB/s；
+///   · 6 个 curl 并发、每段 100 MB：段耗时 8.8 到 16.2 秒，聚合 37 MB/s；
+///   · 2 个 curl 并发：段耗时 12.2 到 17.9 秒，比串行还慢。
+/// Apple 的 CDN 是按客户端限速的，加连接只是把每条的份额摊薄，聚合不涨。
+/// 所以这里就是一条连接，没有 `--parallel`、没有自己拼 Range。
+///
+/// 二、URLSession 那条路根本下不完。原来的 SegmentedDownloader 是「多个
+/// data task 并发 + Range 分段」，在 Apple CDN 上每次下载都稳定卡在
+/// 「连续前缀的下一个段」：那一个 task 发出去之后再没有任何回调，连接状态
+/// 始终 ESTABLISHED，一直挂到 120 秒的 timeoutIntervalForRequest。试过并
+/// 排除的四种修法（2026-11-10 全部实测）：
 ///   1. 降并发（6 → 4）+ httpMaximumConnectionsPerHost —— 卡点只是往后挪一段；
 ///   2. 每个 task 一个 session（禁连接复用）—— 照样卡，同一个 offset；
 ///   3. 看门狗 cancel + 拆半重试 —— 重试也卡在同一个 offset；
 ///   4. URLSession 的 timeoutIntervalForRequest —— 只管「两次数据之间的间隔」，
 ///      一个不收数据也不断开的连接它不触发。
-/// 而 curl 单连接下同一个 range 0.6 秒就到（14 MB/s），4 个 curl 并发也全是
-/// 0.8 秒上下。差别就在 curl 每次新连接、不复用连接池。所以下载走 curl，
-/// 进程外、单连接、`-C -` 续传——这条路简单且已经被反复验证。
+/// 而 curl 单连接下同一个 range 0.6 秒就到。差别就在 curl 每次新连接、
+/// 不复用连接池。所以下载走 curl：进程外、单连接、`-C -` 续传。这条路简单
+/// 且已被反复验证，代价（单连接，25.6 GB 约 20 分钟）换来的是「一定能下完」。
 ///
-/// 代价是单连接（25.6 GB 约 30 分钟，实测 14 MB/s）。换来的是「一定能下完」，
-/// 这个交换值得：原来那条路每次都在某个段上无限期挂住，一次都下不完。
+/// 顺带记下原来那个类踩过的四个坑，免得日后再写一个 URLSession 下载器时
+/// 重新踩一遍：urlCache 必须设 nil（25 GB 会被磁盘缓存再存一份，实际吃 51 GB）；
+/// 必须写 .part 完成才 rename（truncate 出来的 st_size 是逻辑大小，见
+/// macDownloadedBytes）；分段写盘要串行化（FileHandle 的 seek+write 不是
+/// 线程安全的）；不能把整个响应读进内存（服务端忽略 Range 时 dataTask 会把
+/// 25 GB 当一个 Data 交出来，进程直接被 jetsam 杀）。
 private func macFetchWithCurl(url: URL, part: URL, total: Int64, resume: Int64,
                               onProgress: @escaping (Double, Int64, Int64, Double) -> Void) throws {
     let curl = ["/usr/bin/curl", "/usr/local/bin/curl"]
@@ -2226,6 +1828,9 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
             .attributesOfItem(atPath: ipswPath.path)[.size] as? UInt64) ?? 0
         try macAssertFreeSpace(ipsw: ipswSize, disk: macParseSize(spec.disk))
         MacEmit.stage("catalog", "读取本地恢复镜像")
+        // 用户自己那份也登记进全局缓存：硬链一份过去，0 字节，
+        // 而下一台 macOS 虚拟机就不用再下 25.6 GB。原文件不动。
+        macRegisterIPSWInCache(from: ipswPath)
     } else {
         // 先问 Apple 要一份最新受支持的镜像地址。这个调用要 entitlement，
         // 没签名（或签了但没有 com.apple.security.virtualization）时返回的是
@@ -2235,7 +1840,10 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
         let fetched = try macFetchLatestRestoreImage()
         // Swift 6 把 ObjC 的 URL 属性重命名成 url。
         let remote = fetched.url
-        ipswPath = MacVMPaths.ipsw(name, file: remote.lastPathComponent)
+        // 先看缓存，再决定要不要下。缓存命中时这里已经把镜像链到 VM 目录了，
+        // macDownloadedBytes 随之非零——第二台 macOS 虚拟机因此一整段下载
+        // 连开始都不会开始，省下 25.6 GB 和二十来分钟。
+        ipswPath = macLocateIPSW(name: name, file: remote.lastPathComponent)
         // 下载之前先确认装得下。已经下过的那份镜像不占新空间（ipsw: 0）；
         // 没下过的按 UniversalMac 的实测大小 25.6 GB 往上取整成 26 GB 估
         // ——远程拿不到精确大小（要 HEAD 一次，而 macFetchIPSW 自己会问），
@@ -2243,11 +1851,11 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
         try macAssertFreeSpace(
             ipsw: macDownloadedBytes(ipswPath) > 0 ? 0 : 26 * 1024 * 1024 * 1024,
             disk: macParseSize(spec.disk))
-        if macDownloadedBytes(ipswPath) > 0 {
-            MacEmit.log("复用已下载的 \(remote.lastPathComponent)", level: "info")
-        } else {
+        if macDownloadedBytes(ipswPath) == 0 {
             MacEmit.stage("download", "下载 \(remote.lastPathComponent)")
-            MacEmit.log("多连接并发下载，断点续传。中断后重跑会接着下。", level: "info")
+            // 单连接，不是并发：实测 Apple CDN 上加连接只会把每条的份额摊薄，
+            // 聚合不涨（依据见 macFetchWithCurl 的注释）。
+            MacEmit.log("单连接下载，断点续传。中断后重跑会接着下。", level: "info")
             let t0 = Date()
             try macFetchIPSW(remote, dest: ipswPath) { frac, got, total, speed in
                 let left = speed > 0 ? Double(total - got) / speed : 0
@@ -2259,6 +1867,8 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
                 }
             }
             MacEmit.log("下载完成，用了 \(Int(Date().timeIntervalSince(t0) / 60)) 分钟", level: "info")
+            // 下完了登记进全局缓存。失败只是少省一点空间，不影响这次安装。
+            macRegisterIPSWInCache(from: ipswPath)
         }
     }
     onProgress("读取恢复镜像", 0.35)

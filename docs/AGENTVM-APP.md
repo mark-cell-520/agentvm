@@ -795,11 +795,14 @@ Setup Assistant，而「需要自己建账号」这句话只在第一次启动�
 
 ### 没验证的
 
-- **完整安装没有端到端跑过**：这台机器磁盘只剩 48 GB，而 macOS 虚拟机峰值需要
-  60 GB 以上（IPSW 25.6 GB + 系统盘实际写入三十多 GB）。下载器、安装器、
-  provisioning 的代码路径只做了单元级验证。
-- `VZMacGuestProvisioningOptions` 真的能建出账号并打开远程登录——API 是公开的，
-  行为按头文件写的用，但没有实测。
-- app 里 macOS VM 的画面（`VZVirtualMachineView`）没有视觉验证过：没跑到那一步。
+- `VZMacGuestProvisioningOptions` 建账号并打开远程登录：mac1 装完后
+  `macvm.json` 里 `provisioned: true`，2026-11-10 那一轮的记录是第一次启动
+  自动建了账号、远程登录可用。本轮没有重新开机复核（不为测试重启用户的虚拟机），
+  所以这条是「有记录、未复验」。
+- app 里 macOS VM 的画面（`VZVirtualMachineView`）没有视觉验证过：装完就走了
+  命令行/SSH 那条路，没有截图核对过窗口里真的是桌面。
 - 共享目录（virtiofs）在 macOS 客人机上没有可用的驱动，已在 app 的「存储」面板
   里说明，没有实现。
+- **恢复镜像的全局缓存只在「第二台及以后」这条路上验证过机制**
+  （硬链 0 字节、同 inode、删任一头另一头还在，见 `docs/PITFALLS.md` 的
+  IPSW 缓存一节），没有真的装过第二台 macOS 虚拟机。

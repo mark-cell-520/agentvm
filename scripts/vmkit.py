@@ -552,14 +552,23 @@ def cmd_check() -> int:
     df = shutil.disk_usage(HOME)
     free = df.free
     info["free_bytes"] = free
-    # macOS 的恢复镜像 25.6 GB，加上装完之后系统盘实际写的三十多 GB，
-    # 峰值要 60 GB 以上。按 12 GB 判的话 Windows 用户够用，而 macOS
-    # 用户会下到一半磁盘满——那时候 25 GB 已经白下了。
-    macos_need = 60 << 30
+    # macOS 的恢复镜像 25.6 GB，加上装完之后系统盘实际写的三十多 GB。
+    # 但镜像有全局缓存（~/.agentvm/images/ipsw）：缓存命中的话这一次只占
+    # 系统盘那一份，实测 27 GB。所以这两个数分开报——照 60 GB 一刀切会把
+    # 「镜像已经在本地」的用户判成不够，而他们其实只差 28 GB。
+    # 镜像大小从 catalog 取，不写死：Apple 换个版本这个数就变了。
+    try:
+        mac = next(d for d in load_catalog()["distros"] if d.get("kind") == "macos")
+        ipsw_size = int(mac.get("size") or 0)
+    except (StopIteration, ValueError, OSError):
+        ipsw_size = 0
+    disk_actual = 28 << 30      # 实测装完写入约 27 GB，留点余量
+    macos_need = disk_actual
     info["items"].append({
         "name": "磁盘剩余", "ok": free > (12 << 30),
         "detail": f"{human(free)}（Windows 需要 12 GB 以上，"
-                  f"macOS 虚拟机需要 {human(macos_need)}）"})
+                  f"macOS 虚拟机需要 {human(macos_need + ipsw_size)}"
+                  f"；恢复镜像已有缓存时只要 {human(macos_need)}）"})
     if free <= (12 << 30):
         info["ok"] = False
     if free <= macos_need:
@@ -612,12 +621,22 @@ def alloc_vnc_display(taken_displays: set[int]) -> int:
     16100，两个都没法同时用控制台。
 
     所以两边分开比：显示编号和显示编号比，端口和端口比。
+
+    **端口那一侧原来还是错的**（2026-11-10 复测发现）：修好 taken 比较之后，
+    端口比较写成了 `PORT_VNC_BASE + (d - VNC_DISPLAY_BASE)`。对 d = 16100 那
+    就是 5900 + 0 = 5900，于是它去比对的是 5900 到 9899 这一整段，跟 QEMU
+    真正会绑的 22000 到 25999 毫无关系——宿主机上已经有东西占着 22000 时
+    这里看不出来，照样把 16100 发出去，QEMU 起来才报
+    `-vnc 127.0.0.1:16100: Failed to find an available port: Address already
+    in use`，而那句话里的 16100 是显示编号，用户照着去找端口会找到空气。
+    实测：一台跑着的 QEMU 占着 22000，alloc_vnc_display(set()) 仍返回 16100。
+    QEMU 的端口就是 `5900 + 显示编号`，没有偏移量可减。
     """
     used = used_ports()
     for d in range(VNC_DISPLAY_BASE, VNC_DISPLAY_BASE + 4000):
         if d in taken_displays:
             continue
-        if PORT_VNC_BASE + (d - VNC_DISPLAY_BASE) in used:
+        if PORT_VNC_BASE + d in used:
             continue
         return d
     die("VNC 显示编号分配失败：4000 个都占满了")
@@ -737,7 +756,6 @@ runcmd:
   # 各发一次 setterm 关掉它。注意 setterm 是对「当前终端」生效的，所以要把
   # stdout 重定向到具体的 /dev/ttyN 才能作用到那个 VT。
   - [ sh, -c, "for n in 0 1 2 3 4 5 6; do setterm -blank 0 -powersave off -powerdown 0 >/dev/tty$n 2>/dev/null || true; done" ]
-  - [ sh, -c, "cloud-init status --wait >/dev/null 2>&1 || true" ]
 """
     (src / "user-data").write_text(ud)
     (src / "meta-data").write_text(
@@ -780,6 +798,86 @@ def pubkey_text(vm: dict) -> str:
         die(f"没有公钥 {pub}")
     text = pub.read_text().strip()
     return "\n".join(f"      - {text}" for _ in (0,))
+
+
+def install_plan(vm: dict, distro: dict) -> None:
+    """开装之前把要走的路说一遍：几步、大约多久、要占多少空间、哪些能复用。
+
+    为什么值得多说这几行：三条路的耗时差三个数量级——Linux 云镜像下载完就能
+    登（十几秒），Windows 要真跑 Setup（八到十二分钟），macOS 要先下 25.6 GB
+    的恢复镜像再装（二十几分钟）。原来一开始只有一句「下载 XXX」，用户没法
+    判断该去泡杯茶还是守在屏幕前。
+
+    更要紧的是磁盘。macOS 那条路原来下到一半才因为空间不足失败，那时候
+    25 GB 已经白下了；而缓存的 IPSW 能让这一次只占系统盘那一份。把账算在
+    前面，用户可以在开始前就决定要不要先清点空间。
+
+    「共享」和「独占」分开说：底册镜像、Windows ISO、virtio 驱动、IPSW 都在
+    ~/.agentvm/images 里，全机器共用、随 VM 的创建与删除生灭无关；overlay
+    和系统盘才是每台虚拟机自己的。混在一起说会让人以为删了一台 VM 就腾出
+    了整个镜像的空间。
+    """
+    kind = distro["kind"]
+    name = vm["name"]
+    mins = distro.get("install_minutes") or []
+    span = f"，预计 {mins[0]} 到 {mins[1]} 分钟" if len(mins) == 2 else ""
+
+    if kind == "linux":
+        img = IMAGES / f"{distro['id']}.{distro.get('format', 'qcow2')}"
+        have = img.is_file() and img.stat().st_size == distro["size"]
+        Emit.log(f"计划：1. 下载或复用底册镜像 → 2. 建 overlay 磁盘 → "
+                 f"3. 写 cloud-init 配置盘 → 4. 首次启动并等 SSH{span}")
+        Emit.log(f"磁盘：底册镜像 {human(distro['size'])}"
+                 + ("（已在本地，多台虚拟机共用）" if have else "（多台虚拟机共用）")
+                 + f"，本机额外占用的只有 overlay 实际写入的部分（通常几十 MB）")
+    elif kind == "windows":
+        iso = IMAGES / f"{distro['id']}.iso"
+        have = iso.is_file() and iso.stat().st_size == distro["size"]
+        Emit.log(f"计划：1. 下载或复用安装 ISO → 2. 注入 virtio 驱动、"
+                 f"写应答文件 → 3. 创建磁盘 → 4. 全自动安装 → "
+                 f"5. 优雅关机并用窗口重新拉起{span}")
+        Emit.log(f"磁盘：安装 ISO {human(distro['size'])}"
+                 + ("（已在本地，共用）" if have else "（共用）")
+                 + f"，本机磁盘按 {vm['disk']} 稀疏分配，实际占用随安装写入增长")
+        Emit.log("安装期间画面在 app 的「控制台」里，命令行每 20 秒抓一帧到 "
+                 f"{vm_dir(name) / 'last-screen.ppm'}")
+    else:
+        # macOS。IPSW 有全局缓存（~/.agentvm/images/ipsw），第二台起不用再下
+        # 那 25.6 GB；这一条要明说，否则用户看到「秒过」会以为坏了。
+        # catalog 里 macOS 条目的 url 是空的（地址要运行时问 Apple 拿），所以
+        # 不能像另两条那样用 distro["url"] 推文件名——直接看缓存目录里有什么。
+        cache_dir = IMAGES / "ipsw"
+        cached_file = None
+        if cache_dir.is_dir():
+            for f in sorted(cache_dir.iterdir()):
+                if f.is_file() and f.stat().st_size > 0:
+                    cached_file = f
+                    break
+        if cached_file is None:
+            own = vm_dir(name) / "ipsw"
+            if own.is_dir():
+                for f in sorted(own.iterdir()):
+                    if f.is_file() and f.stat().st_size > 0:
+                        cached_file = f
+                        break
+        if cached_file is not None:
+            # catalog 的 install_minutes 是「含下载」的数（30 到 60 分钟里
+            # 二十来分钟在下载）。镜像已在本地，这一段整段省掉，照实说，
+            # 别让人守着屏幕等一个不会发生的下载。
+            span2 = "，预计 5 到 10 分钟（镜像已在本地，不含下载）"
+            Emit.log(f"计划：1. 复用本地恢复镜像 {cached_file.name} → "
+                     f"2. 读取硬件模型 → 3. 建系统盘 → 4. 安装 macOS{span2}")
+            Emit.log(f"磁盘：恢复镜像 {human(cached_file.stat().st_size)} 已在本地"
+                     f"（全局缓存，0 字节新占空间），系统盘按 {vm['disk']} 稀疏分配，"
+                     f"实测装完写入约 27 GB")
+        else:
+            Emit.log(f"计划：1. 下载恢复镜像（约 {human(distro['size'])}）→ "
+                     f"2. 读取硬件模型 → 3. 建系统盘 → 4. 安装 macOS{span}")
+            Emit.log(f"磁盘：恢复镜像 {human(distro['size'])} + 系统盘实测约 27 GB，"
+                     f"峰值约 52 GB。镜像下完会进全局缓存，之后再装 macOS "
+                     f"虚拟机不用再下")
+        Emit.log("注意：macOS 的安装必须在能看到画面的进程里跑，"
+                 "关掉这个终端或 app 窗口等于放弃这次安装")
 
 
 def _rmtree(p: Path) -> None:
@@ -1372,7 +1470,7 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
     while time.time() < deadline:
         if linux_ssh_ready(vm):
             ok(f"SSH 已就绪，用时 {int(time.time() - t0)} 秒")
-            _warn_if_no_guest_agent(vm)
+            _wait_guest_agent(vm)
             return
         if not qemu_pid(vm):
             die(f"QEMU 中途退出了，看 {d / 'qemu.log'}")
@@ -1383,43 +1481,66 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
          f"或 screenshot 抓画面，或看 {d / 'qemu.log'}")
 
 
-def _warn_if_no_guest_agent(vm: dict) -> None:
-    """SSH 通了之后探一次 guest agent，不通就说清楚。
+def _wait_guest_agent(vm: dict, timeout: float = 180.0) -> bool:
+    """等 guest agent 上线，最多 timeout 秒，期间报进度。返回等没等到。
 
-    SSH 就绪不等于 guest agent 可用，而这两件事在日志里原来长得一模一样
-    （都是「已就绪」）。差在哪：SSH 由云镜像自带，agent 要 cloud-init 现装
-    ——apt 慢或挂住时，VM 早就能登录了，agent 还要再等几分钟，甚至永远装不上。
+    为什么是「等」而不是「探一次就走」：SSH 就绪不等于 guest agent 可用，
+    而这两件事在日志里原来长得一模一样（都是「已就绪」）。差在哪儿：SSH 由
+    云镜像自带，agent 要 cloud-init 现装——实测 Ubuntu 24.04 ARM64，SSH 12 秒
+    就通，而 qemu-guest-agent 要到 140 秒后才 active，因为 cloud-init 的
+    apt-get update 要先下 150 MB 索引（universe 的 Packages 一个文件就 72 MB）。
+    原来这里只探一次，不通就 warn，于是 install 报告「已就绪」，用户随后用
+    `guest` 子命令或 agent 优先关机时才发现不通，而排障时没有任何线索指向 apt。
 
-    实测踩过（2026-11-10，Debian 13）：SSH 12 秒通、install 打印「已就绪」，
-    而 cloud-init 的 apt-get update 卡在 sqv 里十几分钟没动，qemu-guest-agent
-    一个字节都没装上。宿主机这边 `guest ping` 报「套接字不存在」，
-    `stop` 于是从 agent 那条路降级——排障时没有任何线索指向 apt。
+    有上限、报进度：等不是无限期的。Debian 13 那条 apt 卡在 sqv 里的路
+    （docs/PITFALLS.md M8）等一辈子也不会来，到点就 warn 走人——VM 照样
+    能用，只是 agent 那条路暂时不走。
 
-    这里只 warn 不 die：agent 不影响 SSH 和窗口，VM 是可用的；而等它装上
-    是分钟级的事，卡在 install 里反而更糟。超时给 5 秒：agent 在跑时
-    ping 是毫秒级，5 秒足够区分「没装」和「慢」。
+    上限给 180 秒而不是 30 秒：实测最慢的一条（Ubuntu 24.04）是 140 秒，
+    留一倍余量；而 catalog 里 Linux 的预计时间本来就写「1 到 3 分钟」，
+    等满了也还在承诺范围内。
     """
     if vm.get("kind") != "linux":
-        return
+        return True
     sock = qga_sock_path(vm)
     if not sock.exists():
         # socket 都不在说明 QEMU 没带这个 chardev，那是装机参数问题，
-        # 不是客人机没装包——两种说法给用户指的方向完全不同。
+        # 不是客人机没装包——两种说法给用户指的方向完全不同，也不用等。
         warn(f"没有 guest agent 套接字（{sock}）。这台 VM 起不来"
              f"qemu-guest-agent，guest 子命令和 agent 优先的关机都用不了。")
-        return
+        return False
     try:
         qa = qga()
     except OSError:
-        return
-    if qa.qga_ping(sock, timeout=5):
-        return
-    warn("guest agent 还不通。SSH 已经能用，但 cloud-init 可能还在装包"
-         "（qemu-guest-agent），也可能装失败了。\n"
+        warn(f"加载不了 guest agent 客户端（{qga_lib_path()}）。"
+             f"guest 子命令和 agent 优先的关机都用不了。")
+        return False
+
+    Emit.stage("agent", "等 guest agent 上线（cloud-init 正在装 "
+                        "qemu-guest-agent）")
+    t0 = time.time()
+    last = -1.0
+    while time.time() - t0 < timeout:
+        if qa.qga_ping(sock, timeout=5):
+            ok(f"guest agent 已就绪，又用了 {int(time.time() - t0)} 秒")
+            return True
+        if not qemu_pid(vm):
+            warn(f"QEMU 中途退出了，agent 不等了。看 {vm_dir(vm['name']) / 'qemu.log'}")
+            return False
+        el = time.time() - t0
+        if el - last >= 10:
+            last = el
+            Emit.progress("agent", el / timeout, int(el), int(timeout), 0)
+            Emit.log(f"还在等 guest agent（已 {int(el)} 秒）…… "
+                     f"apt 要下 150 MB 索引，慢是正常的", "info")
+        time.sleep(3)
+    warn("等了 3 分钟 guest agent 仍不通。SSH 和窗口都能用，VM 是可用的；"
+         "但 guest 子命令和 stop 的 agent 优先关机要等它装上。\n"
          "    在客人机里看：cloud-init status && systemctl status "
          "qemu-guest-agent\n"
-         "    装好了之后 guest 子命令和 stop 的 agent 优先关机才会生效，"
-         "在那之前 stop 会走 SSH 那条路。")
+         "    apt 卡住的话见 docs/PITFALLS.md 的 M8（Debian 系 apt 挂在 "
+         "sqv 签名验证上）")
+    return False
 
 
 # ----------------------------------------------------------- Windows 安装 --
@@ -1909,6 +2030,13 @@ def _install_signal_guard(name: str) -> None:
 
     杀的办法是读 pid 文件，不是 killpg：QEMU 主动脱离了我们的进程组，
     pgid 对不上。
+
+    **SIGHUP 也要接。** 2026-11-10 实测：装到一半把终端窗口关掉（或
+    `vmkit install ... | head` 让管道先关），宿主机这边收到 SIGHUP/SIGPIPE，
+    而这里原来只挂了 SIGTERM 和 SIGINT——于是 vmkit 静默消失，QEMU 作为
+    start_new_session 出来的孤儿继续跑，占着 2 GB 内存、SSH 端口和 VNC 端口，
+    而用户以为「取消了就什么都没了」。pid 文件还在，所以 `stop` 还能停，
+    但没有任何东西告诉用户这儿还挂着一台。
     """
     def handler(signum, frame):
         d = vm_dir(name)
@@ -1933,7 +2061,10 @@ def _install_signal_guard(name: str) -> None:
         # Python 转成 traceback，而这时候用户已经点了「停止」，不想看栈。
         os._exit(130)
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    # SIGPIPE 也要：Python 默认把它设成 SIG_IGN、往关闭的管道写时抛
+    # BrokenPipeError，那个异常没人接，一样是静默退出加一个孤儿 QEMU。
+    # 挂上 handler 之后它和 SIGTERM 走同一条清理路。
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGPIPE):
         try:
             signal.signal(sig, handler)
         except (ValueError, OSError):
@@ -2205,6 +2336,10 @@ def cmd_install(args) -> int:
     vm_dir(name).mkdir(parents=True, exist_ok=True)
     save_vm(vm)
 
+    # 先把要走的路说一遍（几步、多久、占多少空间、哪些能复用）。放在这儿而
+    # 不是各条 cmd_install_* 里面：local 那条没有 catalog、没有预计时间，
+    # 说不出来就不说，见 cmd_install_local 开头那几行 Emit.log。
+    install_plan(vm, distro)
     if distro["kind"] == "windows":
         vm = cmd_install_windows(vm, distro)
     elif distro["kind"] == "macos":
@@ -2231,13 +2366,29 @@ def cmd_install_macos(vm: dict, distro: dict, ipsw: str | None = None) -> dict:
             "  ./install.sh 会把它编出来并装到 ~/.agentvm/bin/vmz\n"
             "或者自己编（见 scripts/vmz/main.swift 顶部注释）。")
 
-    # 磁盘要先看一眼。25.6 GB 镜像 + 装完三十多 GB，峰值 60 GB 以上；
-    # 不够的话在下到一半时才失败，那时候 25 GB 已经白下了。
+    # 磁盘要先看一眼。原来一律按 60 GB 估：25.6 GB 镜像 + 装完三十多 GB。
+    # 但镜像现在有全局缓存（~/.agentvm/images/ipsw），缓存命中的话这一次只占
+    # 系统盘那一份，实测 27 GB——照 60 GB 估会把「够用」报成「可能失败」。
+    # vmz 那边自己也会用同一份缓存再判一次，两边一致。
+    # catalog 里 macOS 条目的 url 是空的（地址运行时才问 Apple 要），所以不能
+    # 用 distro["url"] 推文件名，直接看缓存目录里有没有东西。
+    def _ipsw_present() -> bool:
+        if ipsw and Path(ipsw).expanduser().is_file():
+            return True
+        for d in (IMAGES / "ipsw", vm_dir(name) / "ipsw"):
+            if d.is_dir():
+                for f in d.iterdir():
+                    if f.is_file() and f.stat().st_size > 0:
+                        return True
+        return False
+    ipsw_cached = _ipsw_present()
+    disk_actual = 28 << 30      # 实测装完写入约 27 GB，留点余量
+    need = disk_actual if ipsw_cached else (disk_actual + distro["size"])
     free = shutil.disk_usage(HOME).free
-    need = 60 << 30
     if free < need:
-        warn(f"磁盘只剩 {human(free)}，装 macOS 虚拟机峰值需要约 {human(need)}。"
-             f"可能会在下载或安装中途失败。")
+        warn(f"磁盘只剩 {human(free)}，装 macOS 虚拟机需要约 {human(need)}"
+             f"（{'恢复镜像已有缓存，只算系统盘' if ipsw_cached else '恢复镜像 + 系统盘'}）。"
+             f"可能会在安装中途失败。")
 
     argv = [str(vmz), "install", "--name", vm["name"],
             "--cpu", str(vm["cpus"]), "--mem", vm["ram"],

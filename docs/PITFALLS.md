@@ -632,3 +632,100 @@ cloud-init 十几秒内就把包装好了。VM 本身完全可用，登得进去
 **判断.** 记成已知限制，不阻塞 Windows 装机。真要 RDP，
 在同一台机器上跑 `Microsoft Remote Desktop` 连 `127.0.0.1:21000`
 能否绕过 slirp 这一跳，本轮没有实测（会弹 GUI 窗口）。
+
+## M10. cloud-init 的 runcmd 里等 cloud-init 自己，死锁
+
+`linux_seed` 生成的 user-data 末尾原来有这一行：
+
+```yaml
+runcmd:
+  - [ sh, -c, "cloud-init status --wait >/dev/null 2>&1 || true" ]
+```
+
+它跑在 `modules:final/config-scripts_user` 里，而那一整个阶段要等 runcmd
+返回才算结束。于是 `cloud-init status --wait` 等的是「cloud-init 结束」，
+cloud-init 结束要等 runcmd 返回——互相等，`cloud-init status` 永远停在
+`status: running`。2026-11-10 实测：客人机起来 7 分钟后仍然 running，
+`/var/log/cloud-init.log` 最后一行是
+`Running command ['/var/lib/cloud/instance/scripts/runcmd']`，
+`ps` 里能看到一个 `cloud-init status --wait` 子进程在空转。
+
+**怎么发现的.** 给 Linux 装机加「等 guest agent 上线」时计时，发现
+`qemu-guest-agent` 已经 active 而 cloud-init 仍是 running，与预期相反——
+agent 是 runcmd 之前的模块装的，它 active 说明后面的模块卡住了。
+
+**修法.** 删掉那一行。宿主机这边要等 cloud-init 完，就在宿主机等
+（`_wait_guest_agent`），没有理由让客人机里再起一个自己等自己的进程。
+
+**顺带.** 这一行还解释了另一件事：`qemu-guest-agent` 装上但
+`cloud-init status` 不结束，会让「cloud-init status --wait」成为
+排障时的红鲱鱼——看着像没装完，其实只差这一个自等待。
+
+## M11. `guest exec "整条命令"` 被 shlex.quote 成一个命令名
+
+`qga_exec` 收到列表时，一律 `shlex.join(argv)` 后套 `sh -c`。单个元素且
+含空格的列表会被整体加引号：
+
+```
+argv = ["uname -a && df -h /"]
+shlex.join -> "'uname -a && df -h /'"
+/bin/sh -c "'uname -a && df -h /'"
+-> /bin/sh: 1: uname -a && df -h /: not found
+```
+
+2026-11-10 实测。而 `vmkit.py guest --name d1 exec -- uname -a`（多个参数）
+一直是好的，所以只有「用户把整条命令引成一个参数」这一种写法坏——
+而那恰恰是带管道、`&&`、重定向时最自然的写法，也正是排障时最常用的。
+
+**修法.** 单个元素且匹配 `[\s|&;<>()$\`\\"'*?\[\]#~%]` 时，直接把它当
+`sh -c` 的命令行，不 quote；多个元素才逐个 quote 再拼回去（那样
+`echo "a b"` 才能还原）。
+
+## M12. VNC 显示编号分配：端口那一侧的偏移量算错了
+
+`vm.json` 存的是**显示编号**（16100 起），QEMU 实际监听 **5900 + 编号**
+（22000 起）。分配函数要比对两件事：别的 VM 占用的编号，和宿主机上已占用的
+端口。原来端口那一侧写成
+
+```python
+if PORT_VNC_BASE + (d - VNC_DISPLAY_BASE) in used:
+```
+
+`PORT_VNC_BASE` 是 5900、`VNC_DISPLAY_BASE` 是 16100，对 `d = 16100` 就是
+`5900 + 0 = 5900`——它去比对的是 5900 到 9899 这一整段，跟 QEMU 真正会绑的
+22000 到 25999 毫无关系。宿主机上已经有东西占着 22000 时这里看不出来，
+照样把 16100 发出去，QEMU 起来才报
+
+```
+-vnc 127.0.0.1:16100: Failed to find an available port: Address already in use
+```
+
+那句话里的 16100 是显示编号，用户照着去找端口会找到空气。
+
+2026-11-10 实测：一台跑着的 QEMU 占着 22000，`alloc_vnc_display(set())`
+仍返回 16100；改成 `PORT_VNC_BASE + d` 后返回 16101（端口 22001）。
+
+**教训.** 修「两个编号空间混用」这类 bug 时，两边都要修。这里第一次只修了
+`taken` 那一侧（VM 之间的编号比较），端口那一侧的偏移量留着，症状从
+「每台 VM 都拿 16100」变成「只在宿主机端口真的被占时才炸」，更难复现。
+
+## M13. 装到一半关掉终端，QEMU 作为孤儿继续跑
+
+`_install_signal_guard` 原来只挂 SIGTERM 和 SIGINT。关掉终端窗口发的是
+SIGHUP，`vmkit install ... | head` 让管道先关发的是 SIGPIPE（Python 默认把
+SIGPIPE 设成 SIG_IGN，往关闭的管道写时抛 BrokenPipeError，那个异常没人接）。
+两条路的结果一样：vmkit 静默消失，而 QEMU 是 `start_new_session` 出去的另一个
+进程组，继续跑着——占 2 GB 内存、SSH 端口、VNC 端口，而用户以为「取消了就
+什么都没了」。2026-11-10 实测复现：`nohup vmkit install ... &` 起来 20 秒后
+`kill -HUP`，vmkit 没了，`ps` 里 QEMU 还在，`-name pipetest`。
+
+pid 文件还在，所以 `vmkit stop --name X` 事后能停；但没有任何东西告诉用户
+这儿还挂着一台，而内存和端口是真实占着的。
+
+**修法.** 把 SIGHUP 和 SIGPIPE 加进同一个 handler，和 SIGTERM 走同一条
+「读本次安装的 pid 文件、SIGTERM 它、自己 os._exit(130)」的路。
+
+**注意别把 SIGPIPE 和「写管道失败」混为一谈。** 挂上 handler 之后 Python
+不再把 SIGPIPE 转成 BrokenPipeError，`vmkit install | head` 这类用法会安静地
+把客人机一起带走——那正是想要的行为，但意味着别指望能靠管道中途断开来
+「只看看前几行」而不影响安装。
