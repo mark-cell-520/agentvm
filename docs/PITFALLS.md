@@ -984,3 +984,81 @@ pid 会回绕复用，一个早就结束的安装留下的号随时可能被派�
 lint 加了一道正则检查（`Makefile` 的 `wide-punct` 目标），专门抓
 「没有花括号的 `$VAR` 后面紧跟非 ASCII 字节」。注释里的不算——那是文档，
 不会执行；但看得见的也顺手加了花括号，免得有人照着抄。
+
+## M21. 自动重连一次都没执行过：`scheduleReconnect` 排的活儿被 `!stopped` 挡在门外（已修）
+
+用户报的现象：app 内嵌控制台显示「虚拟机那边把连接关了」，然后**再也不动**。
+而同一时刻 QEMU 好端端在监听（monitor 的 `info vnc` 看得见服务器，用一个
+python 裸客户端连上去 30 秒、收 1.9 MB 数据、一个字节都没断）。
+
+代码里本来就有一段「断开时自动重连，带退避」，注释还写着「原来断线之后……
+然后再也不动——必须用户自己想起去点『重连』」。也就是说这段代码是专门为了修
+这个问题加的，而它自己从来没生效过：
+
+    private func fail(_ msg: String) {
+        guard !stopped else { return }
+        stopped = true            // ← 为了停掉旧连接的 receive 循环
+        ...
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.stopped else { return }   // ← stopped 刚被置 true
+            ...
+            self.connect()
+        }
+
+`fail()` 靠 `stopped` 让旧连接的 receive 循环停下来，而重连恰恰要在那个状态下
+发生。两处对同一个标志的期待正好相反，结果就是退避定时器每次到点都直接 return。
+**一个从来没有任何执行路径能走到的分支，比没有分支更危险**——它让「已经修过了」
+这件事看起来是真的。
+
+修法：把「当前连接还活着吗」和「用户还想连着吗」分开。`stopped` 只管前者；
+后者由 `disconnect()` cancel 那个 work item 来表达（它本来就这么做了）。
+work 里不再判 `stopped`，`connect()` 第一件事就是 `stopped = false`。
+
+顺带把次数从 5 提到 8：1/2/4/8/16/32/64/128 秒，合计约 4 分钟。虚拟机装完系统
+重启、QEMU 重新起来都要这个量级，5 次只有 31 秒不够；而「用户已经关掉面板」
+不靠次数兜，靠 cancel。
+
+实测（`/tmp/vncharness` 的 Swift harness + python RFB 服务端）：
+
+    0.048s  已连接
+    1.713s  虚拟机那边把连接关了      ← 服务端真的断开
+    2.801s  已连接                    ← 1 秒退避后自己连回来
+
+## M22. `.ready` 只说明 TCP 通了，不等于 RFB 握得下来（已修）
+
+`connect()` 的 stateUpdateHandler 在 `.ready` 那一刻就 `publish(connected: true,
+status: "已连接")`。而 `.ready` 只是三次握手成了：端口被别的东西占着、listen
+backlog 满了、对面是个不收数据的服务，全都会走到这里然后永远等不到 ServerInit。
+
+那时的界面是一盏绿灯加「已连接」，底下没有画面——而状态明明是好的，这是最难查
+的一种形状。VNCClient 自己的注释里就记着另一件同类事（「连接是好的、尺寸也对、
+敲键盘也有反应，就是看不到变化」），但绿灯这一处没人回头看。
+
+改成：`.ready` 时显示「正在取画面」，真正拿到画面尺寸（serverInit 那一步）才
+`connected = true`。`queueConnected`（输入事件的门禁）也跟着移到那一刻，
+TCP 一通就往客人机发键鼠事件本来也不对。
+
+同一个坑在测试里藏了一道：我的第一个 RFB 测试服务端把协议顺序写反了（服务端
+先 `recv` 等客户端版本，而 RFB 规定服务端先发）。两边互等，握手永远完不成——
+但因为那会儿「已连接」在 `.ready` 就置位，测试看起来是通过的。**绿灯本身成了
+掩盖测试缺陷的东西。** 修好之后第一次重跑，两个测试同时变红，正是这个改动
+把它们照出来的。
+
+## M23. QEMU 的 VNC 默认允许独占，第二个客户端会把 app 的控制台踢掉（已修）
+
+`-vnc 127.0.0.1:16100` 没给 `share` 参数，QEMU 默认是 `allow-exclusive`：
+客户端在 ClientInit 里请求独占时，其他客户端全部断开。
+
+这条不是理论风险。「远程桌面」那一行给用户的就是 `open vnc://127.0.0.1:22000`，
+用户完全可能一边用 app 内嵌控制台、一边用系统 Screen Sharing 看同一台。那时
+app 的画面会被一下踢没，而它只会说「虚拟机那边把连接关了」——指向一个不存在
+的客人机故障。
+
+两处 `-vnc` 都加 `,share=force-shared`。强制共享之后谁也踢不了谁，多开几个
+客户端只是多几个入口。
+
+注意 `share` 是启动参数，**对已经跑起来的 VM 无效**，要下次启动才生效。

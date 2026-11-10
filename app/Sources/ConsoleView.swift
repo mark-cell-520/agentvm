@@ -20,6 +20,10 @@ struct ConsoleView: View {
 
     @StateObject private var client: VNCClient
     @State private var locked = false
+    /// 这个面板只连一次。SwiftUI 不保证 onAppear 只走一遍（sheet 嵌套、父视图
+    /// 重绘都会再触发），而 connect() 每次都会 cancel 掉上一条连接再建新的——
+    /// 连两次就白丢一次已建好的连接，用户看到的是「画面卡一下又重来」。
+    @State private var didConnect = false
 
     init(name: String, port: Int) {
         self.name = name
@@ -61,7 +65,12 @@ struct ConsoleView: View {
             Divider()
             footer
         }
-        .onAppear { if portError.isEmpty { client.connect() } }
+        .onAppear {
+            if portError.isEmpty, !didConnect {
+                didConnect = true
+                client.connect()
+            }
+        }
         .onDisappear {
             client.disconnect()
             locked = false

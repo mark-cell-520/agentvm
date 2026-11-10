@@ -54,6 +54,16 @@ final class VNCClient: ObservableObject {
     /// 还没解析的字节。TCP 会把一帧切成很多段，也可能把好几帧粘在一段里。
     private var buf = Data()
     private var stopped = true
+    /// 连接代次。每次 connect() 建一条新连接就 +1，旧连接上的迟到事件按代次丢掉。
+    ///
+    /// 为什么需要它：Network framework 把「本地 cancel」也报成
+    /// isComplete = true、error = nil。而 connect() 开头为了清掉旧连接会调一次
+    /// conn?.cancel()——那条旧连接上已经排队的 receive completion 之后才回来，
+    /// 于是 fail("虚拟机那边把连接关了") 把一次主动重连判成了服务端断开，
+    /// 还顺手把刚建好的新连接一起 cancel 掉。症状正是这次用户遇到的：
+    /// QEMU 好端端在监听（monitor 的 info vnc 能看到服务器、python 客户端连上
+    /// 30 秒一个字节不断），app 却坚持说「虚拟机那边把连接关了」并且再也不动。
+    private var generation = 0
     /// framebuffer。桌面大小变化时重建。
     private var ctx: CGContext?
     private var fbW = 0
@@ -94,12 +104,17 @@ final class VNCClient: ObservableObject {
         conn = nil
         reconnectAttempts = 0
         stopped = false
+        generation &+= 1
+        let mine = generation
         set("正在连接 \(host):\(port)")
         let c = NWConnection(host: NWEndpoint.Host(host),
                              port: NWEndpoint.Port(rawValue: port)!,
                              using: .tcp)
         c.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
+            // 只认当前这一条连接的状态。被 cancel 掉的旧连接也会走到这里
+            // （.cancelled / .failed），按代次丢掉，别让它动新连接的状态。
+            guard self.generation == mine else { return }
             switch st {
             case .ready:
                 // 每一条新连接都要把状态机复位。复用旧连接时 buf 里可能还剩着
@@ -110,9 +125,14 @@ final class VNCClient: ObservableObject {
                 self.wantFull = true
                 self.lastFrameAt = Date()
                 self.reconnectAttempts = 0
-                self.publish(connected: true, status: "已连接")
+                // **不在这一刻宣布「已连接」。** .ready 只说明 TCP 三次握手成了，
+                // 不代表 RFB 握得下来：端口被别的东西占着、backlog 满了、对方是个
+                // 不收数据的服务，都会走到这里然后永远等不到 ServerInit。那时界面
+                // 显示「已连接」却没有画面，而状态明明是绿的——最难查的一种。
+                // 真正拿到画面尺寸（serverInit 那一步）才叫连上。
+                self.publish(connected: false, status: "正在取画面")
                 self.startKeepAlive()
-                self.receive()
+                self.receive(mine)
             case .failed(let e):
                 self.fail("连不上 \(self.host):\(self.port)：\(e.localizedDescription)")
             case .cancelled:
@@ -154,16 +174,22 @@ final class VNCClient: ObservableObject {
     }
 
     private func scheduleReconnect() {
-        // 最多 5 次：1s / 2s / 4s / 8s / 16s。虚拟机可能要好几十秒才起来，
-        // 但无限重连会在用户已经关掉面板之后还一直戳一个没人看的端口。
-        guard reconnectAttempts < 5 else {
-            publish(connected: false, status: "重连 5 次都没成，点「重连」再试")
+        // 最多 8 次：1/2/4/8/16/32/64/128 秒，合计约 4 分钟。虚拟机可能要好几十秒
+        // 才起来（重启装完系统、QEMU 重启都要这个量级），5 次只有 31 秒不够；
+        // 但无限重连会在用户已经关掉面板之后还一直戳一个没人看的端口——那种情况
+        // 由 disconnect() cancel 这个 work item 来兜，不是靠次数。
+        guard reconnectAttempts < 8 else {
+            publish(connected: false, status: "重连 8 次都没成，点「重连」再试")
             return
         }
         let delay = 1 << reconnectAttempts
         reconnectAttempts += 1
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.stopped else { return }
+            // **不能在这里判 !stopped。** fail() 刚把 stopped 置成 true（它靠这个
+            // 让旧连接的 receive 循环停下来），而重连恰恰要在那个状态下发生——
+            // 加上这个判断，自动重连一次都不会执行，断线就永久停在红字上。
+            // 「用户不想连了」由 disconnect() cancel 本 work item 表达。
+            guard let self else { return }
             self.publish(connected: false, status: "正在重连（第 \(self.reconnectAttempts) 次）")
             self.connect()
         }
@@ -171,10 +197,12 @@ final class VNCClient: ObservableObject {
         queue.asyncAfter(deadline: .now() + .seconds(delay), execute: work)
     }
 
-    private func receive() {
+    private func receive(_ g: Int) {
         conn?.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) {
             [weak self] data, _, isComplete, err in
-            guard let self, !self.stopped else { return }
+            // 代次对不上说明这条连接已经被取代（用户点了重连、或者换了一台虚拟机），
+            // 它带来的 EOF/错误都是旧账，不能拿去动新连接的状态。
+            guard let self, self.generation == g, !self.stopped else { return }
             if let data, !data.isEmpty {
                 self.buf.append(data)
                 self.pump()
@@ -187,7 +215,7 @@ final class VNCClient: ObservableObject {
                 self.fail("虚拟机那边把连接关了")
                 return
             }
-            self.receive()
+            self.receive(g)
         }
     }
 
@@ -247,6 +275,8 @@ final class VNCClient: ObservableObject {
             sendSetPixelFormat()
             sendSetEncodings()
             phase = .messages
+            // 画面尺寸拿到了，这一刻才叫真的连上。见 connect() 里 .ready 那段。
+            publish(connected: true, status: "已连接")
             return 24 + nameLen
 
         case .messages:

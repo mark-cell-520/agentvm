@@ -1447,7 +1447,7 @@ def linux_qemu_args(vm: dict) -> list[str]:
     args += share_args(vm)
     args += ["-vga", "none", "-device", "ramfb"]
     args += ["-display", "none"] if vm.get("headless") else ["-display", "cocoa"]
-    args += ["-vnc", f"127.0.0.1:{vm['vnc_display']}"]
+    args += ["-vnc", f"127.0.0.1:{vm['vnc_display']},share=force-shared"]
     return args
 
 
@@ -1532,7 +1532,7 @@ def local_qemu_args(vm: dict, with_iso: bool) -> list[str]:
     # 想要原生窗口：vmkit.py window --name X（会重启一次客人机，显示模式是
     # QEMU 启动参数，跑起来之后改不了）。
     args += ["-display", "none"] if vm.get("headless") else ["-display", "cocoa"]
-    args += ["-vnc", f"127.0.0.1:{vm['vnc_display']}"]
+    args += ["-vnc", f"127.0.0.1:{vm['vnc_display']},share=force-shared"]
     return args
 
 

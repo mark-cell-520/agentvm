@@ -779,6 +779,57 @@ Debian 13 装到 `ready=true`；对 mac1 走 app 路径被拒且 vm.json md5 前
 
 ---
 
+## 控制台「连接关了」之后再也不会自己回来（2026-11-10 第五轮）
+
+用户报：虚拟机那边把连接关了，关不掉，也没法继续操作。
+
+排查顺序和结论：
+
+一、VM 本身没病。`vmkit.py status` 报 running、monitor 的 `info vnc` 看得见
+服务器在 127.0.0.1:22000 LISTEN、`VM status: running`。用一个 python 裸 RFB
+客户端按 app 的字节序列连上去，30 秒收到 1.9 MB 数据，**一个字节都没断**。
+QEMU 的 stderr 全都进了 qemu.log，而那个文件是 0 字节——服务端侧没有任何
+异常记录。所以不是 QEMU 踢客户端。
+
+二、app 侧两处缺陷合谋。见 PITFALLS M21、M22。`VNCClient` 里：
+
+    generation      每条连接一个代次，旧连接的迟到 EOF 按代次丢掉
+    scheduleReconnect 不再判 !stopped（那正是它从来不执行的原因），次数 5 -> 8
+    .ready          只显示「正在取画面」；connected 改到 serverInit 之后才置位
+
+三、`ConsoleView.onAppear` 加了 `didConnect` 一次性保护。SwiftUI 不保证 onAppear
+只走一遍，而 `connect()` 每次都 cancel 上一条连接再建新的。
+
+四、vmkit 两处 `-vnc` 加 `share=force-shared`（PITFALLS M23）。默认的
+allow-exclusive 会让用系统 Screen Sharing 看同一台 VM 的用户把 app 控制台踢掉。
+这是启动参数，对已在跑的 VM 无效。
+
+### 测试怎么写的
+
+harness 在 `/tmp/vncharness`：一个 python RFB 服务端（自己实现握手和回帧），
+两个 Swift 入口各测一件事，都不定时器触发而用轮询，避开主线程延迟把时序打乱。
+
+    a/  连上后立刻第二次 connect()：旧连接被 cancel，它的迟到 EOF 不能把
+        新连接也判成断开。判据：全程 connected 且从未出现断开类状态。
+        结果：探针一次都没触发，通过。
+    b/  服务端 2 秒时真的断开：客户端必须自己连回来。
+        结果 1.713s 断开 -> 2.801s 已连接，服务端日志印证连接 1 重新握手。
+
+第一个版本的测试服务端把 RFB 顺序写反了（服务端先 recv 后 send），两边互等，
+握手永远完不成——但因为那会儿「已连接」在 TCP `.ready` 就置位，测试看起来是
+通过的。**是「已连接」诚实化这个改动把测试缺陷照出来的**，修好服务端后两个测试
+同时从假绿变成真绿。
+
+### 没验证的
+
+- 真实 app 里点开控制台看 fnOS 安装界面：修复已装进 /Applications
+  （二进制 md5 与本地构建一致，含「正在取画面」「正在重连（第」字样），
+  VM 全程未受影响，但没有在 GUI 里实际操作过。
+- 多客户端共存（app 控制台 + 系统 Screen Sharing）：`share=force-shared` 只对
+  新启动的 VM 生效，linux1 这次启动时还没有它。
+
+---
+
 ## macOS 客人机（2026-11-10 新增）
 
 ### 为什么 macOS 走 VZ，另外两种走 QEMU
