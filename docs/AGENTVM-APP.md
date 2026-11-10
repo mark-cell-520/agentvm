@@ -677,6 +677,106 @@ wrapper 就在被删掉的 VM 目录里。之后每次登录 launchd 执行一�
   见 `docs/WINDOWS-PORT.md` 第 10 节。
 - QEMU Guest Agent、USB 直通（Quickemu 有）按这个沙箱的定位没做。
 
+### 没验证的
+
+- mac1 的 provisioning（建账号、开远程登录）只在安装日志里有记录，装完之后没有
+  再复验过一次登录。
+- IPSW 全局缓存（`~/.agentvm/images/ipsw`）只在机制层面验证过：硬链同 inode、
+  `du` 前后一致、mac1 的 25.6 GB 镜像确实被别的新虚拟机复用。**没有**真正用缓存
+  装过第二台 macOS 虚拟机。
+- 半成品虚拟机的「重装」按钮在 app 里点过的路径只有命令行等价物
+  （`install --detach --force`，Debian 13 实测装到 ready=true）；
+  app 内点击本身只做了双实例冒烟（起来了、没崩、列表带 broken 字段）。
+
+---
+
+## 半成品虚拟机与「关不掉的安装页」（2026-11-10 第四轮审计）
+
+用户报的 bug 原话：「一个 bug，VM 不完整，缺 disk.qcow2。重新 install。
+一直跳出无法关闭，或者修复，你全面审计，进行修复」。
+
+一句话概括：安装中断后留下一台只有 `vm.json` 的虚拟机，**起点一句死胡同错误，
+中途一个没有出口的页面**。两端都修了。
+
+### 起点的死胡同
+
+`start_linux` 报「VM 不完整，缺 disk.qcow2。重新 install。」，而 `install`
+紧接着回「xxx 已存在。换个名字，或加 --force 重装。」——两句互相踢皮球。
+app 那边连 `--force` 都传不了（新建向导永远不带这个 flag），所以在图形界面里
+这条错误是终点。
+
+`spawn_detached_install` 还多一层：app 永远走 `--detach`，而「已存在」这道校验
+原来只写在 `cmd_install` 里。父进程一声不响就把子进程起出来、写好 install.pid、
+向 app 报「安装已开始」，子进程一秒后死在「已存在」上。app 那时已经切到
+「正在安装」页。macOS 那条分支更糟：它会 `save_vm(_macos_vm_stub(...))`，
+重装一台装好的 mac 会先把它的 vm.json 覆写成空壳。
+
+修法：`vm_broken()` 算出缺哪些文件并作为 `broken` 字段随 `status` 发出；
+两处 `die` 改成能照着做的命令（`_self_cmd()` 给全路径，vmkit.py 不在 PATH 上）；
+`_refuse_existing()` 在三个入口都跑。
+
+### 中途没有出口的页面
+
+`NewVMWizard` 的 `.installing` 页脚原来只有「停止」一个按钮，且
+`.disabled(!busy)`。`step` 离开 `.installing` 的唯一路径是
+`.onChange(of: installFinished)`，而它只在收到一个**能解成 VMInfo 的** `done`
+事件时置位。安装失败、被停止、done 形状对不上——这三种情况它永远是 false。
+于是页面没有任何关闭按钮，Esc 也没有 `.cancelAction`，「停止」打在一个早就
+死掉的进程上什么也不发生。这就是用户说的「无法关闭」。
+
+`handleEvent` 的 `done` 分支原来把两种形状混为一谈：引导进程的
+`{"name","log","pid","detached":true}` 只说明「已经甩到后台」，安装进程自己的
+`{"vm":{…完整记录…}}` 才是装好了。前者解 VMInfo 必然失败，而失败是静默的
+（`try?`）。
+
+修法：页脚永远给「关闭（后台继续装）」；新增 `installEnded`，在
+`tailLog` / `resumeTailing` 的 completion 里置位——进程没了就是结束了，
+这个信号不依赖任何事件形状。
+
+### 顺带修掉的三个老问题
+
+**`--force` 会把 install.log 一起删掉。** 父进程先打开日志（append）再分叉，
+子进程继承那个 fd，而 `--force` 会 `_rmtree` 整个 VM 目录。文件被 unlink，
+子进程往一个不在目录树里的 inode 写，用户看到的是日志不存在或停在旧内容，
+app 一个事件都读不到。`_reopen_install_log()` 在删除后把 fd 1/2 接回新文件
+（`os.dup2`，`sys.stdout` 不用重新赋值），补表头，并按 `os.getpid()` 恢复
+install.pid——那一份也被 rmtree 删了，而 app 的「停止」按钮和重启后的
+「接上还在跑的安装」都靠它找进程。
+
+这条在加重装按钮之前一直没人踩到：`--force` 原来只有命令行会用。
+
+**install.pid 里的死进程号会被复用。** app 的 `installAlive` 原来只判「活着吗、
+是不是僵尸」。macOS 的 pid 会回绕复用，死号随时可能被派给无关进程，这时 app
+认为安装永远在跑：横幅钉住、`running` 不归零于是 `busy` 恒真、所有按钮全灰、
+`tailLog` 的定时器永远不取消。两件事一起修：vmkit 侧安装结束就删 install.pid
+（`main()` 的 `finally` + 信号 handler，那边用 `os._exit` 不走 finally）；
+app 侧用 `ps -o state=,command=` 连进程名核对，没有 `vmkit.py` / `vmz`
+就当作没在跑。只取 `comm` 不够——python3 的 comm 是 "Python"。
+
+**`tailLog` 把 `resumeTailing` 读过的日志又重读一遍。** `resumeTailing` 设好
+tailOffset 之后调的 `tailLog` 又把它清零，同样的事件触发两遍，同一个错误弹窗
+连跳两次。加 `fromStart:` 参数。
+
+### 验证
+
+Swift harness（编译进 `Backend.swift` + `Models.swift`，`/tmp/swifttest`）四场景：
+
+    install.pid 是死 pid     -> nil
+    pid 被 /bin/sleep 复用   -> nil
+    活着的无关 python        -> nil
+    命令行带 vmkit.py 的进程 -> 返回该 pid
+    VMInfo 解码 broken 字段   -> isBroken=true，stateText=没装完
+
+端到端：造半成品（装到一半 SIGKILL + 删盘）→ `start` 报可执行的修复命令；
+app 重装路径 `install --detach --force` 日志可读、install.pid 在位、
+Debian 13 装到 `ready=true`；对 mac1 走 app 路径被拒且 vm.json md5 前后一致；
+新构建的 app 双实例冒烟（起来、没崩、bundle 后端 status 带 broken 字段）。
+
+`make lint` 现在也覆盖 `app/Sources/*.swift` 了——原来只有
+`MacVMEngine.swift` 被 parse，而这轮改的 `ContentView` / `AppState` /
+`NewVMWizard` 从来没被检查过。实测踩过：同一个 `confirmDelete` 写了两遍，
+`make lint` 全绿，直到 `app/build.sh` 才炸。
+
 ---
 
 ## macOS 客人机（2026-11-10 新增）

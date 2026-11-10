@@ -92,7 +92,17 @@ stop: ## Stop the VM (autostart 装过的话重启后会再起来，见 autostar
 #    只有 agentvmrc.example 和 env.template），2>/dev/null || true 把错误整个吞掉
 #  - python3 -m py_compile 会在仓库里留下 __pycache__——app/build.sh 的注释里
 #    特意改用 ast.parse 要避免的正是这件事
+#  - app/Sources/*.swift 里除了 MacVMEngine.swift 的那几个从来没被检查过。
+#    ContentView / AppState / NewVMWizard 全是改安装流程的主战场，而
+#    「invalid redeclaration」这类错只有整份一起 parse 才报得出来
+#    （2026-11-10 实测：同一个 confirmDelete 写了两遍，make lint 全绿，
+#    直到 app/build.sh 才炸）。-parse-as-library 是必须的：那批文件里有
+#    AgentVMApp.swift 的 @main，不加它会报「顶层不允许有代码」。
+#  - bash -n 查不出「全角标点紧跟变量名」。那不是语法错，是 bash 的变量名
+#    解析把高位字节并进了名字：`"$X，y"` 里的名字是 X<U+FF0C>，set -u 下
+#    直接 unbound variable。见 docs/PITFALLS.md M20。
 lint: ## Syntax-check every script
+	@bash scripts/lint-wide-punct.sh
 	@for f in scripts/*.sh scripts/lib/*.sh scripts/agentvm-fetch scripts/agentvm-serve \
 		install.sh app/build.sh; do \
 		bash -n "$$f" && echo "  ok $$f" || exit 1; done
@@ -104,6 +114,12 @@ lint: ## Syntax-check every script
 			-target arm64-apple-macos14.0 \
 			app/Sources/MacVMEngine.swift scripts/vmz/main.swift \
 			&& echo "  ok swift (MacVMEngine + vmz)"; \
+	 else echo "  skip swift (没有 swiftc)"; fi
+	@if command -v swiftc >/dev/null 2>&1; then \
+		swiftc -parse -parse-as-library -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
+			-target arm64-apple-macos14.0 \
+			app/Sources/*.swift \
+			&& echo "  ok swift (app/Sources 全部)"; \
 	 else echo "  skip swift (没有 swiftc)"; fi
 	# vzrun.swift 必须单独 parse：它和 vmz/main.swift 一样是带顶层可执行代码的
 	# CLI 入口，两个入口放进同一次 swiftc -parse 会互相报

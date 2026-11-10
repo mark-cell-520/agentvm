@@ -82,7 +82,7 @@ if [ -n "$BREW" ]; then
         ok "QEMU 装好了"
         exit 0
     fi
-    die "brew 说装完了但找不到 $QEMU_BIN。brew --prefix qemu 看看装哪了。"
+    die "brew 说装完了但找不到 ${QEMU_BIN}。brew --prefix qemu 看看装哪了。"
 fi
 
 # -------------------------------------------- 第四条路：/opt/homebrew 可写 --

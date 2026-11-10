@@ -97,6 +97,31 @@ OpenAVB ROM、idevicerestore 补丁一整套。而 VZ 的 `VZMacOSRestoreImage` 
 `VZMacOSInstaller` / `VZMacOSBootLoader` 是公开 API，宿主机上直接拿到
 macOS 27.2.1 的 IPSW 地址。详见 [docs/AGENTVM-APP.md](docs/AGENTVM-APP.md)。
 
+## 装到一半失败，会留下一台「没装完」的虚拟机
+
+下载断了、磁盘建不出来、安装途中点了停止——任何一步中断都会留下一个只有
+`vm.json` 的目录。这台机器起不来，也没法原地修好，**只能重装**。
+
+它会明说自己缺什么，不会装成一台正常的虚拟机骗你：
+
+    $ vmkit.py status --name d1
+    {"name": "d1", "ready": false, "broken": "缺 disk.qcow2、seed.iso", ...}
+
+点「启动」拿到的是一句能照着做的命令，不是一句「重新 install」的死胡同：
+
+    VM 不完整，缺 disk.qcow2——这一台上次没装完。
+    原地修好它（会清掉 ~/.agentvm/vms/d1 重新装）：
+      python3 …/vmkit.py install --name d1 --force
+    确定不要了：
+      python3 …/vmkit.py delete --name d1
+
+app 里同一台机器显示成「没装完」，详情页有一个「重装这一台」按钮——
+半成品没有可用数据，不用确认，点了就从这儿接着装。命令行上加 `--force`
+是等价的。
+
+`--force` 会清掉整个 VM 目录，对装好的虚拟机用它等于重装（数据一起没）。
+正在跑的虚拟机 `--force` 会被拒绝，要先 `stop`。
+
 ## 装机速度：把 apt 那段从几分钟压到几十秒
 
 Linux 云镜像「下载完就能用」，但 `install` 报「已就绪」之后还有一段在跑：

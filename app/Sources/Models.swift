@@ -171,6 +171,13 @@ struct VMInfo: Identifiable, Codable, Hashable {
     let macResolution: String?
     /// macOS 客人机装完了没有。
     let macInstalled: Bool?
+    /// 这台是不是半成品——缺了启动必需的文件，空串表示齐全。
+    ///
+    /// install 中途失败（下载断了、盘没建出来、用户点了「停止」）会留下一个
+    /// 只有 vm.json 的目录。没有这个字段时界面把它当正常虚拟机列出来，用户点
+    /// 「启动」才拿到一句「VM 不完整，缺 disk.qcow2。重新 install。」，而
+    /// install 又回「已存在，换个名字或加 --force」——两句都是死胡同。
+    let broken: String?
 
     enum CodingKeys: String, CodingKey {
         case name, distro, kind, running, pid, ready, cpus, ram, disk, user
@@ -189,6 +196,7 @@ struct VMInfo: Identifiable, Codable, Hashable {
         case macBuild = "mac_build"
         case macResolution = "mac_resolution"
         case macInstalled = "mac_installed"
+        case broken = "broken"
     }
 
     var id: String { name }
@@ -207,10 +215,15 @@ struct VMInfo: Identifiable, Codable, Hashable {
 
     var stateText: String {
         if isMacOS && !(macInstalled ?? false) { return "未装完" }
+        if isBroken { return "没装完" }
         if running && (sshOk ?? false) { return "运行中" }
         if running { return "已启动" }
         return "已关机"
     }
+
+    /// 半成品：文件不齐，起不来也修不好，只能重装。界面据此显示警告和
+    /// 「重装」按钮，别让用户点「启动」去撞一句死胡同错误。
+    var isBroken: Bool { !(broken ?? "").isEmpty }
 
     var diskUsedText: String {
         ByteCountFormatter.string(fromByteCount: Int64(diskUsedBytes),

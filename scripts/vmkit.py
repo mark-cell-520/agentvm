@@ -264,6 +264,15 @@ def find_vmz() -> Path | None:
     return max(found, key=lambda p: p.stat().st_mtime)
 
 
+def _self_cmd() -> str:
+    """命令行里怎么调自己。错误消息里要给一条能复制粘贴的命令。
+
+    不能只写 `vmkit.py`：它没有装到 PATH 上（install.sh 只装 vmz），
+    用户在终端里照抄会 command not found，而这行字本来是想帮他脱困的。
+    """
+    return f"python3 {Path(__file__).resolve()}"
+
+
 def human(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:
@@ -1725,7 +1734,16 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
     d = vm_dir(vm["name"])
     for f in ("disk.qcow2", "seed.iso"):
         if not (d / f).is_file():
-            die(f"VM 不完整，缺 {f}。重新 install。")
+            # 这句话必须是能照着做的一条路。原来只写「重新 install」，而
+            # install 紧跟着回「xxx 已存在。换个名字，或加 --force 重装。」——
+            # 两句都是死胡同：既起不动，也没法原地修好，用户只能自己去删目录。
+            # 实测踩过（2026-11-10，用户原话「VM 不完整，缺 disk.qcow2。
+            # 重新 install。一直跳出无法关闭」）。
+            die(f"VM 不完整，缺 {f}——这一台上次没装完。\n"
+                f"原地修好它（会清掉 {d} 重新装）：\n"
+                f"  {_self_cmd()} install --name {vm['name']} --force\n"
+                f"确定不要了：\n"
+                f"  {_self_cmd()} delete --name {vm['name']}")
     if not (d / "efi-vars.fd").is_file():
         _, vars_tmpl = find_edk2()
         shutil.copy(vars_tmpl, d / "efi-vars.fd")
@@ -2339,6 +2357,12 @@ def _install_signal_guard(name: str) -> None:
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
                     pass
+        # install.pid 也要清。os._exit 不走 finally，main() 里那道清理在这儿
+        # 不生效；而留着一个死 pid 的后果见 main() 里 install 那段注释。
+        try:
+            (d / "install.pid").unlink()
+        except OSError:
+            pass
         # 自己也退。用 os._exit 而不是 sys.exit：信号处理器里抛异常会被
         # Python 转成 traceback，而这时候用户已经点了「停止」，不想看栈。
         os._exit(130)
@@ -2371,10 +2395,28 @@ def spawn_detached_install(args) -> int:
     避免两边同时写一个文件。
     """
     name = args.name
+    # 名字先过白名单，而且要在碰任何路径之前。
+    #
+    # vm_dir() 是 VMS / name 直接拼，`--name /tmp/x` 解析出来就是 /tmp/x
+    # （pathlib 里绝对路径会盖掉前面的），`--name ../../foo` 直接跳出
+    # ~/.agentvm/vms。下面 _refuse_existing 会去 stat 那个路径上的 vm.json，
+    # 所以校验必须排在它前面——读一个用户指定的任意路径也比不读好，而写
+    # （mkdir / install.log / install.pid）是原来的老问题，一起堵掉。
+    check_vm_name(name)
     # 先把 --password-file 并进 args.password：下面 macOS 那条分支直接用
     # args.password 造 0600 文件，另一条分支要把它转成文件传给子进程。
     # 两处都在这儿取，免得同一个入口两种行为。
     resolve_password(args)
+    # 「已存在」这道校验必须在分叉之前、在写任何文件之前做。
+    #
+    # 原来只写在 cmd_install 里，而 app 永远走 --detach：父进程一声不响就把
+    # 子进程起出来、写好 install.pid、向 app 报「安装已开始」，子进程一秒后
+    # 死在「已存在」上。app 那边已经切到「正在安装」页——用户看到一句错误钉在
+    # 一个没有出口的页面上，既重试不了也关不掉。实测踩过（2026-11-10）。
+    #
+    # 对 macOS 还多一层：下面那个分支会 save_vm(_macos_vm_stub(...))，
+    # 不在这儿拦住的话，重装一台装好的 mac 会先把它的 vm.json 覆写成空壳。
+    _refuse_existing(name, args)
     d = vm_dir(name)
 
     # 先看有没有一个安装已经在跑。原来没有任何检查：连点两次安装（或 app 的
@@ -2396,25 +2438,20 @@ def spawn_detached_install(args) -> int:
     d.mkdir(parents=True, exist_ok=True)
     logf = d / "install.log"
 
-    # 名字必须先校验，而且要在建目录之前。
-    #
-    # 为什么不在 cmd_install 里验完就算：main() 先按 --detach 分叉到这儿，
-    # cmd_install 那道校验在 detach 路径上根本不执行。vm_dir() 直接把名字
-    # 拼进路径，`--name /tmp/x` 会在任意绝对路径建目录、写 install.log 和
-    # install.pid；`--name ../../foo` 直接跳出 ~/.agentvm/vms。vmz 随后会拒
-    # 这个名字，但目录和文件已经留下了。
-    check_vm_name(name)
-
     # macOS 这一种的后端是另一个程序（vmz，Swift 写的，因为 VZ 只有
     # Swift/ObjC API）。这里必须起它而不是再跑一遍 vmkit.py：VZMacOSInstaller
     # 需要一个活的 VZVirtualMachine，而那个对象只在 vmz 进程里。
     # 甩后台的机制照旧（setsid + 日志重定向），所以 app 关掉安装照样跑完。
     distro = None
     if args.distro:
-        try:
-            distro = find_distro(load_catalog(), args.distro)
-        except SystemExit:
-            distro = None
+        # 不能直接用 find_distro：它找不到就 die，而那声错误会由父进程先打到
+        # 界面上，紧接着父进程又报「安装已开始」——用户看到一句错误加一句成功，
+        # 而子进程会把同样的错误再打一遍，日志里同一个问题出现三次。
+        # 实测踩过（2026-11-10）。这里只要「是不是 macOS」一个判据，
+        # 找不到就当不是，真正的报错留给子进程说一次。
+        cat = load_catalog()
+        distro = next((x for x in cat.get("distros", [])
+                       if x.get("id") == args.distro), None)
 
     if distro is not None and distro.get("kind") == "macos":
         vmz = find_vmz()
@@ -2481,6 +2518,74 @@ def spawn_detached_install(args) -> int:
     return 0
 
 
+def _refuse_existing(name: str, args) -> None:
+    """同名虚拟机已经存在、又没给 --force 时，给人一句能照着做的话。
+
+    两处 install（catalog 路、本地安装包路）和后台安装路都要这道校验。
+    原来它只写在 cmd_install 里，而 app 永远走 --detach：父进程一声不响就把
+    子进程起出来、写好 install.pid、向 app 报「安装已开始」，子进程一秒后死
+    在「已存在」上。app 那边已经切到「正在安装」页——用户看到一句错误钉在
+    一个没有出口的页面上，既重试不了也关不掉。实测踩过（2026-11-10）。
+
+    旧 VM 是半成品时要特别说一句：那种机器起不动也修不好，--force 正是给它
+    准备的，不说清楚用户就以为数据会没，不敢按。
+    """
+    if args.force or not vm_file(name).exists():
+        return
+    broken = vm_broken(load_vm(name))
+    if broken:
+        die(f"{name} 已存在，而且它上次没装完（{broken}）——这样一台既起不动"
+            f"又修不好的机器，加 --force 会清掉 {vm_dir(name)} 重新装：\n"
+            f"  {_self_cmd()} install --name {name} --force")
+    die(f"{name} 已存在。换个名字，或加 --force 重装（里面的数据一起没）。")
+
+
+def _reopen_install_log(name: str) -> None:
+    """--force 重装之后，把 stdout/stderr 重新指回新的 install.log。
+
+    为什么需要：后台安装（app 走的那条）是父进程先打开 install.log（append）
+    再把子进程起出来，子进程继承那个 fd。而 --force 会 `_rmtree` 整个 VM 目录，
+    那个文件被 unlink——子进程还在往一个已经不在目录树里的 inode 写。用户看到
+    的是 install.log 不存在、或者停在上一轮的内容，app 的 tailLog 一个事件都
+    读不到，界面是一个完全不动的「正在安装」。实测踩过（2026-11-10，
+    复现步骤：app 里对一台没装完的虚拟机点「重装」）。
+
+    只在确实是后台子进程时调用（调用方用 install.pid 的存在判断）。命令行
+    前台跑的用户 stdout 是终端，不能把它改道进文件里。
+
+    install.pid 也要补回来：父进程写的那份跟着旧目录一起被删了，而 app 的
+    「停止」按钮和重启后的「接上还在跑的安装」都靠这个文件找进程。少了它，
+    用户点停止打在一个空文件上，什么都不会发生。
+    """
+    logf = vm_dir(name) / "install.log"
+    try:
+        logf.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(logf), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    except OSError:
+        fd = -1
+    try:
+        if fd >= 0:
+            # 父进程写的那行表头跟着旧 inode 一起没了，在这儿补一份，日志才连得上。
+            os.write(fd, f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                         f" 开始安装 {name} =====\n".encode())
+            # sys.stdout 是包在 fd 1 上的对象，换掉 fd 1 它就跟着换文件，
+            # 不需要重新赋值 sys.stdout。
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+    except OSError:
+        pass
+    finally:
+        if fd > 2:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        (vm_dir(name) / "install.pid").write_text(str(os.getpid()))
+    except OSError:
+        pass
+
+
 def cmd_install(args) -> int:
     name = args.name
     resolve_password(args)
@@ -2489,8 +2594,9 @@ def cmd_install(args) -> int:
         die("只在 Apple Silicon 的 macOS 上有效。")
     if not name.replace("-", "").replace("_", "").isalnum():
         die(f"名字只能含字母数字和 - _：{name}")
-    if vm_file(name).exists() and not args.force:
-        die(f"{name} 已存在。换个名字，或加 --force 重装。")
+    if not name.replace("-", "").replace("_", "").isalnum():
+        die(f"名字只能含字母数字和 - _：{name}")
+    _refuse_existing(name, args)
 
     # 本地安装包这条路不走 catalog：没有下载地址、没有校验和、没有推荐配置，
     # 全靠用户给的一个路径。所以先把它分叉出来，别让后面的 catalog 查找绊倒。
@@ -2573,9 +2679,11 @@ def cmd_install(args) -> int:
     distro = find_distro(cat, args.distro)
     if not name.replace("-", "").replace("_", "").isalnum():
         die(f"名字只能含字母数字和 - _：{name}")
+    # _refuse_existing 已经在函数开头拦过一次，这里再拦是因为 catalog 查找
+    # （可能因为 distro 名字不对而 die）和本地包那条路都在它之后。重复调用
+    # 是幂等的：给了 --force 或目录不存在就立刻返回。
+    _refuse_existing(name, args)
     if vm_file(name).exists():
-        if not args.force:
-            die(f"{name} 已存在。换个名字，或加 --force 重装。")
         # --force 必须真的清掉旧盘。原来只重写 cloud-init 种子，旧的文件系统
         # 和旧数据原样留着：用户以为得到一台干净机器，实际上一轮的脏数据全在，
         # 而 --help 写的是「覆盖重装」。这种事比不给 --force 更糟——至少那个
@@ -2585,8 +2693,14 @@ def cmd_install(args) -> int:
         old = load_vm(name) if vm_file(name).exists() else {}
         if qemu_pid(old if old else {"name": name}):
             die(f"{name} 正在运行。先 stop 再 --force 重装，不然会删掉正在用的盘。")
+        # 后台安装那条路：父进程在分叉之前就打开了 install.log（append 模式），
+        # 而下面这一删会把它一起 unlink。先记下「我们是那个后台子进程」，
+        # 好在删完之后把 stdout 重新接回新文件。
+        detached = (vm_dir(name) / "install.pid").is_file()
         warn(f"--force：清掉 {vm_dir(name)} 重新装（里面的数据一起没）")
         _rmtree(vm_dir(name))
+        if detached:
+            _reopen_install_log(name)
 
     # 一律 .get()：一个写了一半的 vm.json 缺 ssh_port 时，这里 KeyError 崩掉，
     # 而用户只是想装一个跟那个坏字段无关的新虚拟机。
@@ -3101,6 +3215,35 @@ def cmd_guest(args) -> int:
     die(f"不认识的动作：{args.action}")
 
 
+def vm_broken(vm: dict) -> str:
+    """这台虚拟机是不是半成品——缺了启动必需的文件。不缺返回空串。
+
+    为什么需要这个状态：install 中途失败（下载断了、磁盘建不出来、用户点了
+    「停止」）会留下一个「只有 vm.json」的目录。此时 list / status 把它当成
+    一台正常虚拟机列出来，用户点「启动」才拿到一句「VM 不完整，缺
+    disk.qcow2。重新 install。」——而 install 紧接着回「已存在，换个名字或加
+    --force」。两句都是死胡同。实测踩过（2026-11-10）。
+
+    把这个状态显式发出去，界面就能显示「没装完」并给一个「重装」按钮，
+    install 的「已存在」那句也能直接说清 --force 能修好它。
+    """
+    name = vm.get("name", "")
+    if not name:
+        return ""
+    kind = vm.get("kind", "")
+    # macOS 的系统盘是 raw 的 disk.img（VZ 只认 raw），Windows 和本地 ISO 是
+    # data.img，Linux 云镜像是 qcow2 overlay 加 cloud-init 种子盘。
+    if kind == "macos":
+        need = ("disk.img",)
+    elif kind in ("windows", "local"):
+        need = ("data.img",)
+    else:
+        need = ("disk.qcow2", "seed.iso")
+    d = vm_dir(name)
+    missing = [f for f in need if not (d / f).is_file()]
+    return ("缺 " + "、".join(missing)) if missing else ""
+
+
 def vm_record(vm: dict) -> dict:
     """把一个 vm.json 字典转成界面要的那份记录。
 
@@ -3177,6 +3320,9 @@ def vm_record(vm: dict) -> dict:
         rec["mac_build"] = spec.get("build", "")
         rec["mac_resolution"] = f"{spec.get('width', 1440)}x{spec.get('height', 900)}"
         rec["mac_installed"] = bool(spec.get("installed"))
+    # 半成品状态。界面据此显示「没装完」并给「重装」按钮；空串表示文件齐全。
+    # 放在最后：macOS 那段会改 ready，与 broken 各管一件事，不要互相覆盖。
+    rec["broken"] = vm_broken(vm)
     return rec
 
 
@@ -4390,7 +4536,21 @@ def main() -> int:
     if args.cmd == "install":
         if args.detach:
             return spawn_detached_install(args)
-        return cmd_install(args)
+        try:
+            return cmd_install(args)
+        finally:
+            # install.pid 用完就删。
+            #
+            # 留着它，app 的 resumeWatching 会拿一个死进程号当真：macOS 的 pid
+            # 会回绕复用，一旦这个号被派给无关进程，app 就认为这个安装永远在跑
+            # ——顶部横幅钉在「正在安装」、所有按钮因为 busy 一直是灰的，而用户
+            # 什么都做不了，只能强杀 app。删掉它，app 那边读到的是「文件不在」，
+            # 结论和事实一致。
+            # 放在 finally 里：die() 走 sys.exit，正常返回也会走到，两条路都清。
+            try:
+                (vm_dir(args.name) / "install.pid").unlink()
+            except OSError:
+                pass
     if args.cmd == "status":
         # status 允许不带 --name（看全部），所以要在下面的检查之前处理
         return cmd_status(args)

@@ -840,3 +840,147 @@ CDN 是按客户端限速的，加连接只是把每条的份额摊薄，聚合�
 而且那条路在 Apple CDN 上每次都稳定卡在同一个段、根本下不完
 （四种修法全部实测排除，见 MacVMEngine.swift 里 `macFetchWithCurl` 的注释）。
 那个类已经删掉。
+
+## M16. 「VM 不完整，缺 disk.qcow2。重新 install。」是个死胡同（已修）
+
+2026-11-10 用户原话：「一个 bug，VM 不完整，缺 disk.qcow2。重新 install。
+一直跳出无法关闭」。
+
+这句话是 `start_linux` 里的一句 `die`。问题不在它报错了，在于**它指的路走不通**：
+
+    start   → 「VM 不完整，缺 disk.qcow2。重新 install。」
+    install → 「xxx 已存在。换个名字，或加 --force 重装。」
+
+两句互相踢皮球。用户既起不动这台机器，也没法原地修好它，只能自己去终端
+删目录。而 app 那边连 `--force` 都传不了（新建向导永远不带这个 flag），
+所以在图形界面里这条错误是终点了。
+
+更糟的是 `spawn_detached_install` 那条路：app 永远走 `--detach`，而
+「已存在」这道校验原来只写在 `cmd_install` 里。父进程一声不响就把子进程
+起出来、写好 install.pid、向 app 报「安装已开始」，子进程一秒后死在
+「已存在」上。app 那时已经切到「正在安装」页，用户看到的是一句错误
+钉在一个没有出口的页面上（M17）。
+
+修法三件事：
+
+1. `vm_broken(vm)` 显式算出「缺哪些文件」，`vm_record` 把它作为 `broken`
+   字段发出去。界面据此显示「没装完」并给「重装」按钮，而不是等用户点
+   「启动」去撞一句死胡同错误。
+2. 两处 `die` 都改成能照着做的命令（`install --name X --force` 或
+   `delete --name X`），并且用 `_self_cmd()` 给全路径——vmkit.py 没有装到
+   PATH 上，写 `vmkit.py` 用户照抄会 command not found。
+3. `_refuse_existing()` 在 `cmd_install`、本地安装包路和
+   `spawn_detached_install` 三处都跑一遍。半成品时那句错误要特别说明
+   「它没有可用数据，--force 正是给它准备的」——不说清楚用户以为会丢东西，
+   不敢按。
+
+## M17. 新建向导的「正在安装」页没有出口（已修）
+
+同一个 bug 的后半截。`NewVMWizard` 的 `.installing` 页脚原来只有一个按钮：
+
+    Button("停止") { state.backend.cancel() }
+        .disabled(!state.backend.busy)
+
+而 `step` 离开 `.installing` 的唯一路径是 `.onChange(of: state.installFinished)`，
+`installFinished` 只在 `handleEvent` 收到一个**能解成 VMInfo 的** `done`
+事件时置位。安装失败、被用户停止、后端发来的 done 形状对不上——这三种情况
+它永远是 false。于是：
+
+- 「停止」按钮在安装失败后虽然能点，但 `cancel()` 打在一个早就死掉的进程上，
+  什么也不发生；
+- 页面没有任何关闭按钮，Esc 也没有 `.cancelAction`；
+- 用户被关在这一页上，只能强杀 app。
+
+这就是用户说的「无法关闭」。
+
+修法：
+
+- 页脚永远给「关闭（后台继续装）」——安装是脱离 app 的后台任务，顶部横幅
+  会继续显示进度，这句话必须写在按钮上，不然用户以为一关就没了。
+- 新增 `installEnded`：`tailLog` / `resumeTailing` 的 completion 里置位。
+  进程没了就是结束了，这个信号不依赖任何事件形状，失败时也一定来。
+  到点就让 `step` 回 `.config`（能改名再装一次），没有选过系统时回 `.pick`。
+- `handleEvent` 的 `done` 分支区分两种形状：引导进程的
+  `{"name","log","pid","detached":true}` 只说明「已经甩到后台」，
+  安装进程自己的 `{"vm":{…完整记录…}}` 才是装好了。原来两个都按后者解，
+  引导那个必然静默失败（`try?`），`installFinished` 永远不来。
+
+## M18. `--force` 重装会把 install.log 一起删掉，app 看到的是一个空页面（已修）
+
+`spawn_detached_install` 先打开 `<vm>/install.log`（append）再把子进程
+起出来，子进程继承那个 fd；而 `--force` 会 `_rmtree` 整个 VM 目录。文件被
+unlink，子进程还在往一个已经不在目录树里的 inode 写。
+
+用户看到的是 install.log 不存在、或者停在上一轮的内容；app 的 `tailLog`
+一个事件都读不到，界面是一个完全不动的「正在安装」——比报错更难查。
+
+这条在「给半成品虚拟机加重装按钮」之前一直没人踩到，因为 `--force` 原来
+只有命令行会用。修法：`_reopen_install_log()` 在 `_rmtree` 之后把 fd 1/2
+重新指回新文件（`os.dup2`，`sys.stdout` 不用重新赋值），补一行表头，
+并把 install.pid 按 `os.getpid()` 写回去——那一份也被 rmtree 删了，
+而 app 的「停止」按钮和重启后的「接上还在跑的安装」都靠它找进程。
+
+只在确实是后台子进程时调用（用 install.pid 的存在判断）：命令行前台跑的
+用户 stdout 是终端，不能把它改道进文件里。
+
+## M19. install.pid 里的死进程号会被复用，app 以为安装永远在跑（已修）
+
+app 的 `installAlive` 原来只判「这个 pid 活着吗、是不是僵尸」。macOS 的
+pid 会回绕复用，一个早就结束的安装留下的号随时可能被派给毫无关系的进程。
+这时候 app 认为安装还在跑：
+
+- 顶部横幅钉在「正在安装」；
+- `running` 不归零 → `busy` 恒为真 → 所有按钮全灰；
+- `resumeWatching` 会去尾一份早就写完的日志，`tailLog` 的定时器永远不取消。
+
+用户什么都做不了，只能强杀 app。
+
+两件事一起修：
+
+1. vmkit 侧：安装结束就删 install.pid。放在 `main()` 里 install 那段
+   `finally`（`die()` 走 `sys.exit`，正常返回也会走到），信号 handler 里
+   再补一次——那边用 `os._exit`，不走 finally。窗口从「永久」缩到
+   「安装进行中」。
+2. app 侧：`installAlive` 用 `ps -o state=,command=` 连进程名一起核对，
+   命令行里没有 `vmkit.py` / `vmz` 就当作没在跑。只取 `comm` 不够——
+   python3 的 comm 是 "Python"，任何 Python 程序都算。对不上时返回 nil
+   是安全的方向：最坏是让用户重点一次安装，不会把人锁死在灰屏界面上。
+
+顺带修了 `tailLog` 的一个老问题：`resumeTailing` 已经把整份日志放出去过
+一遍（并设好 tailOffset），紧接着调的 `tailLog` 又把 offset 清零重读，
+同样的事件触发两遍——同一个错误弹窗连跳两次。加 `fromStart:` 参数，
+接续时传 false。
+
+## M20. 全角标点紧跟变量名，bash 把它并进变量名，`set -u` 下整个脚本崩（已修）
+
+2026-11-10 跑 `./install.sh` 时装 app 前一步硬失败：
+
+    ./install.sh: line 100: APP_DST\xef: unbound variable
+
+那一行是 `warn "已存在 $APP_DST，覆盖"`。`，` 是 U+FF0C，UTF-8 三个字节
+`EF BC 8C`。bash 的变量名规则本来只认 `[A-Za-z0-9_]`，但在这个 locale 下
+（`LC_CTYPE=C.UTF-8`）高位字节被它当成名字的一部分——于是 `$APP_DST，覆盖`
+解析成一个叫 `APP_DST\xEF\xBC\x8C` 的变量，`set -u` 判它未绑定，直接退出。
+最小复现：
+
+    $ sh -c 'set -eu; X=hi; echo "$X，y"'      # X<0xEF>: unbound variable
+    $ sh -c 'set -eu; X=hi; echo "${X}，y"'    # hi，y
+
+十二处同类写法，八处在会执行的代码里，五个脚本全都带 `set -u`：
+
+    app/build.sh          退出码 $vmz_status）。      /  $sign_status）。
+    install.sh            详见 $VMZ_LOG）             /  ${APP_DST}，覆盖（这一处直接挡住装机）
+                          / 详见 $APP_SIGN_LOG）
+    scripts/10-install-tart.sh   用本地压缩包 $TARBALL（  /  退出码 $rc）。
+    scripts/agentvm-fetch        删掉了 $out，
+    scripts/install-qemu.sh      找不到 $QEMU_BIN。
+
+后果不是「提示语少个值」：脚本在把 AgentVM.app 拷进 /Applications **之前**
+退出，而前面 QEMU 检查、vmz 编译全都打了 ok。用户看到的是一个装到一半、
+日志一片绿的安装。装机路径上最不该有的形状。
+
+统一改成 `${VAR}`。花括号让名字的边界没有歧义，跟 locale 无关。
+
+lint 加了一道正则检查（`Makefile` 的 `wide-punct` 目标），专门抓
+「没有花括号的 `$VAR` 后面紧跟非 ASCII 字节」。注释里的不算——那是文档，
+不会执行；但看得见的也顺手加了花括号，免得有人照着抄。

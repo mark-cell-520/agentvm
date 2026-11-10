@@ -11,6 +11,17 @@ final class AppState: ObservableObject {
     @Published var loading = false
     @Published var installFinished = false
     @Published var installedVM: VMInfo?
+    /// 安装进程已经结束了——不管成功还是失败。
+    ///
+    /// 为什么不能只靠 installFinished：那个只在收到一个**能解成 VMInfo 的**
+    /// done 事件时置位，而安装失败、被用户停止、后端发来的 done 形状对不上时
+    /// 它永远是 false。后果是向导钉在「正在安装」那一页——那一页原来只有一个
+    /// 「停止」按钮，而安装早就死了，点了没反应，用户没有任何出口，只能强杀
+    /// app。实测踩过（2026-11-10，用户原话「一直跳出无法关闭」）。
+    @Published var installEnded = false
+    /// 「新建虚拟机」向导开不开。原来这是 ContentView 里的 @State，
+    /// AppState 想从详情页直接打开安装页时够不着，于是搬到这里。
+    @Published var showNewVM = false
     /// 正在被监听的安装对应的虚拟机名。app 重启后接上没装完的安装时设上，
     /// 界面据此显示「安装中」横幅。不设的话用户重新打开 app 只看到一个停在
     /// 半路的条目，完全不知道后台还在下 4 GB。
@@ -55,14 +66,20 @@ final class AppState: ObservableObject {
     /// 重装。」→ 错误事件进了 handleEvent 但界面不刷新（见 revision 的注释），
     /// installFinished 永远不来，向导停在「正在安装」，而「停止」又停不掉真正
     /// 的安装进程。用户在第一步就卡死。
-    func resetWizard() {
-        vmName = ""
-        vmPassword = "Agentvm2026"
-        showPassword = false
-        pickedDistro = nil
+    ///
+    /// `startAt` 给一个步骤时不清表单——那是「重装一台没装完的虚拟机」，
+    /// 名字得留着，直接进安装页。
+    func resetWizard(startAt: WizardStep? = nil) {
+        if startAt == nil {
+            vmName = ""
+            vmPassword = "Agentvm2026"
+            showPassword = false
+            pickedDistro = nil
+        }
         installFinished = false
         installedVM = nil
-        wizardStep = nil
+        installEnded = false
+        wizardStep = startAt
     }
 
     /// 新建虚拟机的表单。默认值在选了系统之后按该系统的推荐值填。
@@ -171,6 +188,7 @@ final class AppState: ObservableObject {
         guard let d = pickedDistro else { return }
         installFinished = false
         installedVM = nil
+        installEnded = false
         backend.clearLog()
 
         var args: [String]
@@ -195,9 +213,19 @@ final class AppState: ObservableObject {
             self?.refreshStatus()
             self?.watchingInstall = nil
             self?.backend.setWatching(nil)
+            // 进程没了就是结束了。必须在这儿置位：安装失败时 installFinished
+            // 永远不会来，而向导的出口只有它一个，用户会被关在安装页里。
+            self?.installEnded = true
         }
         watchingInstall = vmName
         backend.setWatching(vmName)
+    }
+
+    /// 打开新建向导。`at` 给一个步骤时直接停在那儿（不清表单）——
+    /// 横幅上的「查看详情」要的是「跳到正在安装那一页」，不是回到第一步。
+    func openNewVMWizard(at step: WizardStep? = nil) {
+        resetWizard(startAt: step)
+        showNewVM = true
     }
 
     /// app 启动时接上还在跑的安装。
@@ -251,12 +279,14 @@ final class AppState: ObservableObject {
         watchingInstall = newest.name
         backend.setWatching(newest.name)
         wizardStep = .installing
+        installEnded = false
         backend.resumeTailing(newest.dir.appendingPathComponent("install.log"),
                               pid: pid,
                               onEvent: handleEvent) { [weak self] in
             self?.refreshStatus()
             self?.watchingInstall = nil
             self?.backend.setWatching(nil)
+            self?.installEnded = true
         }
     }
 
@@ -291,6 +321,15 @@ final class AppState: ObservableObject {
             backend.appendLog(.init(level: "error",
                                     text: ev["msg"] as? String ?? ""))
         case "done":
+            // 后台安装那条路有两个形状完全不同的 done：
+            //   · 引导进程的：{"name","log","pid","detached":true}，只说明
+            //     「安装已经甩到后台跑了」，不是装好了；
+            //   · 安装进程自己的：{"vm":{…完整 VM 记录…}}，这才是装好了。
+            // 原来两个都按后者解，引导那个的 VMInfo 解码必然失败——而失败是
+            // 静默的（try?），installFinished 永远不置位，用户看到的是一台
+            // 装好了的虚拟机配一个钉在「正在安装」的向导。实测踩过（2026-11-10）。
+            if let inner = ev["vm"] as? [String: Any],
+               inner["detached"] as? Bool == true { break }
             if let dict = ev["vm"] as? [String: Any],
                let data = try? JSONSerialization.data(withJSONObject: dict),
                let vm = try? JSONDecoder().decode(VMInfo.self, from: data) {
@@ -497,6 +536,49 @@ final class AppState: ObservableObject {
         backend.run(["delete", "--name", vm.name], onEvent: handleCommandEvent) { [weak self] in
             self?.refreshStatus()
         }
+    }
+
+    /// 重装一台虚拟机：清掉它的目录从头装。给「没装完」的那几台用。
+    ///
+    /// 为什么需要这条：半成品 VM（install 中途失败留下的）既起不动也没法原地
+    /// 修好——点「启动」拿到「VM 不完整，缺 disk.qcow2。重新 install。」，
+    /// 而从新建向导装同样的名字又回「已存在，换个名字或加 --force」。两句都是
+    /// 死胡同，用户只能自己去终端删目录。实测踩过（2026-11-10）。
+    ///
+    /// 半成品没有可用数据，所以调用方可以直接调，不用再确认一遍。
+    func reinstall(_ vm: VMInfo) {
+        var args: [String]
+        if vm.isLocal, let src = vm.source, !src.isEmpty {
+            args = ["--source", src]
+        } else if !vm.distro.isEmpty {
+            args = ["--distro", vm.distro]
+        } else {
+            backend.errorMessage = "这台没有记录装的是哪个系统，没法重装。删掉它重新建一台。"
+            revision += 1
+            return
+        }
+        args += ["--name", vm.name, "--force",
+                 "--cpu", String(vm.cpus), "--mem", vm.ram,
+                 "--disk", vm.disk, "--user", vm.user]
+        // 密码跟新建向导同一个来源。不传的话 vmkit 用它自己的默认值，
+        // 而用户从向导里看到的一直是表单里那个——两处不一致，
+        // 装完登不进去时没有任何线索指向这里。
+        if !vmPassword.isEmpty { args += ["--password", vmPassword] }
+        installFinished = false
+        installedVM = nil
+        installEnded = false
+        backend.clearLog()
+        // 直接进安装页：用户点的是「重装」，给他看进度，而不是回第一步重选系统。
+        resetWizard(startAt: .installing)
+        showNewVM = true
+        backend.installDetached(args, onEvent: handleEvent) { [weak self] in
+            self?.refreshStatus()
+            self?.watchingInstall = nil
+            self?.backend.setWatching(nil)
+            self?.installEnded = true
+        }
+        watchingInstall = vm.name
+        backend.setWatching(vm.name)
     }
 
     func toggleAutostart(_ vm: VMInfo) {

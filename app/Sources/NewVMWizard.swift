@@ -88,8 +88,21 @@ struct NewVMWizard: View {
                     .disabled(!canInstall)
                     .keyboardShortcut(.defaultAction)
             } else if step == .installing {
-                Button("停止") { state.backend.cancel() }
-                    .disabled(!state.backend.busy)
+                // 安装页必须永远有出口。
+                //
+                // 原来这里只有「停止」一个按钮，而它 .disabled(!busy)：安装失败
+                // 或被停止之后 busy 归零、按钮虽然能点但 cancel() 打在一个早就
+                // 死掉的进程上什么也不做；installFinished 又永远不来（失败时收
+                // 不到能解成 VMInfo 的 done），step 于是钉在 .installing。
+                // 用户被关在这一页上，只能强杀 app。实测踩过（2026-11-10，
+                // 用户原话「一直跳出无法关闭」）。
+                if state.backend.busy {
+                    Button("停止") { state.backend.cancel() }
+                }
+                // 关掉向导不等于取消安装：它是脱离 app 的后台任务，顶部横幅
+                // 会继续显示进度。这句话必须说，不然用户以为一关就没了。
+                Button("关闭（后台继续装）") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
             } else {
                 Button("关闭") { dismiss() }
                     .keyboardShortcut(.defaultAction)
@@ -99,6 +112,15 @@ struct NewVMWizard: View {
         .padding(.vertical, 12)
         .onChange(of: state.installFinished) { _, finished in
             if finished { step = .done }
+        }
+        .onChange(of: state.installEnded) { _, ended in
+            // 安装进程结束了，但没等到「装好了」——失败、被用户停止、
+            // 或者后端发来的 done 形状解不出来。必须让用户离开这一页，
+            // 否则就是上面那个没有出口的陷阱。回到配置页（能改名再装一次）；
+            // 没有选过系统时（app 重启后接上来的安装）只能回第一步。
+            if ended && !state.installFinished {
+                step = state.pickedDistro == nil ? .pick : .config
+            }
         }
     }
 

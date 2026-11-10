@@ -67,7 +67,7 @@ trap 'rm -rf "$WORK"' EXIT
 if [ -n "$TARBALL" ]; then
     [ -f "$TARBALL" ] || die "找不到压缩包：$TARBALL"
     cp "$TARBALL" "$WORK/tart.tar.gz"
-    ok "用本地压缩包 $TARBALL（跳过联网）"
+    ok "用本地压缩包 ${TARBALL}（跳过联网）"
 else
     read -r TAG ASSET_ID ASSET_SIZE < <(resolve_release) || true
 
@@ -142,7 +142,7 @@ if "$PREFIX/bin/tart" --version; then
   ok "Tart installed"
 else
   rc=$?
-  die "tart 装好了但跑不起来（退出码 $rc）。通常是签名/重定位问题："
+  die "tart 装好了但跑不起来（退出码 ${rc}）。通常是签名/重定位问题："
       "    xattr -dr com.apple.quarantine '$APPDIR/tart.app'"
       "    codesign --force --deep -s - '$APPDIR/tart.app'"
       "  详见 docs/WINDOWS-ARM-ON-MACOS.md 的「改完必须重签」。"

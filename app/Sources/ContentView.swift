@@ -3,7 +3,8 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var state: AppState
     @State private var selection: String?
-    @State private var showNewVM = false
+    // showNewVM 在 AppState 里：详情页的「重装」按钮要能直接把向导开到安装页，
+    // 放在这儿它够不着。
 
     /// 有安装在进行时显示的进度横幅。安装是脱离 app 的后台任务，用户可能刚
     /// 重新打开 app，也可能中途把向导关了——不管哪种都得让他看见还在装。
@@ -26,8 +27,7 @@ struct ContentView: View {
                 }
                 Spacer()
                 Button("查看详情") {
-                    state.wizardStep = .installing
-                    showNewVM = true
+                    state.openNewVMWizard(at: .installing)
                 }
                 .buttonStyle(.borderless)
             }
@@ -71,7 +71,7 @@ struct ContentView: View {
                     .help("刷新")
 
                     Button {
-                        showNewVM = true
+                        state.openNewVMWizard()
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -120,7 +120,7 @@ struct ContentView: View {
                     Text("在左边选一个虚拟机，或新建一个")
                         .foregroundStyle(.secondary)
                     Button {
-                        showNewVM = true
+                        state.openNewVMWizard()
                     } label: {
                         Label("新建虚拟机", systemImage: "plus")
                     }
@@ -130,16 +130,15 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .sheet(isPresented: $showNewVM) {
+        .sheet(isPresented: $state.showNewVM) {
             NewVMWizard(startStep: state.wizardStep ?? .pick)
                 .environmentObject(state)
         }
-        // 每次打开新建向导都先把表单清干净，别把上一次填的名字带给下一次。
-        // 见 AppState.resetWizard() 的注释：不清会让第二个虚拟机必然重名失败，
-        // 而失败还停在一个关不掉的「正在安装」页面上。
-        .onChange(of: showNewVM) { _, open in
-            if open { state.resetWizard() }
-        }
+        // 注意：这里原来还有一个 .onChange(of: showNewVM) { resetWizard() }。
+        // 它会把「重装一台没装完的虚拟机」设好的 wizardStep = .installing 一起
+        // 清掉——用户点「重装」，向导却回到第一步，而他刚从那儿过来。
+        // 现在清表单这件事由 AppState.openNewVMWizard() / resetWizard(startAt:)
+        // 在打开之前显式做，不再靠 onChange 补刀。
         // 控制台单独一个窗口/sheet。用 item 而不是布尔量：关掉的时候要把
         // consoleVM 清空，否则下一次打开同一个 VM 时 SwiftUI 认为内容没变，
         // 不会重建——而那个客户端连着上一次的连接。
@@ -195,6 +194,10 @@ struct VMDetailView: View {
                     warningBanner
                 }
 
+                if vm.isBroken {
+                    brokenBanner
+                }
+
                 GroupBox("状态") { infoGrid }
                 GroupBox("操作") { actions }
 
@@ -224,6 +227,41 @@ struct VMDetailView: View {
             Spacer()
             statusPill
         }
+    }
+
+    /// 半成品虚拟机的警告条：文件不齐，起不来，只能重装。
+    ///
+    /// 原来没有这个状态：半成品在列表里和正常虚拟机一模一样，用户点「启动」
+    /// 才撞上一句「VM 不完整，缺 disk.qcow2。重新 install。」，而 install 又
+    /// 回「已存在，换个名字或加 --force」——两句都是死胡同。在这儿说清楚，
+    /// 并把唯一能走的那条路（重装）直接给成一个按钮。
+    @ViewBuilder
+    private var brokenBanner: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("这台上次没装完").bold()
+            }
+            Text("缺的文件：\(vm.broken ?? "")。现在这样既启动不了，也没法原地修好。"
+                 + "重装会清掉它的目录从头装——它没有可用数据，不用担心丢东西。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("重装这一台") { state.reinstall(vm) }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(state.backend.busy)
+                Button("删掉它") { confirmDelete(vm) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(state.backend.busy)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var statusPill: some View {
@@ -286,7 +324,22 @@ struct VMDetailView: View {
     }
 
     private var actions: some View {
-        HStack(spacing: 10) {
+        // 半成品：文件不齐，启动/控制台/快照这一整套点过去全是同一句死胡同
+        // 错误。只给能走的那两条路。用 if/else 而不是提前 return——
+        // ViewBuilder 里的 return 在这个 Swift 版本上会触发编译器的
+        // 「failed to produce diagnostic」，报错行号离真正的原因很远。
+        Group {
+        if vm.isBroken {
+            HStack(spacing: 10) {
+                Button("重装这一台") { state.reinstall(vm) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(state.backend.busy)
+                Button("删除", role: .destructive) { confirmDelete(vm) }
+                    .disabled(state.backend.busy)
+                Spacer()
+            }
+        } else {
+            HStack(spacing: 10) {
             if vm.running {
                 Button("关机") { state.action("stop", name: vm.name) }
                     .disabled(state.backend.busy)
@@ -339,6 +392,8 @@ struct VMDetailView: View {
             // NSAlert，就这个最重的操作没有。
             Button("删除", role: .destructive) { confirmDelete(vm) }
                 .disabled(state.backend.busy)
+            }
+        }
         }
     }
 

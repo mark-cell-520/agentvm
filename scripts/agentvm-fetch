@@ -207,7 +207,7 @@ fetch_one() {
     # 同一个必然失败的尝试。
     33) warn "server refuses Range for $digest (curl 33)"
         rm -f "$out"
-        die "删掉了 $out，重跑本脚本重新下（不带续传）" ;;
+        die "删掉了 ${out}，重跑本脚本重新下（不带续传）" ;;
     *) warn "download of $digest failed (HTTP $code); rerun to resume"; return 1 ;;
   esac
 

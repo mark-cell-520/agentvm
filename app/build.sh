@@ -78,7 +78,7 @@ if swiftc -O -sdk "$SDK" -target "$TARGET" \
 else
     vmz_status=$?
     sed 's/^/    /' "$vmz_log"
-    echo "    vmz 编译失败（退出码 $vmz_status）。Windows/Linux 不受影响，macOS 虚拟机用不了。"
+    echo "    vmz 编译失败（退出码 ${vmz_status}）。Windows/Linux 不受影响，macOS 虚拟机用不了。"
     rm -f "$VMBIN"
 fi
 # 拷进 app 之前先确认它真是个 Mach-O。上面已经 rm 过残文件，这里是第二道：
@@ -190,7 +190,7 @@ if codesign --force --deep --entitlements "$ROOT/app/Resources/entitlements.plis
 else
   sign_status=$?
   sed 's/^/    /' "$sign_err"
-  echo "    签名失败（退出码 $sign_status）。app 在 macOS 上会被拦成「已损坏，应移到废纸篓」。"
+  echo "    签名失败（退出码 ${sign_status}。app 在 macOS 上会被拦成「已损坏，应移到废纸篓」。"
   exit 1
 fi
 

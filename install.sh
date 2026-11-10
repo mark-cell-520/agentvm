@@ -76,7 +76,7 @@ if command -v swiftc >/dev/null 2>&1; then
                 rm -f "$VMBIN/vmz"
             fi
         else
-            warn "vmz 编出来了但签名失败，macOS 虚拟机可能用不了（详见 $VMZ_LOG）"
+            warn "vmz 编出来了但签名失败，macOS 虚拟机可能用不了（详见 ${VMZ_LOG}）"
             # 不能用的东西不留。macOS 上签错的 Mach-O 常见表现是进程能起但被
             # SIGKILL（137），而它在 PATH 能找到的位置上，vmkit 会认为装好了、
             # 一路走到安装中途才失败。install-qemu.sh 对 QEMU 就是跑一次
@@ -97,7 +97,7 @@ fi
 
 log "安装 AgentVM.app"
 if [ -d "$APP_DST" ]; then
-    warn "已存在 $APP_DST，覆盖"
+    warn "已存在 ${APP_DST}，覆盖"
     # 先把跑着的实例退掉再删。app 开着时 rm 掉旧 bundle，运行中的实例继续用旧
     # inode，新装的对外不可见——用户以为「装了没生效」。osascript 优雅退出，
     # pkill 兜底；两者在 app 没运行时都会返回非零，用 || true 挡住 set -e。
@@ -165,7 +165,7 @@ xattr -dr com.apple.quarantine "$APP_DST" 2>/dev/null || true
 APP_SIGN_LOG="$(mktemp "${TMPDIR:-/tmp}/agentvm-app-sign.XXXXXX")"
 if ! codesign --force --deep --entitlements "$ROOT/app/Resources/entitlements.plist" \
         -s - "$APP_DST" 2>"$APP_SIGN_LOG"; then
-    warn "签名失败，app 可能被 Gatekeeper 拦（详见 $APP_SIGN_LOG）"
+    warn "签名失败，app 可能被 Gatekeeper 拦（详见 ${APP_SIGN_LOG}）"
 fi
 
 # --deep 不把 entitlement 传给嵌套二进制。install.sh 复用的可能是仓库里陈旧的

@@ -288,10 +288,14 @@ final class Backend: ObservableObject {
     /// 轮一次完全跟得上，而且不用处理文件被 truncate 或替换的边界情况。
     /// 结束的判据是安装进程消失，不是「读到某个标记」——进程没了就一定结束了，
     /// 而标记可能因为崩溃没写出来。
-    func tailLog(_ url: URL, pid: Int32,
+    ///
+    /// `fromStart` 为假时从 tailOffset 当前位置接着读，不清零。resumeTailing
+    /// 已经把整份日志放出去过一遍了，再清零重读会让同样的事件重复触发——
+    /// 同一个错误弹窗会连跳两次。实测踩过（2026-11-10）。
+    func tailLog(_ url: URL, pid: Int32, fromStart: Bool = true,
                  onEvent: @escaping ([String: Any]) -> Void,
                  completion: @escaping () -> Void) {
-        tailOffset = 0
+        if fromStart { tailOffset = 0 }
         tailPid = pid
 
         let parser = StreamParser()
@@ -351,7 +355,8 @@ final class Backend: ObservableObject {
             completion()
             return
         }
-        tailLog(url, pid: pid, onEvent: onEvent, completion: completion)
+        tailLog(url, pid: pid, fromStart: false, onEvent: onEvent,
+                completion: completion)
     }
 
     /// 某个虚拟机的安装进程是否还活着。
@@ -362,6 +367,13 @@ final class Backend: ObservableObject {
     /// 判活不能用 `kill(pid, 0)`：**僵尸进程照样返回成功**，而安装是被强杀之后
     /// 最常见的状态就是僵尸。用 os.kill 会永远认为上一次还在跑——app 从此拒绝
     /// 再接任何安装，而用户看到的是一个永远不动的「正在安装」。用 ps 排除 Z 状态。
+    ///
+    /// **还必须核对进程名。** install.pid 在安装结束时本该被 vmkit 删掉
+    /// （main() 里 install 那段 finally），但崩溃、强杀、旧版本留下的文件都会
+    /// 让它留着一个死 pid；而 macOS 的 pid 会回绕复用，这个号随时可能被派给
+    /// 一个毫无关系的进程。只判「活着」会把一个早就结束的安装当成永远在跑：
+    /// 顶部横幅钉在「正在安装」、running 不归零于是 busy 恒为真、所有按钮全灰，
+    /// 用户什么都做不了只能强杀 app。实测踩过（2026-11-10）。
     func installAlive(name: String) -> Int32? {
         let pidFile = Backend.vmsDirectory
             .appendingPathComponent(name)
@@ -371,7 +383,9 @@ final class Backend: ObservableObject {
               pid > 0 else { return nil }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
-        p.arguments = ["-p", String(pid), "-o", "state="]
+        // state 和 command 都要：前者排僵尸，后者核对是不是我们的安装进程。
+        // 只取 comm 不够——python3 的 comm 是 "Python"，任何 Python 程序都算。
+        p.arguments = ["-p", String(pid), "-o", "state=,command="]
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
@@ -386,8 +400,15 @@ final class Backend: ObservableObject {
         }
         let out = (try? pipe.fileHandleForReading.readToEnd())
             .flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        let state = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        if state.isEmpty || state.hasPrefix("Z") { return nil }
+        let line = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if line.isEmpty || line.hasPrefix("Z") { return nil }
+        // 归属判据：安装进程只有两种——vmkit.py 自己（Linux/Windows/local），
+        // 以及 vmz（macOS，VZ 只有 Swift API）。对不上就当作没在跑，那个方向
+        // 是安全的：最坏是让用户重点一次安装，不会把人锁死在灰屏界面上。
+        let cmd = line.dropFirst()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cmd.contains("vmkit.py") || cmd.contains("/vmz")
+                || cmd.hasSuffix(" vmz") else { return nil }
         return pid
     }
 
