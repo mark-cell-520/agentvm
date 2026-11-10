@@ -24,7 +24,7 @@ Windows 约 10 到 15 分钟，Linux 约 1 到 3 分钟。装完虚拟机是一�
 选一个本地 ISO，或者贴一个下载网址（后端带断点续传）。
 
 **2. 可视化配置。** 装完之后改 CPU、内存、磁盘、显示模式、三个端口、挂不挂安装
-光盘，都在「配置」面板里（macOS 虚拟机没有端口可改，它的网络是 NAT）。改完点「保存并重启」立刻生效——不用重新安装系统，
+光盘、共享目录、端口转发，都在「配置」面板里。改完点「保存并重启」立刻生效——不用重新安装系统，
 系统里的东西全留着。原来改内存只能删了重装，而删了重装意味着系统里的一切全没。
 
 **3. 存储四件套。** 「存储」面板里能加附加盘、拍快照、挂共享目录、克隆：
@@ -97,6 +97,53 @@ OpenAVB ROM、idevicerestore 补丁一整套。而 VZ 的 `VZMacOSRestoreImage` 
 `VZMacOSInstaller` / `VZMacOSBootLoader` 是公开 API，宿主机上直接拿到
 macOS 27.2.1 的 IPSW 地址。详见 [docs/AGENTVM-APP.md](docs/AGENTVM-APP.md)。
 
+## 客人机代理与共享目录
+
+Linux 云镜像那条路从 install 起就带着 QEMU guest agent：cloud-init 装
+`qemu-guest-agent`，QEMU 挂上 `virtio-serial`，宿主机经 `<vm>/qga.sock` 讲
+JSON-RPC。它给的是一条**不依赖客人机网络**的通道——sshd 没起来、IP 变了、
+防火墙把 22 挡了，SSH 都用不了，它照样通。
+
+```sh
+python3 scripts/vmkit.py guest --name d1 ping              # 探活
+python3 scripts/vmkit.py guest --name d1 ip                # 客人机的 IPv4
+python3 scripts/vmkit.py guest --name d1 disks             # 客人机能看到的块设备
+python3 scripts/vmkit.py guest --name d1 exec -- uname -a  # 在客人机里执行
+```
+
+关机顺序也因此变了：guest agent → SSH → ACPI 电源键 → 强杀。qcow2 被强杀有丢
+数据风险，所以前面每一层都值得试。加 agent 之前就起着的老 VM 没有这个 socket，
+那一步自动跳过，不报错。
+
+**Windows on ARM 侧没有它，也不硬上。** qemu-ga 的 Windows ARM64 安装包
+（`qemu-ga-arm64.msi`）目前只有 virtio-win-guest-tools-installer PR #100 /
+#104 的 CI artifact，没有正式 release 产物；UTM #5134 说 guest agent 未移植到
+ARM64 Windows。两条证据对不上，所以等正式包。宿主机侧的代码是「socket 存在就
+试」：自己装了社区版 agent、并按 Linux 那边的约定把 socket 放到 `<vm>/qga.sock`
+就能用上，不用改代码。详见 [docs/WINDOWS-ARM-ON-MACOS.md](docs/WINDOWS-ARM-ON-MACOS.md)。
+
+### tart 的目录共享、VNC 与端口暴露
+
+macOS 上 Linux 走 tart 的那条路（`agentvm.py`）把 `tart run` 的三个能力透传出来：
+
+```sh
+python3 agentvm.py start --dir ~/Shared:host --dir ~/Code:code \
+                         --vnc 127.0.0.1:5901 \
+                         --expose 8080:80
+```
+
+客人机里的挂载点是 `/Volumes/My Shared Files/<标签>`。`--dir` 和 `--expose`
+可以重复给。也可以写进 `.agentvmrc`（`tart_dirs=~/Shared:host,~/Code:code`、
+`tart_vnc=127.0.0.1:5901`、`tart_expose=8080:80`），或用环境变量
+`AGENTVM_TART_DIRS` / `AGENTVM_TART_VNC` / `AGENTVM_TART_EXPOSE`。端口必须是
+1-65535 的整数，路径要真实存在——配错了在启动前就报出来，不会起一半再吐一句
+看不懂的 usage。
+
+端口暴露走 tart 的 `--net-softnet-expose`，这是 tart 官方的端口转发方案：比
+自己在宿主机上起一个 socat 稳，多一个进程就多一个会静默死掉的东西，而它死了
+之后的表象是「端口突然连不上」，跟 VM 本身没关系。这三个参数只对 tart 后端
+有意义，Hyper-V 那边给了也不生效（不报错）。
+
 ## macOS 虚拟机：能装，但有三条要知道的限制
 
 在 Apple Silicon 的 Mac 上再装一个 macOS，用的是 Apple 官方的
@@ -118,8 +165,37 @@ macOS 虚拟机，app 一退出它就停。Windows/Linux 那套「安装甩后�
 25.6 GB 从 7 小时变成 23 分钟），中断了重跑会接着下。装完 IPSW 就可以删了。
 
 装完第一次启动会自动建账号、打开远程登录（SSH），不用进 Setup Assistant 手动点。
-宿主机上不转发任何端口——它的网络是 VZ 的 NAT，内部 192.168.64.x，
-SSH 只能从同一个 NAT 里的机器连。
+
+宿主机连不进客人机这件事，现在有一条公开路径能走一半：**端口转发（vsock）**。
+VZ 的 NAT 附件没有端口映射 API（运行时实测 `VZNATNetworkDeviceAttachment` 只有
+5 个方法，方法名里带 port 的有 0 个），vsock 是唯一公开的进客路径，所以宿主机上
+开一个只绑 127.0.0.1 的 TCP 监听，每个连接换一条到客人机 vsock 端点的连接：
+
+```sh
+./scripts/vmz/vmz forward add --name m1 --host 2222 --guest 22   # 之后重启生效
+# 安装时一起给也行（可重复）：
+#   vmz install --name m1 --forward 2222:22 --forward 8022:22
+```
+
+**但要说清楚它通到哪一步**：宿主机这边（监听、转发、重试）是通的，
+`VZNATNetworkDeviceAttachment` 不给的端口映射由它补上。客人机那边需要有个程序
+监听对应的 vsock 端口，而 **macOS 客人机默认没有这样的服务**——它的 sshd 只听
+TCP，系统里没有现成的 vsock 监听者（vzvm 那条路能通，是因为它的客人机是 Linux，
+nix-daemon/sshd 直接听在 vsock 端口上）。所以「宿主机不再对客人机完全封闭」这
+件事做到了，「`ssh -p 2222 agent@127.0.0.1` 直接能进」还没有——那需要客人机里
+有个听 vsock 的东西。界面上（配置面板 → 端口转发）和启动日志里都写着这句话，
+不装作已经通了。
+
+共享目录是另一件事，那个是真通了：**virtiofs**，宿主机目录自动挂到客人机的
+`/Volumes/<挂载名>`，不需要在客人机里敲 mount（Linux 那边的 9p 要自己挂，
+macOS 这边用的是 VZ 的自动挂载 tag， lima 的源码注释明确警告不能用自己起的 tag，
+否则客人机里能看见卷但一访问就是 Operation not permitted）。
+
+```sh
+./scripts/vmz/vmz share add --name m1 --path ~/code --mount code   # 之后重启生效
+# 安装时一起给也行（可重复）：
+#   vmz install --name m1 --share ~/code:code --share ~/data:data:ro
+```
 
 ```sh
 ./install.sh
@@ -196,7 +272,8 @@ VM 名做白名单校验——所有 PowerShell 语句都是单引号插值，�
 接任意代码，这个面在入口处挡掉。
 
 虚拟机只绑 127.0.0.1，外面连不进来。macOS 虚拟机的网络是 VZ 的 NAT，
-宿主机上一个端口都不开。密码一律不进命令行参数：macOS 那条路会把密码写进
+宿主机上默认一个端口都不开（配了 vsock 端口转发的那些也只绑 127.0.0.1，
+见「macOS 虚拟机」那一节）。密码一律不进命令行参数：macOS 那条路会把密码写进
 VM 目录里一个 0600 文件再传给后端，`ps` 看不到。
 
 ## 免费与开源

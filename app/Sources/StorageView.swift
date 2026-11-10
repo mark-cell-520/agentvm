@@ -19,8 +19,10 @@ struct StorageView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    // 附加盘和共享目录对 macOS 客人机不开放，原因写在
-                    // macUnsupported 里。藏起来比摆一个点了报错的按钮好。
+                    // 附加盘对 macOS 客人机不开放，原因写在 macUnsupported 里。
+                    // 共享目录对它是开放的（virtiofs），但入口在「配置」面板，
+                    // 不在这儿——原因见 macUnsupported 的注释。
+                    // 藏起来比摆一个点了报错的按钮好。
                     if !vm.isMacOS {
                         disks
                         Divider()
@@ -51,12 +53,14 @@ struct StorageView: View {
         .onAppear { state.snapshotList(name: vm.name) }
     }
 
-    /// macOS 客人机上用不了的两样，以及为什么。
+    /// macOS 客人机上用不了的附加盘，以及为什么。
     ///
     /// 不说「暂不支持」就完事：用户需要知道是框架层面没有，还是我们没写。
     /// 附加盘：VZ 支持多个 block device，但 macOS 客人机的磁盘热插拔路径
-    /// 没验证过，写一个不生效的按钮比不给按钮更糟。共享目录：virtiofs 需要
-    /// 客人机里有驱动，macOS 的 virtio-fs 支持情况没实测。
+    /// 没验证过，写一个不生效的按钮比不给按钮更糟。
+    /// 共享目录**不在这一列**：virtiofs 通了（VZVirtioFileSystemDeviceConfiguration
+    /// 加 macOSGuestAutomountTag，客人机自动挂到 /Volumes/<名字>），入口在
+    /// 「配置」面板里，和 CPU 内存放一起——因为它俩一样是启动参数，改完要重启。
     /// 快照和克隆是能用的（APFS clonefile），所以那两个区段照常显示。
     private var macUnsupported: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -64,9 +68,9 @@ struct StorageView: View {
             Text("· 附加盘：VZ 支持多块磁盘，但 macOS 客人机的热插拔没有可用的"
                  + "公开路径，重启挂载也没验证过。要存数据用克隆一份更稳。")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("· 共享目录：virtiofs 要客人机里有驱动，macOS 这边没有实测过"
-                 + "能用的组合。")
-                .font(.caption).foregroundStyle(.secondary)
+            Text("共享目录是能用的（virtiofs，客人机自动挂到 /Volumes/<名字>），"
+                 + "入口在「配置」面板里，不在这儿——它和 CPU、内存一样属于启动参数。")
+                .font(.caption).foregroundStyle(.green)
             Text("快照和克隆是能用的：走 APFS 的 clonefile，秒级、不占额外空间。")
                 .font(.caption).foregroundStyle(.green)
         }

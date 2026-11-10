@@ -22,7 +22,7 @@ QEMU 加 HVF（Hypervisor.framework），这也是 UTM 对 Windows 采用的引�
     winarm-vm.py create                  # 只建磁盘与 EFI vars
     winarm-vm.py start                   # 启动 QEMU
     winarm-vm.py status                  # 看状态与 SSH 是否可达
-    winarm-vm.py stop                    # ACPI 关机，超时则强杀
+    winarm-vm.py stop                    # 关机：guest agent / SSH / ACPI，超时则强杀
     winarm-vm.py logs [-f]               # 看 QEMU 日志
     winarm-vm.py autostart [--disable]   # 装/卸 launchd 开机自启
 
@@ -50,6 +50,7 @@ QEMU 加 HVF（Hypervisor.framework），这也是 UTM 对 Windows 采用的引�
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import platform
 import shutil
@@ -477,6 +478,11 @@ class Cfg:
         return self.vm_dir / "monitor.sock"
 
     @property
+    def qga_sock(self) -> Path:
+        """QEMU guest agent 套接字。**默认不存在**，原因见 qga_shutdown_wait。"""
+        return self.vm_dir / "qga.sock"
+
+    @property
     def vnc_display_file(self) -> Path:
         return self.vm_dir / "vnc.display"
 
@@ -486,7 +492,14 @@ class Cfg:
 
     @property
     def snapshots(self) -> Path:
-        return self.vm_dir.parent / "snapshots"
+        # 每台 VM 自己一份。原来是 vm_dir.parent / "snapshots"，也就是
+        # ~/.agentvm/vms/snapshots，所有 Windows VM 共用一个根、只按快照名
+        # 区分。两个后果：第二台 VM 拍一个同名快照报「已存在」；更严重的是
+        # restore 会把 VM a 的 data.img 覆盖到 VM b 上——用户以为在还原自己
+        # 的机器，实际拿到的是另一台的盘，而这一步没有任何提示。
+        # macOS 那边（MacVMPaths.snapshots）本来就是每 VM 一份，这边对齐。
+        # 已经存在的共用目录由 _migrate_shared_snapshots 负责搬。
+        return self.vm_dir / "snapshots"
 
     @property
     def pubkey(self) -> Path:
@@ -1033,17 +1046,84 @@ def cmd_start(cfg: Cfg, install: bool = False,
     die(f"QEMU 启动失败，看 {cfg.qemu_log}")
 
 
+_qga = None
+
+
+def qga():
+    """惰性加载 scripts/lib/qga.py（QEMU guest agent 客户端）。
+
+    和 vmkit.py 那边同一份代码，两个入口各装一次：vmkit 的 Windows 分支是
+    把本模块 import 进来用的，而本模块也要能单独跑（`winarm-vm.py stop`），
+    所以不能依赖调用方先把它装上。用 importlib 按路径装而不是
+    `from lib import qga`：lib/ 不是包，那样得把 scripts/ 塞进 sys.path，而
+    lib 是个太通用的名字，会和别处同名模块撞。
+    """
+    global _qga
+    if _qga is None:
+        spec = importlib.util.spec_from_file_location(
+            "qga", Path(__file__).resolve().parent / "lib" / "qga.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        _qga = mod
+    return _qga
+
+
+def qga_shutdown_wait(cfg: Cfg, wait: int = 60) -> bool:
+    """客人机里有 qemu-guest-agent 就走它关机，返回是否已经停下。
+
+    **Windows ARM64 侧默认走不到这儿。** qemu-ga 的 Windows ARM64 安装包
+    （qemu-ga-arm64.msi）目前只有 virtio-win-guest-tools-installer PR #100 /
+    #104 的 CI artifact，没有正式 release 产物；UTM #5134 那边说 guest agent
+    未移植到 ARM64 Windows。两条证据对不上，所以我们**不**在 qemu_args 里加
+    virtio-serial 和这个 chardev：加了也只是建一个没人接的 socket，反而让
+    这里每次 stop 都白等一轮超时。
+
+    那为什么还留着这段：用户自己装了社区版的 ARM64 agent、并按 Linux 那边
+    的约定把 socket 放到 <vm>/qga.sock，这里就会自动用上，不需要改代码。
+    判断依据只有「文件在不在」，没有任何隐式探测。
+    """
+    if not cfg.qga_sock.exists():
+        return False
+    try:
+        qa = qga()
+    except OSError:
+        # 只有 scripts/lib/qga.py 真的丢了才会走到这儿。VM 还在跑，不能为
+        # 这个 die，后面的 SSH、ACPI、强杀照样能停。
+        return False
+    try:
+        if not qa.qga_ping(cfg.qga_sock, timeout=5):
+            return False
+        log("guest agent 可达，让它走自己的关机流程")
+        qa.qga_shutdown(cfg.qga_sock)
+    except qa.QGAError as e:
+        warn(f"guest agent 关机没成：{e}")
+        return False
+    for _ in range(wait):
+        time.sleep(1)
+        if not qemu_running(cfg):
+            ok("已优雅关机")
+            return True
+    warn(f"等了 {wait} 秒 guest agent 还没关掉，试下一条路")
+    return False
+
+
 def cmd_stop(cfg: Cfg) -> None:
-    """关机。三条路按可靠性排序，前两条失败了才强杀。
+    """关机。四条路按可靠性排序，前几条失败了才强杀。
 
     为什么先试 SSH：ACPI 的 system_powerdown 是「电源键事件」，要客人机里
     有交互会话去处理它。停在登录界面时没人接这个事件，等到超时也关不掉，
     最后只能强杀，而 raw 盘被强杀有丢数据的风险。SSH 的 shutdown 是让
     Windows 自己走完整关机流程，最稳。
+
+    guest agent 排在 SSH 前面，但它对 Windows ARM64 默认不存在，见
+    qga_shutdown_wait 的说明——正常情况下这一步是零成本直接跳过。
     """
     pid = qemu_running(cfg)
     if not pid:
         ok("VM 没在运行")
+        return
+
+    if qga_shutdown_wait(cfg):
         return
 
     if ssh_ready(cfg, timeout=8):
@@ -1229,6 +1309,46 @@ def _snap_dir(cfg: Cfg, name: str) -> Path:
     return cfg.snapshots / name
 
 
+def _migrate_shared_snapshots(cfg: Cfg) -> None:
+    """把老版本共用的快照根搬进这个 VM 自己的目录。
+
+    见 Cfg.snapshots：共用根让第二台 VM 拍不了同名快照，还会把 A 的盘还原
+    到 B 上。搬之前要能说清这些快照是谁的——共用目录里没有任何 VM 信息，
+    同目录下有两台以上虚拟机就分不出来，那种情况下让用户自己决定，不猜。
+    """
+    old = cfg.vm_dir.parent / "snapshots"
+    new = cfg.snapshots
+    if old == new or not old.is_dir():
+        return
+    entries = [p for p in old.iterdir()]
+    if not entries:
+        # 空目录：清掉它，别留一个以后又被误当成快照根的共用目录
+        try:
+            old.rmdir()
+        except OSError:
+            pass
+        return
+    if new.is_dir() and any(new.iterdir()):
+        die(f"同时存在共用的 {old}（{len(entries)} 个快照）和我自己的 {new}"
+            f"（已有内容），不知道该用哪个。请手动确认后删掉其中一个。")
+    siblings = [p for p in cfg.vm_dir.parent.iterdir()
+                if p.is_dir() and p.name != "snapshots"]
+    if len(siblings) > 1:
+        die(f"快照目录原来是所有虚拟机共用的 {old}，里面有 {len(entries)} 个快照，"
+            f"而同目录下有 {len(siblings)} 台虚拟机，分不出这些快照属于谁。\n"
+            f"请手动把它们移到各自的 <VM 目录>/snapshots/ 下，然后删掉 {old}。")
+    log(f"快照目录从共用的 {old} 搬到我自己的 {new}")
+    new.parent.mkdir(parents=True, exist_ok=True)
+    # 用 rename 不用 shutil.move：后者遇到「目标是已存在目录」会把源目录
+    # 整体搬进目标里面去，出来的是 new/snapshots/...，下一次又回到共用根。
+    # POSIX 的 rename 允许把目录换成同名的空目录，正好覆盖 new 刚被
+    # mkdir(parents=True) 建出来的情况。
+    try:
+        os.rename(str(old), str(new))
+    except OSError as e:
+        die(f"搬不动 {old} -> {new}：{e}。请手动处理后再试。")
+
+
 def cmd_snapshot(cfg: Cfg, action: str, name: str = "",
                  clean: bool = False, restart: bool = False) -> None:
     """快照与还原。底层是 APFS 的 copy-on-write 克隆，不是 QEMU 内部快照。
@@ -1242,6 +1362,7 @@ def cmd_snapshot(cfg: Cfg, action: str, name: str = "",
     保证。要一个保证干净的点，就加 --clean：它会先关机、存完再拉起来。
     """
     cfg.snapshots.mkdir(parents=True, exist_ok=True)
+    _migrate_shared_snapshots(cfg)
 
     if action == "save":
         if not name:

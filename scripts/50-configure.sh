@@ -33,7 +33,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 客人机只收到几行 export 和一个空的补丁段，宿主机打印
 # 「ok configuration applied」。密钥已经推进 guest 而 patch 从未执行。
 CONFIG_PATCH="$HERE/lib/patch-agent-config.py"
-[ -f "$CONFIG_PATCH" ] || die "找不到补丁脚本：$CONFIG_PATCH"
+# -r 而不是 -f：文件在但权限 000 时 -f 为真，往下 $(cat ...) 失败又被未加引号的
+# heredoc 吞掉，客人机收到空补丁段，宿主机还打印「ok configuration applied」。
+# 直接测可读，堵住这个假绿。
+[ -r "$CONFIG_PATCH" ] || die "读不到补丁脚本：$CONFIG_PATCH"
 
 # usage 由 lib/common.sh 提供（打到第一个非注释行为止），这里不重复定义。
 
@@ -47,13 +50,13 @@ YOLO=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --vm) VM_NAME="$2"; shift 2 ;;
-    --llm-key-file) LLM_KEY_FILE="$2"; shift 2 ;;
-    --llm-base-url) LLM_BASE_URL="$2"; shift 2 ;;
-    --llm-model) LLM_MODEL="$2"; shift 2 ;;
-    --feishu-app-id) FEISHU_APP_ID="$2"; shift 2 ;;
-    --feishu-app-secret-file) FEISHU_APP_SECRET_FILE="$2"; shift 2 ;;
-    --feishu-domain) FEISHU_DOMAIN="$2"; shift 2 ;;
+    --vm) [ $# -ge 2 ] || die "--vm 需要一个值"; VM_NAME="$2"; shift 2 ;;
+    --llm-key-file) [ $# -ge 2 ] || die "--llm-key-file 需要一个值"; LLM_KEY_FILE="$2"; shift 2 ;;
+    --llm-base-url) [ $# -ge 2 ] || die "--llm-base-url 需要一个值"; LLM_BASE_URL="$2"; shift 2 ;;
+    --llm-model) [ $# -ge 2 ] || die "--llm-model 需要一个值"; LLM_MODEL="$2"; shift 2 ;;
+    --feishu-app-id) [ $# -ge 2 ] || die "--feishu-app-id 需要一个值"; FEISHU_APP_ID="$2"; shift 2 ;;
+    --feishu-app-secret-file) [ $# -ge 2 ] || die "--feishu-app-secret-file 需要一个值"; FEISHU_APP_SECRET_FILE="$2"; shift 2 ;;
+    --feishu-domain) [ $# -ge 2 ] || die "--feishu-domain 需要一个值"; FEISHU_DOMAIN="$2"; shift 2 ;;
     --yolo) YOLO=1; shift ;;
     -h|--help) usage 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -106,19 +109,28 @@ fi
 # echo "'`），普通值里的 `$` 和反引号也会被宿主机先展开一遍，报错指不回真因。
 # printf %q 产出的串可以安全地再被 shell 解析一次，这是最短的正确做法。
 info "applying configuration inside guest"
-Q_BASE_URL="$(printf '%q' "$LLM_BASE_URL")"
-Q_MODEL="$(printf '%q' "$LLM_MODEL")"
-Q_APP_ID="$(printf '%q' "$FEISHU_APP_ID")"
-Q_DOMAIN="$(printf '%q' "$FEISHU_DOMAIN")"
-"$TART_BIN" exec "$VM_NAME" sh -s <<EOF
-set -eu
-export AGENTVM_LLM_BASE_URL=$Q_BASE_URL
-export AGENTVM_LLM_MODEL=$Q_MODEL
-export AGENTVM_FEISHU_APP_ID=$Q_APP_ID
-export AGENTVM_FEISHU_DOMAIN=$Q_DOMAIN
-export AGENTVM_YOLO=${YOLO}
-$(cat "$CONFIG_PATCH")
-EOF
+# 补丁脚本是 Python，必须用 python3 喂，不能用 sh。
+#
+# 原来走 `sh -s`：sh 逐行解释 Python 源码必然抛错，而清理 /tmp 里两份明文
+# 密钥的代码就在那个跑不起来的脚本里——于是 configure 表面「成功」，guest 的
+# /tmp 永久留下可读的 LLM key 和飞书 secret。agentvm.py 的 configure 有同一个
+# 错，两边一起改。
+#
+# 两个注入面一起堵：
+#   1. 环境变量经 env 直接进 argv，不经过任何 shell 解析，也就不需要 %q。
+#      原来那套 printf %q 是为了让值能被 shell 安全解析一次，现在没有 shell
+#      这一层了，转义反而多余。
+#   2. 脚本用重定向喂而不是未加引号的 heredoc。heredoc 会把补丁里的 $ 和
+#      反引号交给宿主机先展开一遍，那是原来就有的第二个注入面。
+"$TART_BIN" exec "$VM_NAME" command -v python3 >/dev/null 2>&1 \
+	|| die "客人机里没有 python3，配置装不进去。先在客人机里 apt install python3。"
+"$TART_BIN" exec "$VM_NAME" env \
+	AGENTVM_LLM_BASE_URL="$LLM_BASE_URL" \
+	AGENTVM_LLM_MODEL="$LLM_MODEL" \
+	AGENTVM_FEISHU_APP_ID="$FEISHU_APP_ID" \
+	AGENTVM_FEISHU_DOMAIN="$FEISHU_DOMAIN" \
+	AGENTVM_YOLO="$YOLO" \
+	python3 - < "$CONFIG_PATCH"
 
 ok "configuration applied"
 

@@ -45,6 +45,25 @@ def save(p: Path, d: dict) -> None:
         plistlib.dump(d, f)
 
 
+def backup(p: Path) -> None:
+    """把原文件拷一份到 BACKUP，跑 restore 时靠它回滚。
+
+    目录要显式建：BACKUP 指向仓库里的 .tmp/prefs-backup/，那是个按需创建的
+    目录，不在 git 里（见 .gitignore）。原来整个项目没有这个函数，而不带
+    restore 直接运行 100% 崩在 NameError 上——脚本自己的说明里写着
+    「原文件已备份，跑 restore 可回滚」，那句话是空的。
+
+    已经备份过就不再覆盖：第一份才是没被动过的原档，第二次运行时的
+    「原文件」已经是上一轮改过的结果，覆盖它等于把回滚的依据也改掉。
+    """
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    dst = BACKUP / p.name
+    if dst.exists():
+        return
+    shutil.copy2(p, dst)
+    print(f"已备份 {p.name} -> {dst}")
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "restore":
         for name in ("com.apple.HIToolbox.plist", "com.apple.inputsources.plist"):

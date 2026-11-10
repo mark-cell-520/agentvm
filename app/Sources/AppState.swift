@@ -343,6 +343,9 @@ final class AppState: ObservableObject {
         macRuntimes[vm.name]
     }
 
+    /// 有没有正在跑的 macOS 客人机。app 退出前的判据（见 stopAllMacVMs）。
+    var hasRunningMacVM: Bool { !macRuntimes.isEmpty }
+
     /// 启动一个 macOS 虚拟机，并打开它的窗口。
     ///
     /// 和另外两种的区别：另外两种是 `vmkit start` 起完就返回（QEMU 自己跑），
@@ -382,32 +385,92 @@ final class AppState: ObservableObject {
                 self?.revision += 1
             }
         }
-        do {
-            try rt.start(spec: spec, provision: !spec.provisioned)
-            // 同 vmz 侧：只有 didProvision 才写 provisioned。否则 macOS 26
-            // 及以下的机器会被标成「已建过账号」，以后再也不会建。
-            if rt.didProvision, !spec.provisioned {
-                var s = spec
-                s.provisioned = true
-                try? MacVMSpec.save(s)
+        // start() 里 vzWait 会同步等 machine.start 的 completion（几秒），
+        // 主线程就这么卡着：app 彩球，点哪都没反应，而用户以为点了没生效
+        // 会再点一次。派到后台队列跑，UI 更新再回主线程。
+        // rt 要强引用：它同时也在 macRuntimes 字典里，强捕获不会造成循环，
+        // 却能保证「客人机自己停了把 runtime 摘掉」这种事不会在 start 中途
+        // 把 VZVirtualMachine 释放掉。
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try rt.start(spec: spec, provision: !spec.provisioned, host: "app")
+                let didProvision = rt.didProvision
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    // 同 vmz 侧：只有 didProvision 才写 provisioned。否则 macOS 26
+                    // 及以下的机器会被标成「已建过账号」，以后再也不会建。
+                    //
+                    // 写盘失败必须说出来。原来是 `try? MacVMSpec.save(s)`：
+                    // 磁盘满时它静默失败，而界面照显「已启动」，下次启动又跑
+                    // 一遍 Setup Assistant——用户看到的是「每次开机都要建账号」。
+                    if didProvision, !spec.provisioned {
+                        var s = spec
+                        s.provisioned = true
+                        do {
+                            try s.save()
+                        } catch {
+                            self.macVMLastError = "账号建好了，但「已建过账号」这个标记写不回去（\(error.localizedDescription)）。下次启动会再问一遍账号，选取消即可。"
+                        }
+                    }
+                    self.macVM = vm
+                    self.revision += 1
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.macRuntimes.removeValue(forKey: vm.name)
+                    self.macVMLastError = error.localizedDescription
+                    self.revision += 1
+                }
             }
-            macVM = vm
-            revision += 1
-        } catch {
-            macRuntimes.removeValue(forKey: vm.name)
-            macVMLastError = error.localizedDescription
-            revision += 1
         }
     }
 
     /// 停掉一个 macOS 虚拟机。走 VZ 的优雅停机，不是杀进程。
+    ///
+    /// runtime 不能在这儿就从字典里摘掉：rt.stop() 是异步的（它把
+    /// machine.stop 投到 vmQueue 就返回），一释放 runtime，VZVirtualMachine
+    /// 跟着释放，收尾块里那句 `guard let self` 也不再有人调——macvm.pid
+    /// 永不删除、状态卡在 .stopping、onGuestStop/onFailed 全丢（delegate 是
+    /// weak）。所以等 stop 真的结束（或等超时）再摘。
     func stopMacVM(_ vm: VMInfo) {
         guard let rt = macRuntimes[vm.name] else { return }
-        rt.stop()
-        macRuntimes.removeValue(forKey: vm.name)
         macVM = nil
         revision += 1
-        refreshStatus()
+        rt.stop { [weak self] timedOut in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if timedOut {
+                    // 等超时：客人机还在跑，runtime 必须留着——vm 还在里面，
+                    // 还能再叫一次 stop。摘掉就等于没有任何对象能停它了，
+                    // 它会一直占 CPU/内存到 app 退出，而界面上显示「已停止」。
+                    self.macVMLastError = "优雅关机等超时（客人机可能停在登录界面）。虚拟机还在运行，可以再停一次，或者在客人机里选「关机」。"
+                    self.revision += 1
+                    return
+                }
+                self.macRuntimes.removeValue(forKey: vm.name)
+                self.revision += 1
+                self.refreshStatus()
+            }
+        }
+    }
+
+    /// app 退出时停掉所有 macOS 客人机。同步等，因为进程马上就要没了。
+    ///
+    /// 为什么必须专门做：VZ 没有「后台常驻」这回事，进程一走机器就没了。
+    /// 原来 app 退出等于直接拔电源——APFS 留下未干净的日志，下次启动跑
+    /// 好几分钟 fsck，而用户完全不知道发生了什么。
+    ///
+    /// 调用方是 app delegate 的 applicationShouldTerminate（全仓库唯一的
+    /// 退出钩子；sheet 的 .onDisappear 只覆盖关窗口，app 终止时 SwiftUI
+    /// 不保证跑它）。
+    func stopAllMacVMs(timeout: TimeInterval = 45) {
+        for rt in macRuntimes.values {
+            rt.stopAndWait(timeout: timeout)
+        }
+        macRuntimes.removeAll()
+        macVM = nil
+        revision += 1
     }
 
     func action(_ cmd: String, name: String) {
@@ -611,6 +674,30 @@ final class AppState: ObservableObject {
                     onEvent: handleCommandEvent) { [weak self] in
             self?.refreshStatus(); completion()
         }
+    }
+
+    // ------------------------------------- macOS 客人机的共享目录与端口转发 --
+
+    /// 存 macOS 客人机的共享目录和端口转发（virtiofs / vsock）。
+    ///
+    /// 为什么不像 CPU、内存那样走 vmkit configure：这两项是 macvm.json 里
+    /// MacVMSpec 的字段，而 app 本来就直接读这份配置（startMacVM 里就是
+    /// MacVMSpec.load）。再开一条 vmkit → vmz 的路，只是多传一遍参数、
+    /// 多一处校验。写盘是原子的（macSaveSpec 用 .atomic 并设 0600，
+    /// 和 vmkit 的 configure_macos 同一套规矩）。
+    ///
+    /// 调用方要先校验过（MacVMPaths.validateShares / validateForwards），
+    /// 这里只管存——错误信息由界面就地显示，比弹一个后端错误好用。
+    func macSaveDevices(name: String, shares: [MacVMShare],
+                        forwards: [MacVMForward]) throws {
+        guard var spec = MacVMSpec.load(name: name) else {
+            throw MacVMError("读不到 macOS 虚拟机的配置（~/.agentvm/vms/\(name)/macvm.json）")
+        }
+        try MacVMPaths.validateShares(shares)
+        try MacVMPaths.validateForwards(forwards)
+        spec.shares = shares
+        spec.forwards = forwards
+        try spec.save()
     }
 
     // ------------------------------------------------------ 克隆 --

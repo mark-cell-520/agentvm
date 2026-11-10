@@ -713,7 +713,10 @@ wrapper 就在被删掉的 VM 目录里。之后每次登录 launchd 执行一�
 - 没有 VNC server，所以 app 的自研 RFB 客户端对 macOS 客人机用不上，画面是
   `VZVirtualMachineView`（原生 NSView，比 VNC 清楚也快）。
 - 宿主机不转发端口：`VZNATNetworkDeviceAttachment` 不对外监听，SSH 在 NAT
-  内部的 192.168.64.x。
+  内部的 192.168.64.x。这一点现在有一条公开路径能走一半：vsock 端口转发
+  （`MacVsockProxy`）在宿主机上开只绑 127.0.0.1 的 TCP 监听，接到客人机的
+  vsock 端口上——宿主机这边是通的，但客人机里得有程序监听那个 vsock 端口，
+  而 macOS 客人机默认没有。详见 README「macOS 虚拟机」那一节。
 
 ### 安装流程
 

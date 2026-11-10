@@ -533,3 +533,22 @@ start 回调从不触发。最小配置（无盘、无网络、无串口）表�
 **判断.** 这是运行环境对 Virtualization.framework 的限制，不是脚本问题。
 在真实可用的 Mac 上 `scripts/vzrun.swift` 的 API 调用是正确的，
 但「能在真机启动 guest」这一条未获验证，不能声称已验证。
+
+## M7. YAML 双引号标量后面不能再跟内容
+
+**症状.** `linux_seed()` 生成的是 `fqdn: "d1".local` 和
+`instance-id: "d1"-001`。两行都是**语法错误**的 YAML：双引号标量在闭合引号处
+结束，后面紧跟一个裸标量，解析器直接报 ParserError。cloud-init 会把整份
+user-data 丢掉——账号、密码、SSH 公钥、packages 全部不生效，表象是「VM 起来了
+但登不进去」，而宿主机从下载到启动每一步都返回成功。
+
+**怎么发现的.** 给 cloud-init 加 `qemu-guest-agent` 时顺手把生成的 user-data
+喂给 `yaml.safe_load`，它炸了。之前没人炸是因为没有人校验过产物——只有密码
+注入那一类问题会让人去看生成的文本（见 docs/AGENTVM-APP.md「cloud-init 的
+YAML 注入」），而引号外跟内容是同一个病的另一个实例。
+
+**结论.** 后缀必须放进引号里面：`_yaml_scalar(name + '.local')`。生成配置
+文件的代码，产物要过一遍解析器再交出去，不能只看「字符串拼对了」。
+
+**影响范围.** 只有 `linux_seed()` 这两行。改完之后 user-data 和 meta-data
+都用 `yaml.safe_load` 验过能解析，`passwd` 里的 `p@ss #word` 也还是原值。

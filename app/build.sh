@@ -26,7 +26,9 @@ vmz_log=$(mktemp)
 sign_err=$(mktemp)
 trap 'rm -f "$vmz_log" "$sign_err"' EXIT
 
-SDK=$(xcrun --sdk macosx --show-sdk-path)
+# 没装命令行工具时 xcrun 报裸错误、set -e 直接退出，用户看不到「要装工具」。
+SDK=$(xcrun --sdk macosx --show-sdk-path) \
+  || die "需要 Xcode 命令行工具：xcode-select --install"
 # vmz 编到仓库里的临时位置，再拷进 app 的 Resources。不进 git
 # （.gitignore 里有 vmz 一行），装机时 install.sh 会另编一份到
 # ~/.agentvm/bin/vmz 给命令行用。
@@ -83,7 +85,10 @@ fi
 # 万一编译「成功」而输出不是可执行文件（磁盘满时 ld 会留一个空文件），
 # 拷进去用户拿到的是一个跑不起来的 vmz，而报错在很远的将来。
 if [ -f "$VMBIN" ]; then
-    if file "$VMBIN" | grep -q "Mach-O"; then
+    # file 失败也要和「不是 Mach-O」分开：脚本是 /bin/sh、没有 pipefail，
+    # `file "$VMBIN" | grep -q` 里 file 挂了会被完全吞掉，grep 拿空输入返回 1，
+    # 于是走 else 把「file 失败了」说成「二进制无效」。先把 file 的输出存下来再判。
+    if out="$(file "$VMBIN" 2>/dev/null)" && printf '%s' "$out" | grep -q "Mach-O"; then
         cp "$VMBIN" "$RES/backend/vmz"
         chmod 755 "$RES/backend/vmz"
     else
@@ -92,11 +97,19 @@ if [ -f "$VMBIN" ]; then
     fi
 fi
 
-echo "==> 拷后端（vmkit.py + winarm-vm.py + catalog.json + vmz）"
+echo "==> 拷后端（vmkit.py + winarm-vm.py + catalog.json + lib/ + vmz）"
 cp "$ROOT/scripts/vmkit.py"          "$RES/backend/"
 cp "$ROOT/scripts/winarm-vm.py"      "$RES/backend/"
 cp "$ROOT/scripts/catalog.json"      "$RES/backend/"
+# scripts/lib/ 必须一起拷进来。vmkit.py 现在 import 这里的 qga.py（客人机
+# 代理客户端），少拷一个目录的后果是：从 AgentVM.app 里起的 Linux 虚拟机
+# 全都用不上 guest agent，而宿主机 scripts/ 目录下手工跑的一条不少——
+# 这种「app 里少一半功能」的差距在测试里看不出来，只有用户报「关机不优雅」
+# 才发现。vmkit.py 侧已用 AGENTVM_QGA_LIB 兜底并告警，这里是根治。
+mkdir -p "$RES/backend/lib"
+cp "$ROOT"/scripts/lib/*.py          "$RES/backend/lib/"
 chmod 755 "$RES/backend/vmkit.py" "$RES/backend/winarm-vm.py"
+find "$RES/backend/lib" -name '*.py' -exec chmod 644 {} +
 
 echo "==> 写 Info.plist"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -145,7 +158,11 @@ if [ -f "$RES/backend/vmz" ]; then
     if ! codesign -s - --entitlements "$ROOT/app/Resources/entitlements.plist" \
             --force "$RES/backend/vmz" >"$sign_err" 2>&1; then
         sed 's/^/    /' "$sign_err"
-        echo "    嵌套 vmz 签名失败。app 里起 macOS 虚拟机会直接崩，命令行那份不受影响。"
+        # 原来只 echo 一句 warn 就继续：bundle 照样签、照样「完成」，用户拿到一个
+        # macOS 虚拟机一启动就 abort 的 app，而构建日志里没有任何失败信号。嵌套
+        # vmz 签不上必须让整个构建失败，不能带着它往下走。
+        echo "    嵌套 vmz 签名失败，构建中止（app 里起 macOS 虚拟机会直接崩）。"
+        exit 1
     fi
     # 签完要验。签名命令成功不等于 entitlement 真的在里面。
     if ! codesign -d --entitlements - "$RES/backend/vmz" 2>/dev/null \
@@ -182,14 +199,18 @@ echo "==> 校验"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 # 用 ast.parse 而不是 py_compile：后者会在 Resources/backend/ 里留下
 # __pycache__ 目录，把编译产物塞进交付物里。
-python3 - "$RES/backend/vmkit.py" "$RES/backend/winarm-vm.py" <<'PY'
+# lib/*.py 一起查——qga.py 有语法错的话 vmkit.py 每次 import 才炸，
+# 那时候错误信息指向的是 import 那一行，不是真正写错的那一行。
+python3 - "$RES/backend/vmkit.py" "$RES/backend/winarm-vm.py" \
+	"$RES"/backend/lib/*.py <<'PY'
 import ast, sys
 for f in sys.argv[1:]:
-    ast.parse(open(f, encoding="utf-8").read(), filename=f)
+	ast.parse(open(f, encoding="utf-8").read(), filename=f)
 print("    python 语法 ok")
 PY
-# 万一之前留下过缓存，清掉
-rm -rf "$RES/backend/__pycache__"
+# 万一之前留下过缓存，清掉。lib/ 下也查一遍：少清一处，下一次构建的
+# 「清缓存」就等于没清。
+rm -rf "$RES/backend/__pycache__" "$RES/backend/lib/__pycache__"
 
 echo ""
 echo "完成：$APP"

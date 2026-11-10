@@ -40,6 +40,7 @@ stdout 每行一个 JSON 对象，界面直接解析：
     ~/.agentvm/vms/<名字>/disk.qcow2  虚拟磁盘（Linux）
     ~/.agentvm/vms/<名字>/data.img    虚拟磁盘（Windows，raw）
     ~/.agentvm/vms/<名字>/seed.iso     cloud-init 配置盘（Linux）
+    ~/.agentvm/vms/<名字>/qga.sock     QEMU guest agent 套接字（Linux）
 
 用法
 ----
@@ -50,6 +51,7 @@ stdout 每行一个 JSON 对象，界面直接解析：
     vmkit.py status --name d1
     vmkit.py start --name d1 [--headless]
     vmkit.py stop --name d1
+    vmkit.py guest --name d1 ip          问客人机要 IP / 执行命令（走 guest agent）
     vmkit.py delete --name d1
     vmkit.py open --name d1              把虚拟机窗口带到前台
     vmkit.py autostart --name d1 [--disable]
@@ -64,6 +66,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -331,7 +334,16 @@ def _save_vm_impl(vm: dict) -> None:
     p = vm_file(vm["name"])
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(vm, ensure_ascii=False, indent=2))
+    # 临时文件必须一创建就是 0600。原来用 write_text，按默认 umask 落成
+    # 0644，而里面是明文 password——同机上任何本地用户都能读每一台虚拟机
+    # 的口令；replace 之后才 chmod 0600，中间那段窗口足够被人读走。
+    # fsync 也不能省：不落盘就换名，崩起来留下的是一个空的 vm.json，
+    # 而 load_vm 只会说「不是合法 JSON」。
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(vm, ensure_ascii=False, indent=2))
+        fh.flush()
+        os.fsync(fh.fileno())
     tmp.replace(p)
 
 
@@ -645,10 +657,19 @@ def linux_seed(vm: dict) -> Path:
         die(f"登录名不合法：{vm['user']!r}。要像 debian、agent、vm01 这样："
             f"小写字母或下线开头，后面跟小写字母、数字、下划线、连字符。")
     pub = pubkey_text(vm)
+    # fqdn 的 .local 必须放在引号**里面**。`fqdn: {_yaml_scalar(name)}.local`
+    # 生成的是 `fqdn: "d1".local`——双引号标量后面紧跟一个裸标量，YAML 直接
+    # 语法错误，cloud-init 会把整份 user-data 丢掉：账号、密码、SSH 公钥、
+    # packages 全都不生效，表象是「VM 起来了但登不进去」，而宿主机一路成功。
+    # meta-data 的 instance-id 后缀是同一个病。这条是审计时漏掉的：同一次
+    # 审计修了密码注入（见 docs/AGENTVM-APP.md「cloud-init 的 YAML 注入」），
+    # 但漏了「引号外不能跟内容」这一条。
+    fqdn = _yaml_scalar(vm['name'] + '.local')
+    instance_id = _yaml_scalar(vm['name'] + '-001')
     ud = f"""#cloud-config
 # 由 agentvm 生成，改这个文件不如改 vm.json 后重跑 install。
 hostname: {_yaml_scalar(vm['name'])}
-fqdn: {_yaml_scalar(vm['name'])}.local
+fqdn: {fqdn}
 manage_etc_hosts: true
 
 users:
@@ -673,6 +694,13 @@ packages:
   - curl
   - ca-certificates
   - sudo
+  # QEMU guest agent。装上它宿主机就能不靠 SSH 在客人机里执行命令、要它
+  # 优雅关机、问它的 IP 和磁盘——磁盘在线 resize 一类功能要的就是这些。
+  # 装的是 Debian/Ubuntu 源里的 qemu-guest-agent，零额外下载成本（几十 KB），
+  # 而换来的是一条不依赖客人机网络的通道：sshd 没起来、IP 变了、防火墙把
+  # 22 挡了，SSH 都用不了，virtio-serial 照样通。
+  # 源里没有这个包时 cloud-init 只记一条警告继续跑，不会让首次启动失败。
+  - qemu-guest-agent
 
 # Ubuntu 的服务名是 ssh，Debian 的是 sshd。两条都试，哪条存在用哪条。
 # 不写这条的话某些云镜像首次启动 sshd 未必是 enabled 的，表现为
@@ -684,6 +712,11 @@ packages:
 # 登录终端。打开 getty@tty0 就有登录提示符，窗口才看得见东西。
 runcmd:
   - [ sh, -c, "systemctl enable --now ssh || systemctl enable --now sshd || true" ]
+  # guest agent 的服务。apt 装上时一般是 enabled 的，但云镜像裁剪过的
+  # systemd 未必，而且它是**新包**——老 VM 升级时原来没有这一行。显式
+  # enable --now 一次，失败也只是回到「宿主机那边探不到 agent」，
+  # 不影响 SSH 和窗口。
+  - [ sh, -c, "systemctl enable --now qemu-guest-agent || true" ]
   - [ sh, -c, "systemctl enable --now getty@tty0.service || true" ]
   # 控制台空闲默认会黑屏（kernel 的 consoleblank，默认 10 分钟）。VM 常常
   # 一放就是几小时，用户回来看见一个全黑窗口，会以为虚拟机死了。往每个 VT
@@ -694,7 +727,7 @@ runcmd:
 """
     (src / "user-data").write_text(ud)
     (src / "meta-data").write_text(
-        f"instance-id: {_yaml_scalar(vm['name'])}-001\n"
+        f"instance-id: {instance_id}\n"
         f"local-hostname: {_yaml_scalar(vm['name'])}\n")
 
     out = d / "seed.iso"
@@ -984,6 +1017,22 @@ def linux_qemu_args(vm: dict) -> list[str]:
         "-drive", f"file={seed},format=raw,media=cdrom,readonly=on",
         "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{vm['ssh_port']}-:22",
         "-device", "virtio-net-pci,netdev=net0",
+        # QEMU guest agent：virtio-serial 总线 + 一个 virtserialport，客人机里
+        # qemu-guest-agent 把 /dev/virtio-ports/org.qemu.guest_agent.0 接到宿主
+        # 的 qga.sock 上。三个参数是一套，少一个 QEMU 起不来（virtserialport
+        # 找不到它的 chardev）或者连上没有 agent 应答。
+        #
+        # chardev 的 id 显式给成 qga0，不靠 QEMU 自动编号：自动编号是
+        # chardev0，谁第一个创建谁拿走，以后这条 argv 里再加一个 chardev
+        # （比如串口控制台）就会把它挤成 chardev1，而 virtserialport 里写的
+        # 还是 chardev0——连上一台 nobody 在听的 socket，现象是「guest agent
+        # 时好时坏」，排查半天。
+        #
+        # server=on,wait=off：QEMU 一启动就建好 socket 等客人机连过来，
+        # 不因为有没人连着的端口就卡住启动。
+        "-device", "virtio-serial",
+        "-chardev", f"socket,path={qga_sock_path(vm)},server=on,wait=off,id=qga0",
+        "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         "-device", "virtio-rng-pci",
         "-rtc", "base=localtime",
         "-monitor", f"unix:{d / 'monitor.sock'},server,nowait",
@@ -1189,23 +1238,72 @@ def qemu_pid(vm: dict) -> int | None:
     return pid
 
 
-def macos_pid(vm: dict) -> int | None:
-    """macOS 客人机的进程号（vmz 的），没在跑就 None。
+def _read_macvm_pid(path: Path) -> tuple[str, int] | None:
+    """读 macvm.pid，返回 (宿主类型, pid)。文件不在或内容坏了返回 None。
 
-    判活同样要排除僵尸：vmz 被强杀之后最常见的就是僵尸状态，而
-    `kill(pid, 0)` 对僵尸照样成功——照那个写会永远认为 VM 在跑，
-    界面停在「运行中」，而机器早没了。
+    内容形如 `vmz:1234` 或 `app:1234`：承载 VM 的是 vmz 进程还是
+    AgentVM.app 自己。MacVMEngine.macWritePID 明确区分这个前缀，因为
+    vmz stop 只准对 vmz 宿主发信号——对 app 发 SIGTERM 会把整个 app
+    打死（app 没有 SIGTERM 处理），而用户看到的是「已停」，实际 app 没了、
+    VM 属于非优雅停机。
+
+    原来这里直接 int(text)：带前缀的内容一律 ValueError → 恒返回 None。
+    后果是一整条假绿：status/vm_record 对所有 macOS VM 永远报「已关机」，
+    stop 报「没在运行」返回 0，delete 于是不停机就 _rmtree，把 disk.img
+    从正在跑的 VZ 机器脚下抽走。
+
+    老格式（只有数字）当成 vmz 宿主，跟 Swift 侧 macReadPIDFile 一致。
+    """
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    host, sep, pid_text = text.partition(":")
+    if not sep:
+        # 没有冒号：老格式，整串就是 pid
+        host, pid_text = "vmz", text
+    host = host.strip()
+    pid_text = pid_text.strip()
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    if host not in ("vmz", "app"):
+        host = "vmz"
+    return host, pid
+
+
+def macos_pid_entry(vm: dict) -> tuple[str, int] | None:
+    """(宿主, pid)。宿主是 "vmz" 或 "app"，进程不在了返回 None。
+
+    要区分宿主时必须用这个，不能只用 macos_pid：VM 在 app 里跑着，
+    命令行没有任何办法停它，而停不下来的机器也不能删。
     """
     p = vm_dir(vm["name"]) / "macvm.pid"
     if not p.is_file():
         return None
-    try:
-        pid = int(p.read_text().strip())
-    except ValueError:
+    entry = _read_macvm_pid(p)
+    if not entry:
         return None
-    if pid <= 0 or not _pid_alive(pid):
+    _host, pid = entry
+    if not _pid_alive(pid):
         return None
-    return pid
+    return entry
+
+
+def macos_pid(vm: dict) -> int | None:
+    """macOS 客人机的进程号，没在跑就 None。
+
+    两种宿主都算在跑：VM 在 app 里也是真的在跑，界面显示「已关机」
+    而用户明明开着窗口是最难查的一类 bug。能不能停是另一个问题，
+    由 macos_pid_entry 回答。
+    """
+    entry = macos_pid_entry(vm)
+    return entry[1] if entry else None
 
 
 def linux_ssh_ready(vm: dict, timeout: float = 8) -> bool:
@@ -1300,6 +1398,104 @@ def winarm():
         _winarm = mod
         _winarm._Die = _Die  # type: ignore[attr-defined]
     return _winarm
+
+
+_qga = None
+_qga_missing_said = False
+
+
+def qga_lib_path() -> Path:
+    """guest agent 客户端（scripts/lib/qga.py）在哪。
+
+    默认就在本文件旁边的 lib/ 下。多认一个环境变量 AGENTVM_QGA_LIB 是因为
+    app 打包时只拷了 vmkit.py、winarm-vm.py、catalog.json 三样进
+    Resources/backend/，scripts/lib/ 整个不在里面（见 app/build.sh 的 cp 清单，
+    那是不能碰的文件）。从 app 里起的 VM 因此找不到这个客户端——要么在那边
+    的清单里补一行 cp，要么用这个变量指向仓库里的那一份。
+    """
+    env = os.environ.get("AGENTVM_QGA_LIB")
+    if env:
+        return Path(env).expanduser()
+    return HERE / "lib" / "qga.py"
+
+
+def qga():
+    """惰性加载 scripts/lib/qga.py（QEMU guest agent 客户端）。
+
+    和 winarm() 一个理由：只有真的用到 guest agent 时才加载。用 importlib
+    按路径装而不是 `from lib import qga`：lib/ 不是包，那样得把 scripts/
+    塞进 sys.path，而 lib 是个太通用的名字，会和别处同名模块撞。
+    """
+    global _qga
+    if _qga is None:
+        lib = qga_lib_path()
+        if not lib.is_file():
+            # FileNotFoundError 是 OSError，qga_shutdown_wait 接的就是它。
+            raise FileNotFoundError(str(lib))
+        spec = importlib.util.spec_from_file_location("qga", lib)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        _qga = mod
+    return _qga
+
+
+def qga_sock_path(vm: dict) -> Path:
+    """这台 VM 的 guest agent 套接字。
+
+    和 monitor.sock、qemu.pid 放在同一个目录，是项目现有约定：临时文件落
+    VM 目录而不是 /tmp。/tmp 会被系统清理，而且多用户机器上谁能连上这个
+    socket，谁就能在客人机里以 root 执行命令。
+    """
+    return vm_dir(vm["name"]) / "qga.sock"
+
+
+def qga_shutdown_wait(vm: dict, wait: int = 120) -> bool:
+    """客人机里装了 qemu-guest-agent 就走它关机，返回是否已经停下。
+
+    排在 SSH 前面的理由：这条路不依赖客人机网络。sshd 没起来、IP 变了、
+    防火墙把 22 挡了，SSH 那条都试不了，而 guest agent 走的是
+    virtio-serial，只要 QEMU 带着这个设备就通。
+
+    **socket 存在不等于 agent 在跑**：QEMU 只要带了这个 chardev 就会把
+    qga.sock 建出来，而 guest 里要等 cloud-init 装上 qemu-guest-agent 并起
+    服务；加参数之前就起着的老 VM 更是只有 socket 没有 agent。所以先 ping
+    探活，ping 不通就安静返回假，让调用方走原来的路——在关机链路上报错
+    只会把一条本来能走通的路搅黄。
+    """
+    sock = qga_sock_path(vm)
+    if not sock.exists():
+        return False
+    try:
+        qa = qga()
+    except OSError:
+        # 只有客户端文件真的丢了才会走到这儿。VM 还在跑，不能为这个 die，
+        # 后面的 ACPI 和强杀照样能停。
+        #
+        # 但要说出来，而且只说一次：静默跳过的话，用户会以为 guest agent 装了
+        # 却没生效，跑去客人机里排查，而问题在宿主机这一侧。说一次是因为 stop
+        # 不是热循环，但一条命令里可能停好几台，每台都刷一遍没有意义。
+        global _qga_missing_said
+        if not _qga_missing_said:
+            _qga_missing_said = True
+            warn(f"guest agent 客户端不在：{qga_lib_path()}，跳过这条关机路。\n"
+                 f"  app 打包时 scripts/lib/ 没进 Resources/backend/，"
+                 f"可用 AGENTVM_QGA_LIB 指向仓库里的那一份。")
+        return False
+    try:
+        if not qa.qga_ping(sock, timeout=5):
+            return False
+        log("guest agent 可达，让它走自己的关机流程")
+        qa.qga_shutdown(sock)
+    except qa.QGAError as e:
+        warn(f"guest agent 关机没成：{e}")
+        return False
+    for _ in range(wait):
+        time.sleep(1)
+        if not qemu_pid(vm):
+            ok("已优雅关机")
+            return True
+    warn(f"等了 {wait} 秒 guest agent 还没关掉，试下一条路")
+    return False
 
 
 def virtio_ready() -> Path:
@@ -1476,7 +1672,11 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
 
 # ------------------------------------------------------------ 生命周期 --
 
-_VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_VM_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+
+# 快照名白名单。会原样进 qemu-img 的 argv，所以禁连字符开头（`--tag=-c`
+# 会被 qemu-img 当成自己的选项），长度也限死。
+_SNAP_TAG_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]{0,63}")
 
 
 def check_vm_name(name: str) -> None:
@@ -1485,8 +1685,11 @@ def check_vm_name(name: str) -> None:
     这个名字会拼进文件路径（~/.agentvm/vms/<name>）、plist 标签、以及
     PowerShell 单引号字符串。挡在入口处比在每个使用点各自判断可靠——
     漏一个使用点就是一次路径穿越或命令注入。
+
+    必须 fullmatch：match 只要求开头对上，而 `$` 允许匹配末尾换行之前，
+    "vm\n后面任意内容" 能过校验——拼进路径和 plist 的就是另一回事了。
     """
-    if not _VM_NAME_RE.match(name or ""):
+    if not _VM_NAME_RE.fullmatch(name or ""):
         die(f"虚拟机名字只能以字母数字开头，含字母数字和 . _ -，"
             f"最长 63 个字符：{name!r}")
 
@@ -1551,6 +1754,77 @@ def _vmz_password_args(name: str, password: str | None) -> list[str]:
     return ["--password-file", str(f)]
 
 
+def resolve_password(args) -> str | None:
+    """把 --password-file 读进 args.password，读到手就删掉文件。
+
+    为什么要有文件这条路：app 侧用 `--password <明文>` 起 vmkit，父进程和
+    Windows/Linux 子进程的明文口令就在 argv 里，`ps -ax` 对所有本地用户
+    可见，而装一个 Windows 要十几分钟——暴露窗口跟着安装时长走。
+    _vmz_password_args 早就换成「0600 文件 + 读完即删」，install/configure
+    这两个入口却一直是明文 argv，口径不一是漏的不是取舍。
+
+    与 _vmz_password_args 同一套做法：文件放调用方给的位置，读进来立刻
+    unlink，中途失败也一样——口令不该在磁盘上过夜。
+
+    注意：app 侧（app/Sources/*.swift）目前仍在拼 --password，换成
+    --password-file 由负责 app 的那一路做；Python 侧先把入口和读取逻辑
+    备好，两边接口一致就能直接换。
+    """
+    f = getattr(args, "password_file", None)
+    if not f:
+        return getattr(args, "password", None)
+    p = Path(f).expanduser()
+    try:
+        raw = p.read_bytes()
+    except OSError as e:
+        die(f"读不了 --password-file {p}：{e}")
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    val = raw.decode("utf-8", "replace").strip()
+    if not val:
+        die(f"--password-file {p} 是空的")
+    args.password = val
+    return val
+
+
+def _forward_password(argv: list[str], name: str, value: str | None) -> list[str]:
+    """后台安装时把 argv 里的口令换成一个 0600 文件路径。
+
+    后台安装是「父进程照原样再起一遍自己」，口令就这么原样进了子进程的
+    argv，而它要活十几分钟——父进程那份已经够糟，子进程这份一样能 ps 到。
+    改成父进程先落一个 0600 文件，子进程用 --password-file 指过去，
+    读完即删（见 resolve_password）。文件在 VM 目录里而不是 /tmp：
+    同一个 VM 的安装只可能有一个（install.pid 互斥），不会串。
+
+    value 由调用方从 args.password 取（resolve_password 已经把
+    --password-file 并进那一项），这里只负责把两种写法从 argv 上摘掉。
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--password", "--password-file") and i + 1 < len(argv):
+            i += 2
+            continue
+        if a.startswith(("--password=", "--password-file=")):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    if value:
+        d = vm_dir(name)
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "vmkit.pass"
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(value)
+        os.chmod(str(f), 0o600)
+        out += ["--password-file", str(f)]
+    return out
+
+
 def _vmz_install_env() -> dict:
     """给 vmz 的环境。PATH 要补全，因为 launchd 拉起的 app 不带 shell PATH。"""
     env = dict(os.environ)
@@ -1561,8 +1835,8 @@ def _vmz_install_env() -> dict:
     return env
 
 
-def _install_signal_guard() -> None:
-    """安装期间收到 SIGTERM/SIGINT 时，把客人机进程一起带走。
+def _install_signal_guard(name: str) -> None:
+    """安装期间收到 SIGTERM/SIGINT 时，把这次装的那台客人机一起带走。
 
     为什么必须要有：app 的「停止」按钮杀的是 install.pid，而非 macOS 路径下
     那个 pid 就是 vmkit 自己。vmkit 原来没有信号处理器，收到 SIGTERM 当场
@@ -1571,15 +1845,27 @@ def _install_signal_guard() -> None:
     winarm 看到磁盘已存在就复用、看到 qemu_running 就报「VM 已在运行」，
     新安装顺着旧 VM 走到「SSH 就绪」，状态完全对不上。
 
-    杀的办法是读每个 VM 的 qemu.pid 文件，不是 killpg：QEMU 主动脱离了
-    我们的进程组，pgid 对不上。
+    只杀本次安装名下的 pid 文件。原来遍历 VMS.glob("*/qemu.pid") 把所有 VM
+    的 QEMU 都 SIGTERM：取消一次安装，会把用户其他正在跑的虚拟机一起干掉，
+    而那些机器跟这次安装毫无关系，数据还可能没落盘。
+
+    杀的办法是读 pid 文件，不是 killpg：QEMU 主动脱离了我们的进程组，
+    pgid 对不上。
     """
     def handler(signum, frame):
-        for p in sorted(VMS.glob("*/qemu.pid")):
+        d = vm_dir(name)
+        pids: list[int] = []
+        q = d / "qemu.pid"
+        if q.is_file():
             try:
-                pid = int(p.read_text().strip())
+                pids.append(int(q.read_text().strip()))
             except (OSError, ValueError):
-                continue
+                pass
+        # macOS 这条路的客人机是 vmz，pid 在 macvm.pid 里，而且带宿主前缀
+        entry = _read_macvm_pid(d / "macvm.pid")
+        if entry:
+            pids.append(entry[1])
+        for pid in pids:
             if pid > 0 and _pid_alive(pid):
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -1614,6 +1900,10 @@ def spawn_detached_install(args) -> int:
     避免两边同时写一个文件。
     """
     name = args.name
+    # 先把 --password-file 并进 args.password：下面 macOS 那条分支直接用
+    # args.password 造 0600 文件，另一条分支要把它转成文件传给子进程。
+    # 两处都在这儿取，免得同一个入口两种行为。
+    resolve_password(args)
     d = vm_dir(name)
 
     # 先看有没有一个安装已经在跑。原来没有任何检查：连点两次安装（或 app 的
@@ -1700,6 +1990,8 @@ def spawn_detached_install(args) -> int:
             if a == "--detach":
                 continue
             argv.append(a)
+        # 口令不能顺着 argv 传给子进程，换成 0600 文件指过去
+        argv = _forward_password(argv, name, args.password)
         env = None
 
     # 追加而不是覆盖：重跑一次不会把上次的日志冲掉，出问题时能回看
@@ -1719,10 +2011,11 @@ def spawn_detached_install(args) -> int:
 
 
 def cmd_install(args) -> int:
-    _install_signal_guard()
+    name = args.name
+    resolve_password(args)
+    _install_signal_guard(name)
     if platform.machine() != "arm64" or platform.system() != "Darwin":
         die("只在 Apple Silicon 的 macOS 上有效。")
-    name = args.name
     if not name.replace("-", "").replace("_", "").isalnum():
         die(f"名字只能含字母数字和 - _：{name}")
     if vm_file(name).exists() and not args.force:
@@ -2067,7 +2360,10 @@ def start_macos(vm: dict) -> None:
 def cmd_start(args) -> int:
     vm = load_vm(args.name)
     headless = resolve_headless(vm, args)
-    if vm["kind"] == "windows":
+    # 一律 .get("kind")：写了一半的 vm.json 没有 kind，直接下标就是 KeyError
+    # 裸栈，而用户看到的只是「启动失败」四个字后面跟一个栈。
+    kind = vm.get("kind")
+    if kind == "windows":
         w = winarm()
         os.environ.update(winarm_env(vm, headless))
         # 必须接 winarm 的 _Die：它用 die() 表示「盘没建」「安装介质不在」
@@ -2079,7 +2375,7 @@ def cmd_start(args) -> int:
         except w._Die as e:
             die(str(e))
         _sync_windows_vnc(vm)
-    elif vm["kind"] == "macos":
+    elif kind == "macos":
         # macOS 客人机是前台跑的，不是起了就返回。
         #
         # 原因写在 MacVMEngine 顶部：VZVirtualMachine 不能跨进程传递，
@@ -2088,7 +2384,7 @@ def cmd_start(args) -> int:
         # 关终端客人机跟着停。这不是设计选择，是框架限制。
         # app 里不走这条路，它在自己进程里跑 VZ，所以有关闭按钮和画面。
         start_macos(vm)
-    elif vm["kind"] == "local":
+    elif kind == "local":
         # 从盘启动意味着用户已经在安装器里点完了。原来这里不会置 ready，
         # 于是界面一直显示「未就绪」、登录信息也不给——用户明明已经装好。
         # 装没装完只有用户知道，他选择 start 就是最明确的表态。
@@ -2143,25 +2439,28 @@ def cmd_window(args) -> int:
 
 def cmd_stop(args) -> int:
     vm = load_vm(args.name)
-    if vm["kind"] == "macos":
+    if vm.get("kind") == "macos":
         # macOS 客人机的进程是 vmz，停它要发 SIGTERM——vmz 内部有个
         # signal handler，收到就走 VZ 的优雅停机（machine.stop），
         # 让 macOS 正常 flush 磁盘。直接 kill -9 会在 APFS 里留下
         # 未干净的日志，下次启动跑好几分钟 fsck。
+        entry = macos_pid_entry(vm)
+        if not entry:
+            ok("VM 没在运行")
+            return 0
+        host, pid = entry
+        if host == "app":
+            # 在 app 里跑着的 VM 命令行停不了：vmz stop 只对 vmz 宿主发
+            # 信号，对 app 发 SIGTERM 会连 app 一起打死（它没有处理函数），
+            # 而 VM 是非优雅停机。这里明说，而不是返回 0 假装停过了。
+            die(f"{vm.get('name')} 正在 AgentVM.app 里运行（pid {pid}），"
+                f"命令行停不了它。\n"
+                f"请在 app 里选中这台虚拟机，点关闭/关机。")
         vmz = find_vmz()
         if not vmz:
             die("找不到 vmz，停不了 macOS 虚拟机。")
-        pidf = vm_dir(vm["name"]) / "macvm.pid"
-        try:
-            pid = int(pidf.read_text().strip())
-        except (OSError, ValueError):
-            ok("VM 没在运行")
-            return 0
-        if not _pid_alive(pid):
-            ok("VM 没在运行")
-            return 0
-        Emit.stage("stop", f"停止 {vm['name']}")
-        proc = subprocess.Popen([str(vmz), "stop", "--name", vm["name"]],
+        Emit.stage("stop", f"停止 {vm.get('name')}")
+        proc = subprocess.Popen([str(vmz), "stop", "--name", vm.get("name")],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, cwd=str(HERE), env=_vmz_install_env())
         rc = _relay(proc, "stop")
@@ -2183,7 +2482,11 @@ def cmd_stop(args) -> int:
         except w._Die as e:
             die(str(e))
         return 0
-    # Linux：先试 SSH 关机，再 ACPI，最后才强杀。qcow2 被强杀有丢数据风险。
+    # Linux：guest agent → SSH → ACPI → 强杀，一路降级。
+    # qcow2 被强杀有丢数据风险，所以前面每一层都值得试；而 agent 排在 SSH
+    # 前面是因为它不依赖客人机网络，理由见 qga_shutdown_wait 的注释。
+    if qga_shutdown_wait(vm):
+        return 0
     if linux_ssh_ready(vm, timeout=5):
         log("SSH 可达，走客人机自己的关机流程")
         subprocess.run([find_tool("ssh"), "-i", vm["ssh_key"],
@@ -2218,6 +2521,93 @@ def cmd_stop(args) -> int:
     run(["kill", "-9", str(pid)], check=False)
     ok("已强杀")
     return 0
+
+
+def cmd_guest(args) -> int:
+    """通过 QEMU guest agent 碰客人机，不依赖客人机网络。
+
+        vmkit.py guest --name d1 ping
+        vmkit.py guest --name d1 ip              客人机的 IPv4 地址
+        vmkit.py guest --name d1 disks           客人机能看到的块设备
+        vmkit.py guest --name d1 exec -- uname -a
+        vmkit.py guest --name d1 shutdown        优雅关机（stop 走的就是它）
+
+    和 SSH 的分工：这条走 virtio-serial，客人机没网、sshd 没起来、防火墙把
+    22 挡了都能用；代价是要客人机里装着 qemu-guest-agent（Linux 云镜像从
+    install 起就带着，见 linux_seed 的 packages）。
+
+    Windows 侧用不了：qemu-ga 的 Windows ARM64 安装包目前没有正式 release
+    产物（virtio-win-guest-tools-installer PR #100 / #104 只有 CI artifact，
+    UTM #5134 说未移植到 ARM64 Windows），所以 winarm 那边没有这个 socket，
+    这条命令在 Windows VM 上会直接告诉你 socket 不在。
+    """
+    vm = load_vm(args.name)
+    sock = qga_sock_path(vm)
+    if vm.get("kind") != "linux" and not sock.exists():
+        # 提前把「为什么没有」说清。只说「socket 不存在」的话，Windows 用户
+        # 会去装 qemu-guest-agent，然后发现宿主机侧根本没挂这个设备。
+        die(f"{vm['name']} 是 {vm.get('kind')} 客人机，没有 guest agent 套接字。\n"
+            f"Linux 云镜像从 install 起就带（见 linux_seed 的 packages）；\n"
+            f"Windows ARM64 等 qemu-ga 的正式安装包，见 README"
+            f"「客人机代理与共享目录」。")
+    qa = qga()
+
+    if args.action == "exec":
+        argv = list(args.command)
+        # REMAINDER 会把分隔用的 `--` 也吃进来，剥掉它，否则 sh 会拿到一个
+        # 名叫 `--` 的第一个参数。
+        if argv and argv[0] == "--":
+            argv = argv[1:]
+        if not argv:
+            die("要给命令，例如：guest --name d1 exec -- uname -a")
+        try:
+            r = qa.qga_exec(sock, argv, timeout=args.timeout)
+        except qa.QGAError as e:
+            die(str(e))
+        if r["out"]:
+            sys.stdout.write(r["out"])
+            if not r["out"].endswith("\n"):
+                sys.stdout.write("\n")
+        if r["err"]:
+            sys.stderr.write(r["err"])
+        # 客人机里的退出码要透出来。被信号打死时 QGA 给的 exitcode 是假，
+        # 那也算失败，给 1。
+        code = r["exitcode"]
+        return int(code) if isinstance(code, int) else 1
+
+    try:
+        if args.action == "ping":
+            # ping 一次就够。qga_ping 是「一次连接一个请求」，调两次就是两条
+            # 连接、两倍等待，而这里要的只是一个真假。
+            reachable = qa.qga_ping(sock)
+            ok("guest agent 可达" if reachable else
+               f"guest agent 不可达：{sock}")
+            return 0 if reachable else 1
+        if args.action == "ip":
+            ips = qa.qga_ips(sock)
+            if not ips:
+                warn("guest agent 没报出任何 IPv4 地址")
+                return 1
+            for ip in ips:
+                ok(ip)
+            Emit.done({"ips": ips})
+            return 0
+        if args.action == "disks":
+            disks = qa.qga_disks(sock)
+            for d in disks:
+                name = d.get("name", "?")
+                parts = ", ".join(str(p.get("partition", "?"))
+                                  for p in (d.get("partitions") or []))
+                ok(f"{name}" + (f"  分区 {parts}" if parts else "  （没有分区）"))
+            Emit.done({"disks": disks})
+            return 0
+        if args.action == "shutdown":
+            qa.qga_shutdown(sock)
+            log("已让客人机关机")
+            return 0
+    except qa.QGAError as e:
+        die(str(e))
+    die(f"不认识的动作：{args.action}")
 
 
 def vm_record(vm: dict) -> dict:
@@ -2409,8 +2799,8 @@ def cmd_disk(args) -> int:
 
 def _vm_qcow2(vm: dict) -> Path | None:
     """这个虚拟机哪个盘能拍快照。只有 qcow2 有内部快照，raw 盘没有。"""
-    if vm["kind"] == "linux":
-        f = vm_dir(vm["name"]) / "disk.qcow2"
+    if vm.get("kind") == "linux":
+        f = vm_dir(vm.get("name", "")) / "disk.qcow2"
         return f if f.is_file() else None
     for d in vm.get("disks", []):
         if d.get("format") == "qcow2" and Path(d["file"]).is_file():
@@ -2447,6 +2837,19 @@ def list_snapshots(path: Path) -> list[dict]:
     return out
 
 
+def check_snapshot_tag(tag: str) -> str:
+    """快照名白名单。与 Swift 侧 validateTag 同一套规则。
+
+    这个值会原样进 `qemu-img snapshot -c <tag> <file>` 的 argv：
+    `--tag=-c` 会被 qemu-img 当成自己的选项，用户以为是快照名，
+    实际是给转换器发了一条别的命令。所以禁 - 开头，长度也限死。
+    """
+    if not _SNAP_TAG_RE.fullmatch(tag or ""):
+        die(f"快照名只能含字母、数字、点、下划线、连字符，"
+            f"1 到 64 个字符，不能以连字符开头：{tag!r}")
+    return tag
+
+
 def cmd_snapshot(args) -> int:
     """qcow2 内部快照：拍一张、列出来、回滚、删掉。
 
@@ -2459,11 +2862,15 @@ def cmd_snapshot(args) -> int:
     2. **回滚时虚拟机必须关机。** 运行中改镜像内容，客人机缓存和磁盘会对不上。
     """
     vm = load_vm(args.name)
-    name = vm["name"]
+    name = vm.get("name", args.name)
+    # tag 先过白名单再分叉：macOS 那条要把它交给 vmz，qcow2 那条要拼进
+    # qemu-img 的 argv，两边都挡在这儿最省。
+    if args.tag:
+        check_snapshot_tag(args.tag)
 
     # macOS 客人机没有 qcow2，快照是整盘 clonefile（APFS 原生能力），
     # 所以整套动作都在 vmz 里。这里只做转发和事件转播。
-    if vm["kind"] == "macos":
+    if vm.get("kind") == "macos":
         vmz = find_vmz()
         if not vmz:
             die("找不到 vmz，管理不了 macOS 虚拟机的快照。")
@@ -2784,21 +3191,23 @@ def cmd_delete(args) -> int:
         # macOS 虚拟机没有 vm.json（它的配置在 macvm.json 里），
         # 但删的时候照样要先停机、照样要卸自启 plist。漏了这一段，
         # 删一个正在跑的 macOS VM 会把盘从 VZ 脚下抽走。
-        if macos_pid({"name": name}):
+        entry = macos_pid_entry({"name": name})
+        if entry:
+            host, pid = entry
+            if host == "app":
+                # 在 app 里跑着的机器命令行停不了，也就不能删：删了就是
+                # 把 disk.img 从一个活的 VZVirtualMachine 脚下抽走。
+                die(f"{name} 正在 AgentVM.app 里运行（pid {pid}），"
+                    f"命令行停不了它，也不能就这么删。\n"
+                    f"请在 app 里选中它关机，然后再删。")
             warn("VM 还在跑，先关机再删")
             cmd_stop(args)
-        plist = HOME / "Library" / "LaunchAgents" / f"com.agentvm.{name}.plist"
-        if plist.exists():
-            run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
-                check=False)
-            run(["launchctl", "unload", str(plist)], check=False)
-            plist.unlink(missing_ok=True)
-            ok(f"已卸掉开机自启 {plist}")
         # 开机自启的 plist 必须一起卸掉。原来只 _rmtree(d)：plist 还留在
         # ~/Library/LaunchAgents/，而它指向的 wrapper 就在被删掉的 VM 目录里。
         # 之后每次登录 launchd 执行一个不存在的脚本 → 非零退出 → KeepAlive 加
         # ThrottleInterval 15 → 每 15 秒重试一次，永不停止，还会往已删除目录写
         # 日志失败。用户看到的是「删了的虚拟机还在每隔一会儿折腾一下」。
+        # bootout 之后再 unload 是老版本 launchd 的兼容写法，两个都发。
         plist = HOME / "Library" / "LaunchAgents" / f"com.agentvm.{name}.plist"
         if plist.exists():
             run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
@@ -2940,12 +3349,15 @@ def cmd_configure(args) -> int:
     3. **改磁盘大小时虚拟机必须关机。** qcow2 镜像被 QEMU 占着写锁，resize 会失败。
     """
     vm = load_vm(args.name)
-    name = vm["name"]
+    # 密码也可能从文件来。放在最前面：configure_macos 和下面那串
+    # `if args.password` 都读 args.password，一个入口两种来源容易漏一边。
+    resolve_password(args)
+    name = vm.get("name", args.name)
 
     # macOS 客人机的配置不在 vm.json 里，在 macvm.json（vmz 的格式）。
     # 两边各管各的文件：vmkit 的 save_vm 是整体重写，混在一个文件里
     # 迟早互相冲掉。这里单独走一条路，改完照样说清楚要重启才生效。
-    if vm["kind"] == "macos":
+    if vm.get("kind") == "macos":
         return configure_macos(args)
 
     changed: list[str] = []
@@ -2954,7 +3366,7 @@ def cmd_configure(args) -> int:
         top = host_cpus()
         if not 1 <= args.cpu <= top:
             die(f"CPU 核心要给 1 到 {top} 之间，你给了 {args.cpu}")
-        if args.cpu != vm["cpus"]:
+        if args.cpu != vm.get("cpus"):
             vm["cpus"] = args.cpu
             changed.append(f"CPU {args.cpu} 核")
 
@@ -2968,25 +3380,28 @@ def cmd_configure(args) -> int:
         if want > ceiling:
             die(f"内存最多 {human(ceiling)}（宿主机 {human(host_mem())}，"
                 f"要给 macOS 自己留 2 GB）")
-        if want != parse_size(vm["ram"]):
+        # 一律 .get()：vm.json 是会被写一半的（安装中断、用户手改、旧版本
+        # 留下的），缺 ram / disk 的坏文件原来在这里 KeyError 崩掉。同文件
+        # vm_record 的注释刚写过这条，这几处是漏的。
+        if want != parse_size(vm.get("ram", "0")):
             vm["ram"] = args.mem.upper()
             changed.append(f"内存 {vm['ram']}")
 
     if args.disk:
         want = parse_size(args.disk)
-        cur = parse_size(vm["disk"])
+        cur = parse_size(vm.get("disk", "0"))
         # 下限 1G。原来没有：`--disk 64` 被解析成 64 字节，qemu-img 老实建成一个
         # 512 字节的盘，QEMU 起来就是一个空盘，用户完全看不出所以然。
         if want < 1 << 30:
             die(f"磁盘至少 1G，你给了 {args.disk}")
         if want < cur:
-            die(f"磁盘只能往大改：现在是 {vm['disk']}，你要给 {args.disk}。"
+            die(f"磁盘只能往大改：现在是 {vm.get('disk')}，你要给 {args.disk}。"
                 f"改小会把超出去的数据截掉，文件系统不会跟着缩。")
         if want > cur:
             if qemu_pid(vm):
                 die("虚拟机正在运行，镜像被占着写锁，改不了大小。先 stop。")
             d = vm_dir(name)
-            if vm["kind"] == "linux":
+            if vm.get("kind") == "linux":
                 disk = d / "disk.qcow2"
                 if not disk.is_file():
                     die(f"找不到 {disk}")
@@ -3015,7 +3430,7 @@ def cmd_configure(args) -> int:
         # 原来这里只改 vm.json 就完事：输出写着「已改 密码 / 下次启动生效」，
         # 重启后 cloud-init 读到的还是旧 user-data，用户拿新密码登不进去，
         # 而界面说已改。这是最难查的那类 bug——两边都「成功」了。
-        if vm["kind"] == "linux":
+        if vm.get("kind") == "linux":
             try:
                 linux_seed(vm)
                 changed.append("种子盘已重写（新密码下次启动生效）")
@@ -3073,7 +3488,9 @@ def cmd_configure(args) -> int:
             die(f"端口 {want} 已经分给 {taken_ports[want]} 了，换一个")
         taken_ports[want] = what
 
-    if args.ssh_port is not None and args.ssh_port != vm["ssh_port"]:
+    # 写了一半的 vm.json 可能没有 ssh_port：原来这里直接下标，一个坏文件
+    # 就让 configure 整条命令 KeyError 崩掉，而用户只是想改个内存。
+    if args.ssh_port is not None and args.ssh_port != vm.get("ssh_port"):
         take_port(args.ssh_port, "SSH")
         vm["ssh_port"] = args.ssh_port
         changed.append(f"SSH 端口 {args.ssh_port}")
@@ -3208,10 +3625,25 @@ def configure_macos(args) -> int:
     return 0
 
 
+def _xml_escape(s) -> str:
+    """XML 文本转义。plist 是 XML，名字或路径里出现 & < > 会让 launchd
+    解析失败，严重时写出一份 launchctl load 直接报错的文件——而报错信息
+    指的是一个 plist 路径，用户看不出是名字里的字符惹的祸。"""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
 def cmd_autostart(args) -> int:
     vm = load_vm(args.name)
-    d = vm_dir(vm["name"])
-    label = f"com.agentvm.{vm['name']}"
+    # 名字要单独校验。args.name 在 main() 里已经过过白名单，但这里用的是
+    # vm["name"]——vm.json 的内容不一定是本工具写的（手改、旧版本、别的
+    # 入口），一个带引号或 $ 的名字会原样写进 launchd.sh 和 plist 标签，
+    # 而 launchd.sh 是被 launchd 当脚本执行的：那是以当前用户权限的
+    # 任意命令执行。
+    name = vm.get("name") or args.name
+    check_vm_name(name)
+    d = vm_dir(name)
+    label = f"com.agentvm.{name}"
     plist = HOME / "Library" / "LaunchAgents" / f"{label}.plist"
     wrapper = d / "launchd.sh"
     py = Path(sys.executable).resolve()
@@ -3226,22 +3658,28 @@ def cmd_autostart(args) -> int:
             ok("本来就没装开机自启")
         return 0
 
-    if vm["kind"] == "windows":
-        inner = (f'exec "{py}" "{WINARM}" start --foreground < /dev/null')
-    elif vm["kind"] == "macos":
+    kind = vm.get("kind")
+    if kind == "windows":
+        # shlex.quote：路径里带空格或 shell 元字符时，不转义就是把一句话
+        # 切成好几个词，或者把引号里的内容变成命令。
+        inner = (f"exec {shlex.quote(str(py))} {shlex.quote(str(WINARM))} "
+                 f"start --foreground < /dev/null")
+    elif kind == "macos":
         # macOS 客人机的 wrapper 调 vmz。它前台跑（VZ 的 VM 跟进程同生共死），
         # 所以 launchd 的 KeepAlive 正好合用：进程一退就再拉起来。
         vmz = find_vmz()
         if not vmz:
             die("找不到 vmz，配不了 macOS 虚拟机的开机自启。")
-        inner = f'exec "{vmz}" start --name {vm["name"]} < /dev/null'
+        inner = (f"exec {shlex.quote(str(vmz))} start "
+                 f"--name {shlex.quote(name)} < /dev/null")
     else:
-        inner = f'exec "{py}" "{script}" start --name {vm["name"]} --headless < /dev/null'
+        inner = (f"exec {shlex.quote(str(py))} {shlex.quote(str(script))} start "
+                 f"--name {shlex.quote(name)} --headless < /dev/null")
 
     # QEMU 的路径只有另外三种需要。原来这行在 if/elif 链外面无条件执行，
     # 而 find_tool 找不到就 die——只跑 macOS 虚拟机、没装 QEMU 的机器上，
     # autostart 直接报「找不到 qemu-system-aarch64」，而这个 VM 压根不碰它。
-    if vm["kind"] == "macos":
+    if kind == "macos":
         hb = str(Path(vmz).parent.parent) if vmz else "/usr"
     else:
         hb = find_tool("qemu-system-aarch64").rsplit("/bin/", 1)[0]
@@ -3261,14 +3699,16 @@ export HEADLESS="1"
     if plist.exists():
         run(["launchctl", "unload", str(plist)], check=False)
     plist.parent.mkdir(parents=True, exist_ok=True)
+    # 文本节点一律转义：plist 是 XML，路径和标签里有 & < > 就让这份文件
+    # 不再是合法 XML，launchctl load 报的错还指向不到真正的原因。
     plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>{_xml_escape(label)}</string>
     <key>ProgramArguments</key>
-    <array><string>{wrapper}</string></array>
+    <array><string>{_xml_escape(wrapper)}</string></array>
     <key>RunAtLoad</key>
     <true/>
     <key>Nice</key>
@@ -3278,9 +3718,9 @@ export HEADLESS="1"
     <key>ThrottleInterval</key>
     <integer>15</integer>
     <key>StandardOutPath</key>
-    <string>{d / 'launchd.log'}</string>
+    <string>{_xml_escape(d / 'launchd.log')}</string>
     <key>StandardErrorPath</key>
-    <string>{d / 'launchd.log'}</string>
+    <string>{_xml_escape(d / 'launchd.log')}</string>
 </dict>
 </plist>
 """)
@@ -3329,7 +3769,10 @@ def main() -> int:
     p.add_argument("--mem")
     p.add_argument("--disk")
     p.add_argument("--user")
-    p.add_argument("--password")
+    p.add_argument("--password", help="密码。它会以明文落在 vm.json 里（0600），"
+                                      "能不给就不给")
+    p.add_argument("--password-file",
+                   help="密码文件，内容读进内存后即删，不进命令行参数")
     p.add_argument("--ssh-key")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--wait", type=int, default=40, help="等就绪的分钟数")
@@ -3363,6 +3806,8 @@ def main() -> int:
             sp.add_argument("--disk", help="磁盘，只能往大改，如 64G")
             sp.add_argument("--user", help="登录名")
             sp.add_argument("--password", help="密码")
+            sp.add_argument("--password-file",
+                            help="密码文件，读进内存后即删，不进命令行参数")
             sp.add_argument("--headless", action="store_true",
                             help="改成无窗口运行（画面走 VNC）")
             sp.add_argument("--window", action="store_true",
@@ -3413,6 +3858,16 @@ def main() -> int:
     p.add_argument("--tag", help="挂载标签，客人机里按它认")
     p.add_argument("--path", help="宿主机上的目录")
 
+    p = sub.add_parser("guest", help="通过 QEMU guest agent 碰客人机")
+    p.add_argument("action", choices=["ping", "ip", "disks", "exec", "shutdown"])
+    p.add_argument("--name", required=True)
+    p.add_argument("--timeout", type=float, default=60.0,
+                   help="exec 等客人机命令结束的秒数")
+    # exec 后面跟的是一条要原样送进客人机的命令，必须是 REMAINDER：
+    # 固定位置参数会把 `-la` 这类当成 vmkit 自己的选项报「unrecognized」。
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="exec 的要执行的命令，前面加 -- 更稳")
+
     args = ap.parse_args()
     if args.no_json:
         Emit.on = False
@@ -3432,6 +3887,13 @@ def main() -> int:
         return cmd_status(args)
     if not args.name:
         die(f"{args.cmd} 需要 --name")
+    # 名字先过白名单再进任何子命令。vm_dir() 是 VMS / name 直接拼路径，
+    # 而 delete 对这个路径是 _rmtree：`delete --name ..` 删的是
+    # ~/.agentvm/vms/.. 也就是 ~/.agentvm——所有 VM 和全部底册镜像一起没。
+    # 放在分派之前统一做，因为每个子命令都拿 args.name 拼路径，逐个补校验
+    # 漏一个就是一次数据销毁。校验放在 exists 判断之前，所以 delete 照样
+    # 能删「只剩目录、没有 vm.json」的残留（那正是删除失败后要清的）。
+    check_vm_name(args.name)
     if args.cmd == "start":
         return cmd_start(args)
     if args.cmd == "stop":
@@ -3458,6 +3920,8 @@ def main() -> int:
         return cmd_clone(args)
     if args.cmd == "share":
         return cmd_share(args)
+    if args.cmd == "guest":
+        return cmd_guest(args)
     if args.cmd == "screenshot":
         return cmd_screenshot(args)
     return 1

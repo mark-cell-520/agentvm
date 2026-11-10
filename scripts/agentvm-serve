@@ -13,8 +13,8 @@ IMAGE_DIR="$AGENTVM_HOME/image"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port) PORT="$2"; shift 2 ;;
-    --dir) IMAGE_DIR="$2"; shift 2 ;;
+    --port) [ $# -ge 2 ] || die "--port 需要一个值"; PORT="$2"; shift 2 ;;
+    --dir) [ $# -ge 2 ] || die "--dir 需要一个值"; IMAGE_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac

@@ -217,6 +217,29 @@ raw 盘被强杀有丢数据的风险。
 60 秒等不到，只能 `kill -9`。所以 `stop` 的顺序改成：SSH 可达就先
 `shutdown /s`，再退到 ACPI，最后才强杀。
 
+现在最前面还多了一条 guest agent（`qga_shutdown_wait`），但它对 Windows
+ARM64 默认不走，原因见下一节。正常情况下那一步是零成本直接跳过。
+
+### Windows ARM64 的 guest agent：等正式包，不硬上
+
+`cmd_stop` 里那条 guest agent 的路是通用的，Windows 侧也留着，但
+`qemu_args` 里**没有** `virtio-serial` 和 `org.qemu.guest_agent.0`。两条
+证据对不上，不能赌：
+
+1. qemu-ga 的 Windows ARM64 安装包（`qemu-ga-arm64.msi`）目前只有
+   virtio-win-guest-tools-installer PR #100 / #104 的 CI artifact，没有正式
+   release 产物（PR #100 还被关了）。
+2. UTM #5134 说 guest agent 未移植到 ARM64 Windows。
+
+硬加设备的后果不是「没效果」而是「有反效果」：QEMU 只要带了这个 chardev 就会
+把 `<vm>/qga.sock` 建出来，于是每次 `stop` 都先去连一个没人接的 socket，白等
+一轮超时——本来 8 秒能关掉的机器变成每次都多等一段。
+
+宿主机侧的判断只有「socket 在不在」，没有任何隐式探测：自己装了社区版的
+ARM64 agent、并按 Linux 那边的约定把 socket 放到 `<vm>/qga.sock`，代码自动
+用上，不用改。Linux 云镜像那条路是齐全的（README「客人机代理与共享目录」），
+因为 `qemu-guest-agent` 在 Debian/Ubuntu 源里就有。
+
 ### 按名字调 QEMU 会在没有 PATH 的地方炸
 
 `Popen("qemu-system-aarch64")` 依赖调用方的 PATH 里有 `~/hb/bin`。从
@@ -356,3 +379,6 @@ raw（稀疏、QEMU 直接读写，装系统时就是这么建的）。改格式
   `backends/base.py`、`backends/tart.py`、`backends/hyperv.py` 定义了它
   没接进去的那套接口。
 - Windows 是评估版，90 天后要重新弄或自己授权。
+- Windows 侧没有 QEMU guest agent：`qemu-ga-arm64.msi` 只有 PR 的 CI
+  artifact，没有正式 release 产物，详见「Windows ARM64 的 guest agent」那一节。
+  宿主机侧的代码已经留着位置，包一出来就能接上。

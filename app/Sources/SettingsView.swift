@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 宿主机资源条：一眼看出「这个虚拟机要占掉机器多少」。
 ///
@@ -314,10 +315,22 @@ struct SettingsView: View {
     @State private var saving = false
     @State private var errorMsg: String?
     @State private var done = false
+    /// macOS 客人机的共享目录和端口转发。从 macvm.json 读，保存时写回去
+    /// （见 AppState.macSaveDevices）。非 macOS 虚拟机这两项恒为空、界面也不显示。
+    @State private var macShares: [MacVMShare]
+    @State private var macForwards: [MacVMForward]
+    @State private var newSharePath = ""
+    @State private var newShareName = "host"
+    @State private var newShareReadOnly = false
+    @State private var newHostPort = ""
+    @State private var newGuestPort = ""
 
     init(vm: VMInfo) {
         self.vm = vm
         _s = State(initialValue: VMSettings(vm: vm))
+        let spec = MacVMSpec.load(name: vm.name)
+        _macShares = State(initialValue: spec?.shares ?? [])
+        _macForwards = State(initialValue: spec?.forwards ?? [])
     }
 
     /// 有哪些改动需要重启才生效。
@@ -331,6 +344,17 @@ struct SettingsView: View {
             || s.attachISO != vm.attachISO
             || s.sshPort != vm.sshPort || s.vncPort != vm.vncPort
             || s.rdpPort != vm.rdpPort || s.webPort != vm.webPort
+            // macOS 的共享目录和端口转发是创建 VZVirtualMachine 时的设备参数，
+            // 和 CPU 内存一样改完要重启。
+            || (vm.isMacOS && devicesChanged)
+    }
+
+    /// 共享目录 / 端口转发相对磁盘上的配置有没有动。
+    private var devicesChanged: Bool {
+        // 读不到配置时当作没改：保存那一下会报出真正的错误（见 save() 里
+        // macSaveDevices 的分支），在这儿弹一个看不懂的解码错误没用。
+        guard let spec = MacVMSpec.load(name: vm.name) else { return false }
+        return macShares != spec.shares || macForwards != spec.forwards
     }
 
     private var dirty: Bool {
@@ -349,6 +373,10 @@ struct SettingsView: View {
             && (5900...65535).contains(s.vncPort)
             && (s.rdpPort.map { (1024...65535).contains($0) } ?? true)
             && (s.webPort.map { (1024...65535).contains($0) } ?? true)
+            // macOS 的共享目录 / 端口转发表单填到一半（端口不是数字、目录不存在）
+            // 时也不许保存——和上面那几个端口框同一套规矩：越域就地说明，
+            // 而不是让用户点下去撞一个后端错误。
+            && (!vm.isMacOS || (shareFormError == nil && forwardFormError == nil))
     }
 
     var body: some View {
@@ -366,6 +394,14 @@ struct SettingsView: View {
                     ports
                     Divider()
                     account
+                    // 共享目录和端口转发只有 macOS 客人机有（virtiofs + vsock）。
+                    // 另外两种走 9p 和 QEMU 的端口参数，在「存储」面板里。
+                    if vm.isMacOS {
+                        Divider()
+                        macSharesSection
+                        Divider()
+                        macForwardsSection
+                    }
                     if let e = errorMsg {
                         Text(e).font(.caption).foregroundStyle(.red)
                             .textSelection(.enabled)
@@ -493,13 +529,14 @@ struct SettingsView: View {
     private var ports: some View {
         VStack(alignment: .leading, spacing: 10) {
             if vm.isMacOS {
-                // macOS 客人机一个端口都没有：VZ 的 NAT 附件不对外监听，
-                // VNC 不存在，SSH 在 NAT 内部。摆三个端口框在这儿只会让用户
-                // 填一堆永远不生效的数字。
+                // macOS 客人机没有可改的 SSH/VNC 端口：VZ 的 NAT 附件不对外监听，
+                // VNC 压根不存在。摆三个端口框在这儿只会让用户填一堆永远不生效的
+                // 数字。要让宿主机连进客人机，用下面的「端口转发」（vsock）。
                 Text("端口").font(.headline)
                 Text("macOS 虚拟机没有可改的端口。它的网络是 VZ 的 NAT"
                      + "（内部 192.168.64.x），宿主机上不转发任何端口，"
-                     + "也没有 VNC——画面直接显示在 app 的窗口里。")
+                     + "也没有 VNC——画面直接显示在 app 的窗口里。\n"
+                     + "要让宿主机连进客人机，用下面的「端口转发」。")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
@@ -518,6 +555,235 @@ struct SettingsView: View {
                 portRow("Web 界面", $s.webPort, range: 1024...65535)
             }
             }
+        }
+    }
+
+    // ------------------------------------------------ 共享目录（virtiofs） --
+
+    /// macOS 客人机的共享目录。virtiofs，客人机自动挂到 /Volumes/<挂载名>。
+    ///
+    /// 和 Linux 那边（「存储」面板里的 9p）最大的区别：不用进客人机敲 mount。
+    /// 这是 VZ 的 macOSGuestAutomountTag 给的，见 MacVMEngine 里
+    /// macMakeConfiguration 的注释——那个 tag 不能自己起，否则客人机里
+    /// 能看见卷但一访问就是 Operation not permitted。
+    private var macSharesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("共享目录").font(.headline)
+            Text("把宿主机上的目录挂进客人机，传文件不用再走 scp。"
+                 + "macOS 客人机会自动挂到 /Volumes/<挂载名>，不需要在客人机里敲 mount。")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if macShares.isEmpty {
+                Text("还没有共享目录")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(macShares) { sh in
+                        HStack(spacing: 10) {
+                            Image(systemName: "folder")
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("/Volumes/\(sh.name)").font(.callout)
+                                Text(sh.hostPath + (sh.readOnly ? "（只读）" : ""))
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button("摘掉", role: .destructive) {
+                                macShares.removeAll { $0.id == sh.id }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        .padding(8)
+                        .background(.quaternary.opacity(0.5),
+                                    in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text(newSharePath.isEmpty ? "还没选目录" : newSharePath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button("选择目录…") { pickShareDir() }
+                    .controlSize(.small)
+            }
+            HStack(spacing: 8) {
+                Text("挂载名").frame(width: 56, alignment: .leading)
+                TextField("例如 host", text: $newShareName)
+                    .frame(width: 140)
+                    .textFieldStyle(.roundedBorder)
+                Toggle("只读", isOn: $newShareReadOnly)
+                    .toggleStyle(.checkbox)
+                Button("加") { addShare() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+
+            if let e = shareFormError {
+                Text(e).font(.caption).foregroundStyle(.red)
+            } else {
+                Text("改完要重启虚拟机才生效。只读的那份在客人机里改不了。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// 加共享目录前的就地校验。不在点「加」的时候弹窗：路径不存在、
+    /// 名字不合法这两种错误，用户在输入框旁边就看到比弹窗清楚。
+    private var shareFormError: String? {
+        guard !newSharePath.isEmpty else { return nil }
+        do {
+            _ = try MacVMPaths.validateShareName(newShareName)
+            _ = try MacVMPaths.validateShareDir(newSharePath)
+            var all = macShares
+            all.append(MacVMShare(hostPath: newSharePath, name: newShareName,
+                                  readOnly: newShareReadOnly))
+            try MacVMPaths.validateShares(all)
+            return nil
+        } catch let e as MacVMError {
+            return e.message
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private func addShare() {
+        guard !newSharePath.isEmpty else { return }
+        do {
+            let one = try macParseShare(newShareReadOnly
+                                        ? "\(newSharePath):\(newShareName):ro"
+                                        : "\(newSharePath):\(newShareName)")
+            var all = macShares
+            all.append(one)
+            try MacVMPaths.validateShares(all)
+            macShares = all
+            newSharePath = ""
+            newShareName = "host"
+            newShareReadOnly = false
+        } catch {
+            // 校验失败时不动界面上的列表——错误已经在 shareFormError 里显示了，
+            // 这里再写一次 errorMsg 会让同一个原因出现两遍。
+            errorMsg = nil
+        }
+    }
+
+    private func pickShareDir() {
+        let panel = NSOpenPanel()
+        panel.title = "选一个要共享进去的目录"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            newSharePath = url.path
+            // 用目录名当默认挂载名：/Volumes 下显示的就是它，用户一眼能认出
+            // 是哪个目录。非法字符（空格等）会被校验拦下，那时再手改。
+            let base = url.lastPathComponent
+            if !base.isEmpty { newShareName = base }
+        }
+    }
+
+    // -------------------------------------------------- 端口转发（vsock） --
+
+    /// macOS 客人机的端口转发。宿主机 TCP → 客人机 vsock。
+    ///
+    /// 这是 VZ 的 NAT 之外唯一的公开进客路径（NAT 附件没有端口映射 API）。
+    /// 宿主机这边只绑 127.0.0.1，外面连不进来。
+    private var macForwardsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("端口转发").font(.headline)
+            Text("把宿主机上的一个端口接到客人机的 vsock 端口上。"
+                 + "宿主机这边只绑 127.0.0.1，外面连不进来。")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if macForwards.isEmpty {
+                Text("还没有端口转发")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(macForwards) { f in
+                        HStack(spacing: 10) {
+                            Image(systemName: "arrow.left.arrow.right")
+                                .foregroundStyle(.secondary)
+                            Text("127.0.0.1:\(f.hostPort) → 客人机 vsock \(f.guestPort)")
+                                .font(.callout)
+                            Spacer()
+                            Button("摘掉", role: .destructive) {
+                                macForwards.removeAll { $0.id == f.id }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        .padding(8)
+                        .background(.quaternary.opacity(0.5),
+                                    in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text("宿主机端口").frame(width: 76, alignment: .leading)
+                TextField("例如 2222", text: $newHostPort)
+                    .frame(width: 90)
+                    .textFieldStyle(.roundedBorder)
+                Text("客人机 vsock 端口").frame(width: 110, alignment: .leading)
+                TextField("例如 22", text: $newGuestPort)
+                    .frame(width: 70)
+                    .textFieldStyle(.roundedBorder)
+                Button("加") { addForward() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+
+            if let e = forwardFormError {
+                Text(e).font(.caption).foregroundStyle(.red)
+            } else {
+                // 这句话必须写：转发链路是通的，但「ssh 127.0.0.1:2222 能进
+                // 客人机」还需要客人机里有个听 vsock 的程序，而 macOS 客人机
+                // 默认没有。不写的话用户会以为加了转发就能 SSH 了。
+                Text("注意：客人机里得有程序监听对应的 vsock 端口，这条转发才通。"
+                     + "macOS 客人机默认没有这样的服务（它的 SSH 只听 TCP）。"
+                     + "改完要重启虚拟机才生效。")
+                    .font(.caption2).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var forwardFormError: String? {
+        guard !newHostPort.isEmpty || !newGuestPort.isEmpty else { return nil }
+        do {
+            guard let host = Int(newHostPort), let guest = Int(newGuestPort) else {
+                return "端口要填数字"
+            }
+            let one = try macParseForward("\(host):\(guest)")
+            var all = macForwards
+            all.append(one)
+            try MacVMPaths.validateForwards(all)
+            return nil
+        } catch let e as MacVMError {
+            return e.message
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private func addForward() {
+        do {
+            let one = try macParseForward("\(newHostPort):\(newGuestPort)")
+            var all = macForwards
+            all.append(one)
+            try MacVMPaths.validateForwards(all)
+            macForwards = all
+            newHostPort = ""
+            newGuestPort = ""
+        } catch {
+            errorMsg = nil
         }
     }
 
@@ -619,6 +885,19 @@ struct SettingsView: View {
         saving = true
         errorMsg = nil
         done = false
+        // macOS 的共享目录和端口转发先写 macvm.json，再走 vmkit 改 CPU 内存那些。
+        // 顺序反过来也没关系——两边写的是不同文件的不同字段；先写这边是因为
+        // 它在本进程内完成，失败能立刻显示，而 vmkit 那条要等子进程。
+        if vm.isMacOS, devicesChanged {
+            do {
+                try state.macSaveDevices(name: vm.name, shares: macShares,
+                                         forwards: macForwards)
+            } catch {
+                saving = false
+                errorMsg = error.localizedDescription
+                return
+            }
+        }
         state.configure(vm, settings: s) {
             if let err = state.backend.errorMessage, !err.isEmpty {
                 saving = false

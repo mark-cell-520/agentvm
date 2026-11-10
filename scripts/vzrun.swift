@@ -110,7 +110,17 @@ do {
     config.consoleDevices = [serial]
 
     try config.validate()
-    let vm = VZVirtualMachine(configuration: config)
+    // 必须给 VZ 一条自己的队列。不带 queue 的那个初始化器用**主队列**
+    // （Apple 头文件原话："uses the main queue to operate the virtual
+    // machine ... The completion handlers ... are also invoked on that
+    // queue"），而下面主线程要 Thread.sleep 轮询 12 次 × 10 秒——主线程睡在
+    // sleep 里，主队列没人服务，start 的 completion 要等轮询结束、
+    // dispatchMain() 起来之后才跑。那 120 秒里日志上只有「start() 已同步返回」，
+    // 成功失败都看不见，而轮询循环早就不看它了。
+    // 同一个坑在 MacVMEngine 的 vzWait 注释里记过一次（app 那边是主线程
+    // 同步等 completion，直接自死锁），那边靠「专用队列 + 在调用线程等」解决。
+    let vmQueue = DispatchQueue(label: "vzrun.vz", qos: .userInitiated)
+    let vm = VZVirtualMachine(configuration: config, queue: vmQueue)
     vm.delegate = gLogger
     log("  ok 配置校验通过，VM 状态=\(vm.state.rawValue)")
 

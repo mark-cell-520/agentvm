@@ -42,6 +42,13 @@ if ! launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null; then
   launchctl unload "$PLIST" 2>/dev/null || true
 fi
 
+# VM_NAME 会原样进 plist 的 Label、ProgramArguments 和日志路径。含空格或 XML
+# 特殊字符时写出的 plist 非法，launchctl bootstrap 和 load 都失败，set -e 让脚本
+# 以一句裸 launchctl 错误退出，报错指不回 VM_NAME。写 plist 前先卡一道。
+case "$VM_NAME" in
+  *[!a-zA-Z0-9._-]*) die "VM_NAME 含非法字符（只允许字母数字和 . _ -）：$VM_NAME" ;;
+esac
+
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

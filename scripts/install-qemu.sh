@@ -95,7 +95,12 @@ fi
 
 # 原来用 `mkdir -p /opt/homebrew/bin 2>/dev/null && [ -w ... ]` 探测，探测失败
 # 也会留下一个空的 /opt/homebrew/bin。先判断再建，别留垃圾。
-if [ -d /opt/homebrew ] || [ -w /opt ]; then
+# 「目录存在」不等于「可写」：机器上有一个 root 所有的 /opt/homebrew 而 /opt
+# 不可写时，`[ -d /opt/homebrew ]` 为真，脚本打印「/opt/homebrew 可写」这句假话，
+# 往下 cp 权限失败，set -e 让脚本以一句裸 cp: Permission denied 退出，末尾给用户
+# 指路的 MSG 一个字都不打印。改成直接测可写：不存在时靠下面 mkdir -p 创建，
+# /opt 可写就够。
+if [ -w /opt/homebrew ] || [ -w /opt ]; then
     log "/opt/homebrew 可写，装一个最小 Homebrew（慢，见注释）"
     # 只拉 Homebrew 本体，不跑官方安装脚本——那个脚本要 sudo 且会改 shell 配置。
     tmp=$(mktemp -d)

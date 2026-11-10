@@ -35,7 +35,21 @@ import Virtualization
 enum MacEmit {
     static var on = true
 
+    /// 写 stdout / stderr 的锁。
+    ///
+    /// 为什么必须有：vmz 里 MacEmit.log 会从信号队列、vmQueue、安装进度
+    /// 定时器队列上并发调用（SIGTERM handler 打「正在优雅关机」、下载 delegate
+    /// 打进度、定时器打「安装中…」）。FileHandle 的 write 不是线程安全的，
+    /// 两行 JSON 会交错成半行——而 vmkit 的 _relay 把认不出的碎行当普通日志
+    /// 转出去，app 侧看到的就是一堆读不懂的文本，进度条再也不动。
+    ///
+    /// 只锁「写」这一步，锁内不再调任何会进 MacEmit 的函数（w 是唯一的写出口，
+    /// stage/log/progress 都走它），所以不存在递归加锁。
+    private static let writeLock = NSLock()
+
     static func w(_ obj: [String: Any]) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         guard on else {
             // 人话模式。命令行不带 --json 时用，事件走同一条路换个印法。
             let t = obj["t"] as? String ?? ""
@@ -116,10 +130,96 @@ struct MacVMSpec: Codable {
     /// 安装是否已完成。没完成时 start 会拒绝——没有系统的盘启动只会
     /// 卡在 EFI 里，用户看到一个黑屏，不知道要再等多久。
     var installed: Bool = false
+    /// virtiofs 共享目录。空数组 = 这次启动不挂共享目录设备。
+    /// 见 MacVMShare：macOS 客人机会自动挂到 /Volumes/<挂载名>。
+    var shares: [MacVMShare] = []
+    /// 端口转发：宿主机 TCP 端口 → 客人机 vsock 端口。空数组 = 不起 vsock 设备。
+    /// 见 MacVMForward：这是 VZ 的 NAT 之外唯一的公开进客路径。
+    var forwards: [MacVMForward] = []
 
     enum CodingKeys: String, CodingKey {
         case name, cpus, ram, disk, user, password, provisioned, build
         case width, height, installed
+        case shares, forwards
+    }
+
+    init() {}
+
+    /// 手写解码：每个字段都 decodeIfPresent，读不到就用默认值。
+    ///
+    /// 为什么不能用合成的：类里一旦声明了 CodingKeys，合成解码对**非可选**
+    /// 字段走的是 decode 而不是 decodeIfPresent。新加的 shares / forwards
+    /// 在老 macvm.json 里不存在，整份配置就会读不了——而报错只有一句
+    /// 「The data couldn't be read because it is missing」，看不出缺的是哪个
+    /// 键，用户看到的是「虚拟机莫名其妙用不了了」。实测踩过，所以手写。
+    ///
+    /// 每个默认值都和上面属性声明的那一个一致，改一处必须同时改另一处。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        cpus = try c.decodeIfPresent(Int.self, forKey: .cpus) ?? 4
+        ram = try c.decodeIfPresent(String.self, forKey: .ram) ?? "8G"
+        disk = try c.decodeIfPresent(String.self, forKey: .disk) ?? "80G"
+        user = try c.decodeIfPresent(String.self, forKey: .user) ?? "agent"
+        password = try c.decodeIfPresent(String.self, forKey: .password) ?? "agentvm"
+        provisioned = try c.decodeIfPresent(Bool.self, forKey: .provisioned) ?? false
+        build = try c.decodeIfPresent(String.self, forKey: .build) ?? ""
+        width = try c.decodeIfPresent(Int.self, forKey: .width) ?? 1440
+        height = try c.decodeIfPresent(Int.self, forKey: .height) ?? 900
+        installed = try c.decodeIfPresent(Bool.self, forKey: .installed) ?? false
+        shares = try c.decodeIfPresent([MacVMShare].self, forKey: .shares) ?? []
+        forwards = try c.decodeIfPresent([MacVMForward].self, forKey: .forwards) ?? []
+    }
+}
+
+/// 一个 virtiofs 共享目录：把宿主机的一个目录挂进客人机。
+///
+/// 和 Linux 那边的 VMShare（virtio-9p，客人机里要自己敲 mount）是两套东西：
+/// macOS 这边用 VZVirtioFileSystemDeviceConfiguration 加
+/// macOSGuestAutomountTag，客人机自己会挂到 /Volumes/<name>，不需要在客人机
+/// 里执行任何命令——这是 macOS 客人机和 Linux 客人机在共享目录上最大的区别。
+struct MacVMShare: Codable, Hashable, Identifiable {
+    /// 宿主机上的目录。绝对路径（~ 会在存之前展开）。启动时会再校验一次：
+    /// 不存在或不是目录就直接报错，不让 VZ 拿一份挂不上的配置。
+    var hostPath: String
+    /// 客人机里的挂载名，/Volumes/ 下显示的就是它。
+    ///
+    /// 它同时是 VZMultipleDirectoryShare 的字典键，而那个键非法时框架抛的是
+    /// **ObjC 异常**（Apple 头文件原话 "The keys must be valid names or an
+    /// exception will be raised"）——Swift 接不住，进程直接崩。所以名字必须过
+    /// MacVMPaths.validateShareName 的白名单，不能直接塞。
+    var name: String
+    /// 只读挂载。默认 false：能往里写才是共享目录的意义。
+    var readOnly: Bool = false
+
+    var id: String { "\(name)|\(hostPath)" }
+
+    enum CodingKeys: String, CodingKey {
+        case hostPath = "host_path"
+        case name
+        case readOnly = "read_only"
+    }
+}
+
+/// 一条端口转发：宿主机上的一个 TCP 端口 → 客人机里的一个 vsock 端口。
+///
+/// 为什么是 vsock 而不是「把 NAT 的端口映射出来」：VZNATNetworkDeviceAttachment
+/// 至今没有公开的端口映射 API（运行时实测那个类只有 5 个方法，方法名里带
+/// port 的有 0 个），vsock 是唯一公开路径。宿主机侧开 TCP 监听、每个连接换一条
+/// 到客人机 vsock 端点的连接，实现见 MacVsockProxy。
+struct MacVMForward: Codable, Hashable, Identifiable {
+    /// 宿主机上监听的端口。只绑 127.0.0.1——和另外两种客人机一个规矩，
+    /// 外面连不进来。
+    var hostPort: Int
+    /// 客人机里的 vsock 端口。**客人机里得有程序监听这个端口**，
+    /// macOS 客人机默认没有（它的 sshd 只听 TCP），见 MacVsockProxy 的注释。
+    var guestPort: Int
+
+    var id: String { "\(hostPort)>\(guestPort)" }
+
+    enum CodingKeys: String, CodingKey {
+        case hostPort = "host_port"
+        case guestPort = "guest_port"
     }
 }
 
@@ -185,6 +285,161 @@ enum MacVMPaths {
             throw MacVMError("\(what) 的路径不在该在的目录里：\(c)（应在 \(p) 下）")
         }
     }
+
+    /// 共享目录名的白名单。和 validateTag 同一套字符集：这个名字会拼进
+    /// /Volumes/<名字>，也会被用户敲进 shell，只放字母数字和 - _ .
+    ///
+    /// 为什么不用 VZMultipleDirectoryShare.validateName:error: 那个：实测
+    /// 它认为 "my dir"（带空格）是合法名字，而带空格的名字在 /Volumes/ 下
+    /// 每一条 shell 命令都要加引号，纯属给用户找事。我们自己拦严一点。
+    static func validateShareName(_ name: String) throws {
+        let ok = !name.isEmpty && name.count <= 64
+            && name.allSatisfy { $0.isLetter || $0.isNumber
+                || $0 == "-" || $0 == "_" || $0 == "." }
+            && !name.hasPrefix(".")
+            && !name.contains("..")
+        if !ok {
+            throw MacVMError("挂载名只能含字母、数字、- _ .，不能以点开头、不能含 ..，"
+                             + "且不超过 64 个字符：\(name)")
+        }
+    }
+
+    /// 宿主机共享目录：展开 ~、规整路径、确认真的存在而且是个目录。
+    ///
+    /// 为什么要规整：`URL(fileURLWithPath:)` 不解析 `..`，`~/a/../b` 和 `~/b`
+    /// 指向同一个目录——存的时候就存规整过的（见 macParseShare），界面里显示的
+    /// 路径才和磁盘上的一致。这里再规整一次是给手改过的配置兜底。
+    ///
+    /// 只规整、**不解软链接**，用 FileManager.fileExists(isDirectory:) 判目录：
+    ///   1. 它会顺着链接看下去，`/tmp`、`/var` 这种系统符号链接能得到正确结果。
+    ///   2. URL.resourceValues(isDirectory) 实测对 /tmp 返回 false（它对链接
+    ///      本身作答，isSymbolicLink 才是 true），于是「共享 /tmp」会被一句
+    ///      「不存在或者不是目录」挡掉，而那个目录明明是好的。
+    ///   3. URL.resolvingSymlinksInPath() 也不可靠：实测它解得了自己建的链接，
+    ///      却解不了 /tmp → /private/tmp。
+    /// 存用户给的路径（规整后）而不是解过的：客人机那边由 VZ 自己去解，
+    /// 而用户看到的路径应该和他选的一致。
+    static func validateShareDir(_ path: String) throws -> URL {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/"), !expanded.contains("..") else {
+            throw MacVMError("共享目录要给绝对路径，而且不能含 ..：\(path)")
+        }
+        let url = URL(fileURLWithPath: expanded).standardizedFileURL
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+              isDir.boolValue else {
+            throw MacVMError("共享目录不存在或者不是目录：\(url.path)")
+        }
+        return url
+    }
+
+    /// 端口范围。1024 以下要 root，而这个项目不要求以 root 跑；
+    /// 0 和大于 65535 的压根不是端口。
+    ///
+    /// **只用于宿主机 TCP 端口。** 客人机的 vsock 端口不归这条管——那是另一套
+    /// 端口空间，转发 SSH 要的恰恰就是客人机里的 22（vzvm 的 vsockPort 就是
+    /// 22）。见 validateForwards。
+    static func validatePort(_ port: Int, what: String) throws {
+        guard (1024...65535).contains(port) else {
+            throw MacVMError("\(what)要给 1024 到 65535 之间，你给了 \(port)。"
+                + "1024 以下要 root 权限，而这个工具不要求以 root 跑。")
+        }
+    }
+
+    /// 客人机 vsock 端口的范围。vsock 是独立的 32 位端口空间，和宿主机的
+    /// 特权端口规矩无关，所以下限是 1 而不是 1024。
+    static func validateGuestPort(_ port: Int) throws {
+        guard (1...65535).contains(port) else {
+            throw MacVMError("客人机 vsock 端口要给 1 到 65535 之间，你给了 \(port)。")
+        }
+    }
+
+    /// 整份共享目录列表的校验：名字不能重复（VZMultipleDirectoryShare 的
+    /// 字典键撞了会静默少挂一个目录），宿主机路径也不能重复（挂两遍同一个
+    /// 目录没有意义）。
+    static func validateShares(_ shares: [MacVMShare]) throws {
+        var names = Set<String>()
+        var paths = Set<String>()
+        for sh in shares {
+            try validateShareName(sh.name)
+            let url = try validateShareDir(sh.hostPath)
+            if !names.insert(sh.name).inserted {
+                throw MacVMError("挂载名重复了：\(sh.name)。每个共享目录要一个不同的名字。")
+            }
+            if !paths.insert(url.path).inserted {
+                throw MacVMError("宿主机目录重复了：\(url.path)。同一个目录挂两遍没有意义。")
+            }
+        }
+    }
+
+    /// 整份转发列表的校验：端口合法、宿主机端口不能重复（两个监听绑同一个
+    /// 端口必有一个起不来）。客人机端口不去比对——那是客人机里的事。
+    static func validateForwards(_ forwards: [MacVMForward]) throws {
+        var hostPorts = Set<Int>()
+        for f in forwards {
+            try validatePort(f.hostPort, what: "宿主机端口")
+            try validateGuestPort(f.guestPort)
+            if !hostPorts.insert(f.hostPort).inserted {
+                throw MacVMError("宿主机端口重复了：\(f.hostPort)。"
+                    + "两条转发不能用同一个宿主机端口。")
+            }
+        }
+    }
+}
+
+// MARK: - 共享目录 / 端口转发的命令行解析 --
+
+/// "~/code:code" → MacVMShare。路径里有冒号也不会切错：按最后一个冒号切，
+/// 而挂载名过白名单（不含冒号），所以最后一个冒号一定是分隔符。
+///
+/// 可选的第三段 "ro" 表示只读：`--share ~/code:code:ro`。
+func macParseShare(_ s: String) throws -> MacVMShare {
+    var readOnly = false
+    var text = s
+    if let i = text.lastIndex(of: ":"), String(text[i...].dropFirst()) == "ro" {
+        readOnly = true
+        text = String(text[..<i])
+    }
+    guard let i = text.lastIndex(of: ":") else {
+        throw MacVMError("共享目录要写成 宿主路径:挂载名，例如 ~/code:code。你给了 \(s)")
+    }
+    let path = String(text[..<i]).trimmingCharacters(in: .whitespaces)
+    let name = String(text[i...].dropFirst()).trimmingCharacters(in: .whitespaces)
+    if path.isEmpty || name.isEmpty {
+        throw MacVMError("共享目录要写成 宿主路径:挂载名，例如 ~/code:code。你给了 \(s)")
+    }
+    try MacVMPaths.validateShareName(name)
+    // 存规整过的绝对路径。启动时还会再校验一次（配置可能被手改），但存的
+    // 时候就规整，界面里显示的路径才和磁盘上的一致。
+    let url = try MacVMPaths.validateShareDir(path)
+    return MacVMShare(hostPath: url.path, name: name, readOnly: readOnly)
+}
+
+/// "2222:22" → MacVMForward。宿主机端口:客人机 vsock 端口。
+func macParseForward(_ s: String) throws -> MacVMForward {
+    let parts = s.split(separator: ":", omittingEmptySubsequences: false)
+    guard parts.count == 2,
+          let host = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+          let guest = Int(parts[1].trimmingCharacters(in: .whitespaces)) else {
+        throw MacVMError("端口转发要写成 宿主机端口:客人机端口，例如 2222:22。你给了 \(s)")
+    }
+    try MacVMPaths.validatePort(host, what: "宿主机端口")
+    try MacVMPaths.validateGuestPort(guest)
+    return MacVMForward(hostPort: host, guestPort: guest)
+}
+
+/// 把一串 "路径:名字" 解析成一份合法列表。命令行用。
+func macParseShares(_ list: [String]) throws -> [MacVMShare] {
+    let out = try list.map(macParseShare)
+    try MacVMPaths.validateShares(out)
+    return out
+}
+
+/// 把一串 "宿主机:客人机" 解析成一份合法列表。命令行用。
+func macParseForwards(_ list: [String]) throws -> [MacVMForward] {
+    let out = try list.map(macParseForward)
+    try MacVMPaths.validateForwards(out)
+    return out
 }
 
 // MARK: - 大小解析 --
@@ -284,6 +539,10 @@ func macReadPID(_ name: String) -> Int32? {
 ///
 /// 所以 app 侧写 `app:<pid>`，vmz 侧写 `vmz:<pid>`。vmz stop 只对
 /// vmz 宿主发信号，见到 app 宿主就说明「请在 app 里关机」。
+///
+/// 这个值由 `MacVMRuntime.start(spec:provision:host:)` 的调用方给。
+/// 原来 start 里硬编码 "app"，于是 `vmz start` 起的机器也记成 app 宿主，
+/// 用户想停自己刚起的 VM 只会收到「正在 AgentVM app 里运行」。
 func macWritePID(_ name: String, _ pid: Int32, host: String = "vmz") {
     try? Data("\(host):\(pid)\n".utf8).write(to: MacVMPaths.pidFile(name))
 }
@@ -376,6 +635,13 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
     private let part: URL          // 进行中的文件
     private let fh: FileHandle
     private let lock = NSLock()
+    /// 第一个错误。delegate 回调和 run() 都会碰它，单独一把锁。
+    private let failLock = NSLock()
+    private var firstError: Error?
+    /// run() 建的等待组和并发闸门。task 收尾时由 didComplete 放行，
+    /// 所以它们得是属性而不是 run() 的局部变量。
+    private var group: DispatchGroup?
+    private var limit: DispatchSemaphore?
     private var doneBytes: Int64
     private let total: Int64
     private let startedAt = Date()
@@ -384,12 +650,30 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
     private let onProgress: (Double, Int64, Int64, Double) -> Void
     /// 每 64 MB 更新一次 checkpoint，见 macPartialBytes 的注释。
     private let ckptEvery: Int64 = 64 * 1024 * 1024
+    /// 一个 task 的段状态，key 是 URLSessionTask.taskIdentifier。
+    ///
+    /// 原来是三个共享变量 segOffset/segWant/segGot，那是错的：6 个连接并发时
+    /// 任意一个 task 收到 response 都会把这三个值覆盖掉，于是段 1 的数据写到
+    /// 段 0 的位置、段 2 的写到段 1 的位置，整个文件错位；而每段各自都「收满
+    /// 了」，段长校验抓不到。必须按 task 分开存。
+    private struct SegState {
+        var offset: Int64   ///< 这段在文件里的起始偏移，-1 = 服务端没给 Content-Range
+        var want: Int       ///< 这段应收的字节数，-1 同上
+        var got: Int        ///< 已收字节数
+    }
+    private var segs: [Int: SegState] = [:]
+    /// 已完整落盘、且从文件开头连续的前缀长度。checkpoint 只记这个值。
+    /// 记「已收总和」是错的：靠后的段先完成就会把值推过还没下载的前缀，
+    /// 下次从那儿续传，finish() 只校验大小 → 得到一个大小正确、头部是
+    /// 零洞的「完整」IPSW，VZMacOSRestoreImage.load 报读不了，重跑多少次
+    /// 都一样。这正是 macPartialBytes 注释里那个坑的同源变体。
+    private var contiguous: Int64
+    /// 已完整落盘、但还没并进 contiguous 的段。记 (起始偏移, 段长) 而不是
+    /// 只记偏移：最后一段通常不足一个整段，步进要用它的真实长度，
+    /// 否则 contiguous 会冲过 total，finish() 的相等判断永远不成立。
+    private var pendingSegs: [(offset: Int64, len: Int)] = []
+    /// 每 64 MB 更新一次 checkpoint，见 macPartialBytes 的注释。
     private var nextCkpt: Int64
-    /// 每一段已收到的字节数。URLSessionDataDelegate 是逐块回调的，
-    /// 靠它拼出「这一段写完了没有」，写完了才能更新 doneBytes。
-    private var segGot = 0
-    private var segWant = 0
-    private var segOffset = 0
 
     init(dest: URL, total: Int64, alreadyHave: Int64,
          onProgress: @escaping (Double, Int64, Int64, Double) -> Void) throws {
@@ -400,6 +684,7 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
         self.lastReportBytes = alreadyHave
         self.nextCkpt = alreadyHave + 64 * 1024 * 1024
         self.onProgress = onProgress
+        self.contiguous = alreadyHave
         try FileManager.default.createDirectory(
             at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
         // .part 已存在就接着写，不存在就建一个稀疏文件。
@@ -434,7 +719,7 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
             off = end + 1
         }
         if segments.isEmpty {
-            finish()
+            try finish()
             return
         }
 
@@ -442,8 +727,8 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
         // 并发上限。不是越多越好：实测 6 个连接就到 18.8 MB/s，
         // 再往上单连接速度反而掉（CDN 侧限流）。
         let limit = DispatchSemaphore(value: max(2, connections))
-        let failLock = NSLock()
-        var firstError: Error?
+        self.group = group
+        self.limit = limit
 
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil          // 见类注释第 1 条
@@ -459,75 +744,68 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
         defer { session.finishTasksAndInvalidate() }
 
         for seg in segments {
-            failLock.lock()
-            let failed = firstError != nil
-            failLock.unlock()
-            if failed { break }
+            if hasFailed() { break }
 
             limit.wait()
             group.enter()
             var req = URLRequest(url: url)
             req.setValue("bytes=\(seg.offset)-\(seg.end)", forHTTPHeaderField: "Range")
             req.cachePolicy = .reloadIgnoringLocalCacheData
-            session.dataTask(with: req) { [weak self] _, resp, err in
-                defer { group.leave(); limit.signal() }
-                guard let self else { return }
-                func fail(_ e: Error) {
-                    failLock.lock()
-                    if firstError == nil { firstError = e }
-                    failLock.unlock()
-                }
-                if let err { fail(err); return }
-                guard let http = resp as? HTTPURLResponse else {
-                    fail(MacVMError("下载服务端没有返回数据")); return
-                }
-                // 探活已经确认支持 Range，这里再见到 200 说明中间换了端点，
-                // 照常写会把 25 GB 全塞进第一段的位置。
-                if http.statusCode == 200 {
-                    if seg.offset != 0 {
-                        fail(MacVMError("下载服务端突然不支持 Range 了，无法继续"))
-                        return
-                    }
-                } else if http.statusCode != 206 {
-                    fail(MacVMError("下载服务端返回 HTTP \(http.statusCode)，无法继续"))
-                    return
-                }
-                self.lock.lock()
-                let got = self.segGot
-                self.lock.unlock()
-                if got != seg.end - seg.offset + 1 {
-                    fail(MacVMError("第 \(seg.offset) 段少收了 \(seg.end - seg.offset + 1 - got) 字节"))
-                    return
-                }
-            }.resume()
+            // 关键：不带 completionHandler。带上它 Foundation 会用内部委托
+            // 消费掉 didReceive response/data，self 那两个回调一次都不会来
+            // （实测：48 MB 下载「完成」后 .part 是全零），边收边写整个失效。
+            // 段没收满的判定移到 urlSession(_:task:didCompleteWithError:)。
+            let task = session.dataTask(with: req)
+            lock.lock()
+            segs[task.taskIdentifier] = SegState(offset: Int64(seg.offset),
+                                                 want: seg.end - seg.offset + 1,
+                                                 got: 0)
+            lock.unlock()
+            task.resume()
         }
 
         group.wait()
 
-        failLock.lock()
-        let err = firstError
-        failLock.unlock()
-        if let err { throw err }
-        finish()
+        if let err = firstError { throw err }
+        try finish()
     }
 
-    /// 收尾：确认大小、写 checkpoint、rename 成正式名。
-    private func finish() {
+    private func hasFailed() -> Bool {
+        failLock.lock()
+        defer { failLock.unlock() }
+        return firstError != nil
+    }
+
+    /// 收尾：确认每一段都完整落盘、再 rename 成正式名。
+    /// 收尾：确认每一段都完整落盘、再 rename 成正式名。
+    ///
+    /// 不完整时**必须**抛错，不能静默返回。静默的话调用方看到的是「下载成功」，
+    /// 而 /tmp 里既没有正式文件也没有 .part（被 finish 关掉了），重跑会从零
+    /// 开始——用户看到的是装到一半报错，或者更糟：以为下完了。
+    private func finish() throws {
         lock.lock()
+        // 必须确认「从文件开头连续完整的前缀 == 总大小」。只比对文件大小是
+        // 不够的：多段并发下靠后的段可能先写完，文件大小到了而中间还是零洞，
+        // 那种文件装到一半才报错，而且重跑多少次都一样。
+        let complete = contiguous == total
+        let have = contiguous
         defer { lock.unlock() }
-        let actual = (try? fh.offsetInFile) ?? 0
+        // 关之前先把元数据刷下去。不 synchronize 就 rename，断电可能得到
+        // 一份元数据是新的、数据块还是旧的 IPSW。
+        try? fh.synchronize()
         try? fh.close()
-        guard actual == UInt64(total) else {
-            // 大小不对就留在 .part 里，下次重跑接着下。不 rename——
-            // 一个不完整的正式文件会被 macDownloadedBytes 当成「已下完」，
-            // 正是这个类要修的那个坑。
-            return
+        // 不完整就留在 .part 里，下次重跑接着下。不 rename——一个不完整的
+        // 正式文件会被 macDownloadedBytes 当成「已下完」，正是这个类要修
+        // 的那个坑。
+        guard complete else {
+            throw MacVMError("下载不完整：已确认落盘 \(macHuman(UInt64(have)))，"
+                + "需要 \(macHuman(UInt64(total)))。再跑一次会接着下。")
         }
         try? FileManager.default.removeItem(at: dest)
         do {
             try FileManager.default.moveItem(at: part, to: dest)
         } catch {
-            return
+            throw MacVMError("下载完了但写不出去：\(error.localizedDescription)")
         }
         try? FileManager.default.removeItem(at: part.appendingPathExtension("ckpt"))
         onProgress(1.0, total, total, 0)
@@ -562,14 +840,14 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
             .value(forHTTPHeaderField: "Content-Range") ?? ""
         // "bytes 12345-23456/25595954706"
         let parts = rng.split(separator: " ")
+        var st = SegState(offset: -1, want: -1, got: 0)
         if parts.count == 2, let dash = parts[1].split(separator: "/").first {
             let b = dash.split(separator: "-")
             if b.count == 2, let s = Int(b[0]), let e = Int(b[1]) {
-                segOffset = s
-                segWant = e - s + 1
-                segGot = 0
+                st = SegState(offset: Int64(s), want: e - s + 1, got: 0)
             }
         }
+        segs[dataTask.taskIdentifier] = st
         lock.unlock()
         completionHandler(.allow)
     }
@@ -580,25 +858,81 @@ final class SegmentedDownloader: NSObject, URLSessionDataDelegate {
         // 内存峰值只有一段（8 MB）而不是整个文件。这是这个 delegate 存在的
         // 全部理由——dataTask 的 completion 形式会把整段 Data 交上来，
         // 服务端忽略 Range 时那就是 25 GB。
+        guard var st = segs[dataTask.taskIdentifier], st.offset >= 0 else {
+            lock.unlock()
+            return
+        }
         do {
-            try fh.seek(toFileOffset: UInt64(segOffset + segGot))
+            // seek 自 macOS 13 起不再抛错，write 仍会。
+            fh.seek(toFileOffset: UInt64(st.offset) + UInt64(st.got))
             try fh.write(contentsOf: data)
-            segGot += data.count
+            st.got += data.count
+            segs[dataTask.taskIdentifier] = st
             doneBytes += Int64(data.count)
             let done = doneBytes
             let needCkpt = done >= nextCkpt
             lock.unlock()
-            if needCkpt { writeCkpt(done) }
+            if needCkpt { writeCkpt() }
             report(done: done)
         } catch {
             lock.unlock()
         }
     }
 
-    /// 写 checkpoint。原子：先写临时文件再 rename。
-    private func writeCkpt(_ done: Int64) {
+    /// 一个 task 收尾。段没收满就是失败：服务端中途断了、换了端点、或者
+    /// 压根没返回 206（那种情况 want 是 -1）。
+    ///
+    /// 段长校验必须放在这儿，不能放在 run() 里那个 completion 闭包——
+    // 带 completionHandler 的 dataTask 会让上面两个 delegate 一次都不回调
+    //（ Foundation 用内部委托把数据消费掉了），边收边写整个失效。
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
         lock.lock()
-        nextCkpt = done + ckptEvery
+        let st = segs.removeValue(forKey: task.taskIdentifier)
+        var problem: Error?
+        if let e = error {
+            problem = e
+        } else if st == nil {
+            problem = MacVMError("下载任务异常结束")
+        } else if st!.want < 0 {
+            problem = MacVMError("下载服务端没有返回 Content-Range，无法续传")
+        } else if st!.got != st!.want {
+            problem = MacVMError("第 \(st!.offset) 段少收了 \(st!.want - st!.got) 字节")
+        } else {
+            pendingSegs.append((st!.offset, st!.got))
+            advanceContiguous()
+        }
+        lock.unlock()
+        group?.leave()
+        limit?.signal()
+        if let problem { fail(problem) }
+    }
+
+    /// 把已完整落盘的段并进连续前缀。调用方必须持有 lock。
+    private func advanceContiguous() {
+        var next = contiguous
+        while let i = pendingSegs.firstIndex(where: { $0.offset == next }) {
+            next += Int64(pendingSegs[i].len)
+            pendingSegs.remove(at: i)
+        }
+        contiguous = next
+    }
+
+    /// 记下第一个错误并让 run() 尽早收工。多个 task 并发失败时只留第一个。
+    private func fail(_ e: Error) {
+        failLock.lock()
+        if firstError == nil { firstError = e }
+        failLock.unlock()
+    }
+
+    /// 写 checkpoint。原子：先写临时文件再 rename。
+    ///
+    /// 记的是 contiguous（从开头连续完整落盘的前缀），不是已收总和——后者会
+    /// 在靠后的段先完成时虚高，续传就跳到一段还是零洞的地方。
+    private func writeCkpt() {
+        lock.lock()
+        let done = contiguous
+        nextCkpt = doneBytes + ckptEvery
         lock.unlock()
         let ck = part.appendingPathExtension("ckpt")
         let tmp = ck.appendingPathExtension("tmp")
@@ -661,11 +995,19 @@ func macFetchIPSW(_ url: URL, dest: URL,
     if have > total {
         // 服务端换了文件（版本更新）。留着旧的只会校验失败，删掉重下。
         try? FileManager.default.removeItem(at: dest)
+    } else if have > 0 {
+        // 同名但大小不一样：上一次下到一半被 rename 过，或者换了个版本。
+        // 接着写会在头部留出 have 字节的零洞，而 finish() 只校验大小——
+        // 得到一个大小正确、头部全零的 IPSW，装到一半才报错。
+        try? FileManager.default.removeItem(at: dest)
     }
-    // 续传起点：正式名已经有的一部分（理论上不会，正式名只在下完时出现）
-    // 加上 .part 里已确认落盘的部分。
-    let resume = min(have, total) + macPartialBytes(part)
-    let dl = try SegmentedDownloader(dest: dest, total: total, alreadyHave: resume,
+    // 续传起点必须落在段边界上，否则第一段是短段，段完成后算连续前缀的
+    // 步进会错位。向下取整到整段，最多重下一段（8 MB）。
+    let seg = 8 * 1024 * 1024
+    let ceiling = (Int(total) / seg) * seg
+    let aligned = (Int(macPartialBytes(part)) / seg) * seg
+    let resume = min(aligned, ceiling)
+    let dl = try SegmentedDownloader(dest: dest, total: total, alreadyHave: Int64(resume),
                                      onProgress: onProgress)
     try dl.run(url: url)
 }
@@ -737,6 +1079,52 @@ func macMakeConfiguration(spec: MacVMSpec) throws -> VZVirtualMachineConfigurati
     net.attachment = VZNATNetworkDeviceAttachment()
     cfg.networkDevices = [net]
 
+    // ---- virtiofs 共享目录 ----
+    //
+    // tag 只能用 VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag，
+    // 不能自己起一个。lima 的源码注释明确警告：通用 sharing device 在 macOS
+    // 客人机上「能挂但访问会 Operation not permitted」，必须用这个自动挂载 tag，
+    // 客人才会把它挂到 /Volumes/<共享目录名> 并且真能读写。
+    //
+    // 那个常量的**运行时值不要硬编码**：实测 macOS 27.0.1 上它是
+    // "com.apple.virtio-fs.automount"，而网上流传的是
+    // "com.apple.vz.virtio-fs.automount"——照着抄会得到一个客人机不认的 tag，
+    // 症状是 /Volumes 里什么都没有，而宿主机这边一切正常。直接用常量。
+    if !spec.shares.isEmpty {
+        // 配置可能被手改过，启动时再校验一次。目录不存在时 VZ 那边的错误
+        // 只有一句「validate 失败」，看不出是哪个共享目录有问题。
+        try MacVMPaths.validateShares(spec.shares)
+        var dirs: [String: VZSharedDirectory] = [:]
+        for sh in spec.shares {
+            let url = try MacVMPaths.validateShareDir(sh.hostPath)
+            dirs[sh.name] = VZSharedDirectory(url: url, readOnly: sh.readOnly)
+        }
+        let fs = VZVirtioFileSystemDeviceConfiguration(
+            tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
+        // 多个目录用一个设备：VZMultipleDirectoryShare 的字典键就是客人机
+        // /Volumes/ 下的名字。名字非法时这个 init 抛的是 ObjC 异常（进程直接
+        // 崩，Swift catch 不住），所以上面必须先过白名单。
+        fs.share = VZMultipleDirectoryShare(directories: dirs)
+        cfg.directorySharingDevices = [fs]
+    }
+
+    // ---- vsock ----
+    //
+    // 一个 VM 只允许一个 vsock 设备（Apple 头文件原话 "Only one Virtio socket
+    // device can be used per virtual machine"），所以所有转发共用这一个设备，
+    // 端口区分在宿主机侧的代理里做（见 MacVsockProxy）。
+    //
+    // 没有转发时不起这个设备：macOS 客人机对设备个数是挑的，配错了 validate()
+    // 直接拒，而报错只有一句看不懂的话。少配一个用不上的设备少一个风险。
+    //
+    // 端口在这儿先校验一遍：宿主机端口随后要转成 UInt16 去 bind，而
+    // UInt16(70000) 是**直接陷阱**（Swift 的整数转换溢出会崩进程），不是抛错。
+    // 配置可能被手改过，不能假设它一定合法。
+    if !spec.forwards.isEmpty {
+        try MacVMPaths.validateForwards(spec.forwards)
+        cfg.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+    }
+
     return cfg
 }
 
@@ -803,8 +1191,20 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
     /// 这一次启动有没有真的带上 provisioning。只有真带上了才该把
     /// spec.provisioned 置 true——见 start() 末尾的注释。
     private(set) var didProvision = false
+    /// vsock 端口转发代理。没有转发时是 nil。只在启动成功后建、VM 真停了才拆。
+    private var _vsockProxy: MacVsockProxy?
 
-    func start(spec: MacVMSpec, provision: Bool) throws {
+    private var vsockProxy: MacVsockProxy? {
+        get { propLock.lock(); defer { propLock.unlock() }; return _vsockProxy }
+        set { propLock.lock(); _vsockProxy = newValue; propLock.unlock() }
+    }
+
+    /// 启动。`host` 写进 pid 文件，标记这个 VM 归谁（见 macWritePID）。
+    ///
+    /// 默认 "app" 是故意选的安全侧：万一调用方忘了给，`vmz stop` 会拒绝发
+    /// 信号并让用户去 app 里关机；而默认 "vmz" 的话，忘给的那一方（app）会被
+    /// `vmz stop` 一发 SIGTERM 连整个 app 杀掉。前者只是烦，后者是数据损坏。
+    func start(spec: MacVMSpec, provision: Bool, host: String = "app") throws {
         if vm != nil { return }          // 已经在跑，别起第二个
         specName = spec.name
         let cfg: VZVirtualMachineConfiguration
@@ -818,11 +1218,14 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
             onFailed?(error.localizedDescription)
             throw error
         }
+        // 端口预检放在启动之前：等 VM 起来了才发现宿主机端口被占用，用户白等
+        // 一次启动，而错误只有日志里一行 warn。在这儿失败，启动压根不开始。
+        try macAssertPortsFree(spec.forwards)
         let machine = VZVirtualMachine(configuration: cfg, queue: vmQueue)
         machine.delegate = self
         self.vm = machine
         macWritePID(spec.name, Int32(ProcessInfo.processInfo.processIdentifier),
-                    host: "app")
+                    host: host)
 
         var opts: VZMacOSVirtualMachineStartOptions?
         if provision, #available(macOS 27.0, *) {
@@ -889,7 +1292,46 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
             }
             if let err { throw startFailed(spec, err) }
         }
+        // vsock 端口转发。放在启动成功之后：设备是 machine.socketDevices 里的
+        // 那一个，VM 没起来之前拿不到。
+        installVsockProxy(machine, forwards: spec.forwards)
         DispatchQueue.main.async { self.state = machine.state }
+    }
+
+    /// 把端口转发代理装起来。绑不上端口时**不停虚拟机**——VM 本身是好的，
+    /// 少一个转发比用户等半天启动然后什么都没有强，但错误必须说出来。
+    private func installVsockProxy(_ machine: VZVirtualMachine, forwards: [MacVMForward]) {
+        guard !forwards.isEmpty else { return }
+        // socketDevices 是 VZ 的属性，照这个项目的老规矩在 vmQueue 上读。
+        var device: VZVirtioSocketDevice?
+        let box = Box()
+        vmQueue.async {
+            device = machine.socketDevices.first(where: { $0 is VZVirtioSocketDevice })
+                as? VZVirtioSocketDevice
+            box.sem.signal()
+        }
+        box.sem.wait()
+        guard let device else {
+            MacEmit.log("配置了端口转发，但 VM 上没有 vsock 设备（socketDevices 是空的）。"
+                + "这一次启动不带端口转发。", level: "warn")
+            return
+        }
+        let proxy = MacVsockProxy(vmQueue: vmQueue)
+        do {
+            try proxy.start(forwards: forwards, device: device)
+            vsockProxy = proxy
+        } catch {
+            MacEmit.log("端口转发没起来：\(error.localizedDescription)"
+                + "（虚拟机照常运行，只是这条转发不通）", level: "warn")
+        }
+    }
+
+    /// 拆掉端口转发。VM 真的停了才调（guestDidStop / didStopWithError /
+    /// app 退出）——优雅停机超时的那个分支里客人机还在跑，代理要留着。
+    private func teardownVsockProxy() {
+        let p = vsockProxy
+        vsockProxy = nil
+        p?.stop()
     }
 
     private func startFailed(_ spec: MacVMSpec, _ err: Error) -> MacVMError {
@@ -911,13 +1353,21 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
     /// 摘掉、MacVMRuntime 释放、VZVirtualMachine 跟着释放，而客人机还在跑——
     /// 没有任何对象能再 stop() 它，一直占 CPU/内存到 app 退出，UI 上还显示
     /// 「已停止」。现在超时只是打个警告，vm 留着，还能再叫一次 stop。
-    func stop() {
-        guard let machine = vm else { return }
+    ///
+    /// `completion` 在停机真的结束（或等超时）之后调一次，跑在后台队列上，
+    /// `timedOut` 为 true 表示「没停成，客人机还在跑」。
+    ///
+    /// 为什么需要它：vmz 的信号 handler 原来写 `rt.stop(); exit(0)`——
+    /// stop 只是把 machine.stop 投递到 vmQueue 就返回，下一行 exit(0) 立刻
+    /// 把进程带走，客人机从没收到 ACPI 关机事件，那一下跟 kill -9 等效。
+    func stop(completion: ((_ timedOut: Bool) -> Void)? = nil) {
+        guard let machine = vm else { completion?(false); return }
         guard machine.canStop else {
             // 已经停了（或者正在停）。收尾。
             vm = nil
             try? FileManager.default.removeItem(at: MacVMPaths.pidFile(specName))
             DispatchQueue.main.async { self.state = .stopped }
+            completion?(false)
             return
         }
         DispatchQueue.main.async { self.state = .stopping }
@@ -935,18 +1385,53 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
                 MacEmit.log("优雅关机超时（客人机可能停在登录界面）。"
                     + "虚拟机仍在运行，可以再停一次，或者在客人机里选「关机」。",
                     level: "warn")
+                completion?(true)
                 return
             }
-            guard let self else { return }
+            guard let self else { completion?(false); return }
             self.vm = nil
             try? FileManager.default.removeItem(at: MacVMPaths.pidFile(self.specName))
             DispatchQueue.main.async { self.state = .stopped }
+            completion?(false)
         }
+    }
+
+    /// 同步优雅停机，停完了才返回。**只有 app 退出时用。**
+    ///
+    /// 为什么单独要一个同步版：进程马上就要没了，没有「等回调」的机会——
+    /// SwiftUI 不保证跑 .onDisappear，guestDidStop 也没人服务。原来 app
+    /// 退出等于直接拔电源，APFS 留下未干净的日志，下次启动跑好几分钟 fsck。
+    /// 超时不抛错：等不到也只能让进程走，但日志里要说清楚这次是非优雅停机。
+    func stopAndWait(timeout: TimeInterval = 45) {
+        guard let machine = vm else { return }
+        guard machine.canStop else {
+            // 已经停了（或者正在停）。收尾。
+            vm = nil
+            try? FileManager.default.removeItem(at: MacVMPaths.pidFile(specName))
+            DispatchQueue.main.async { self.state = .stopped }
+            return
+        }
+        DispatchQueue.main.async { self.state = .stopping }
+        // 代理先拆：进程马上就要没了，而桥里的 DispatchIO 还在跑的话，
+        // 退出时那些队列会被硬停，客人机侧的连接变成没人关的半开状态。
+        teardownVsockProxy()
+        let box = Box()
+        vmQueue.async { machine.stop { _ in box.sem.signal() } }
+        if box.sem.wait(timeout: .now() + timeout) == .timedOut {
+            MacEmit.log("退出时优雅关机等不到（等了 \(Int(timeout)) 秒）。"
+                + "这一次是非优雅停机，APFS 可能留下未干净的日志，下次启动会跑 fsck。",
+                level: "warn")
+            return
+        }
+        vm = nil
+        try? FileManager.default.removeItem(at: MacVMPaths.pidFile(specName))
+        DispatchQueue.main.async { self.state = .stopped }
     }
 
     // MARK: VZVirtualMachineDelegate
 
     func guestDidStop(_ vm: VZVirtualMachine) {
+        teardownVsockProxy()
         DispatchQueue.main.async {
             self.state = .stopped
             self.vm = nil
@@ -956,6 +1441,7 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
     }
 
     func vm(_ vm: VZVirtualMachine, didStopWithError error: Error) {
+        teardownVsockProxy()
         let msg = error.localizedDescription
         DispatchQueue.main.async {
             self.state = .stopped
@@ -969,6 +1455,465 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
         // 什么都不画：一块黑画面加一个绿点，用户只能猜，真实原因躺在
         // 一个没人看的字段里。
         onFailed?("虚拟机异常停止：\(msg)")
+    }
+}
+
+// MARK: - vsock 端口转发 --
+
+/// 宿主机侧的 vsock 端口转发代理：宿主机开 TCP 监听，每个连进来的连接换一条
+/// 到客人机 vsock 端点的连接，然后把两边的字节对着抽。
+///
+/// 为什么需要它：VZNATNetworkDeviceAttachment 至今没有公开的端口映射 API
+/// （运行时实测那个类只有 5 个方法，方法名里带 port 的有 0 个），vsock 是
+/// 唯一公开的进客路径。参考实现是 applicative-systems/vzvm 的 VsockProxy.swift
+/// （生产环境在给 Nix 的 Linux 客人机做 SSH 转发），这里照它的形状写，
+/// 但改成适配这个项目的几处：
+///   1. 端口占用直接报错，不学它那样等 60 秒——那是给 launchd 崩溃重启用的，
+///      我们是交互式启动，用户要知道端口被谁占了。
+///   2. 加一个看门狗超时。见下面坑1。
+///   3. 设备从 MacVMRuntime 传进来，不自己持有 VM。
+///
+/// 三个坑，每一个都查证过：
+///   1. **VZ 不告诉宿主客人机什么时候开始监听 vsock 端口。** Apple 头文件对
+///      connectToPort 的原话是 "Does nothing if the guest does not listen on
+///      that port"——也就是客人机没监听时 completion 可能压根不被调用。所以
+///      光靠 completion 的失败重试不够，额外加一个看门狗：到点没回调就当失败
+///      重试（vzvm 用的是 1500 ms × 60 次，这里一样）。
+///   2. **VZVirtioSocketDevice 必须在 VM 的 queue 上 touch**（项目里就是
+///      MacVMRuntime.vmQueue），所以 connect 和 connection.close() 都派发到
+///      那条队列上。
+///   3. **客人机里得有程序监听对应的 vsock 端口。** 这一点必须说清楚：
+///      vzvm 的客人机是 Linux，nix-daemon/sshd 直接听在 vsock 端口上；而
+///      macOS 客人机的 sshd 只听 TCP，系统里没有现成的 vsock 监听服务。
+///      所以转发链路本身是通的，但「ssh 127.0.0.1:xxxx 能进客人机」还需要
+///      客人机里有个听 vsock 的东西。启动日志里会把这句话打出来，
+///      不装作已经通了。
+final class MacVsockProxy {
+    /// 重试间隔和次数。vzvm 用 1500 ms × 60（合计 90 秒）——客人机从开机到
+    /// 服务就绪实测要几十秒，间隔太短只是空转。
+    private static let retryInterval = DispatchTimeInterval.milliseconds(1500)
+    private static let maxRetries = 60
+
+    private let vmQueue: DispatchQueue
+    private let lock = NSLock()
+    private var stopped = false
+    private var device: VZVirtioSocketDevice?
+    private var sources: [DispatchSourceRead] = []
+    /// 存活的桥。Bridge 自己把自己留在这个集合里，两个方向都结束了才摘。
+    private var bridges: Set<Bridge> = []
+
+    init(vmQueue: DispatchQueue) {
+        self.vmQueue = vmQueue
+    }
+
+    /// 开始转发。端口绑不上时抛错（调用方决定是报错还是只记一笔）。
+    func start(forwards: [MacVMForward], device: VZVirtioSocketDevice) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
+        self.device = device
+        var created: [DispatchSourceRead] = []
+        do {
+            for f in forwards {
+                try MacVMPaths.validateForwards([f])
+                let fd = try Self.bindLoopback(port: UInt16(f.hostPort))
+                // 每条转发一条自己的队列：accept 循环和桥都跑在这儿，
+                // 共用一条队列时一条慢连接会把别的转发一起堵住。
+                let q = DispatchQueue(label: "macvm.vsock.\(f.hostPort)", qos: .userInitiated)
+                let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: q)
+                let guestPort = UInt32(f.guestPort)
+                src.setEventHandler { [weak self] in
+                    self?.acceptOne(listenFD: fd, guestPort: guestPort)
+                }
+                // cancel handler 里关 fd。放在这儿而不是 stop() 里手动 close：
+                // source 的 cancel 是异步的，两边都关会 double close。
+                src.setCancelHandler { close(fd) }
+                created.append(src)
+                src.resume()
+                MacEmit.log("端口转发已就绪：127.0.0.1:\(f.hostPort) → 客人机 vsock 端口 \(f.guestPort)")
+            }
+        } catch {
+            // 起了一半失败：已经 resume 的 source 必须 cancel 之后再让它们释放。
+            // 直接释放一个还激活着的 DispatchSource，libdispatch 会断言失败
+            // （崩在整个进程上，而 Swift 接不住）。
+            for s in created { s.cancel() }
+            throw error
+        }
+        sources = created
+        if !forwards.isEmpty {
+            MacEmit.log("注意：客人机里需要有程序监听对应的 vsock 端口，"
+                + "这条转发才通。macOS 客人机默认没有这样的服务（它的 sshd 只听 TCP）。",
+                level: "warn")
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        guard !stopped else { lock.unlock(); return }
+        stopped = true
+        let srcs = sources
+        sources.removeAll()
+        let bs = bridges
+        bridges.removeAll()
+        device = nil
+        lock.unlock()
+        for s in srcs { s.cancel() }
+        for b in bs { b.close() }
+    }
+
+    // ------------------------------------------------------------ 监听 --
+
+    /// 在 127.0.0.1 上开一个监听 socket，返回 fd。
+    ///
+    /// 端口被占用时抛错，而且错误里带上怎么办：这个项目不要求 root，
+    /// 1024 以下的端口本来就绑不上，这两件事要分开说。
+    static func bindLoopback(port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw MacVMError("建不了 socket：\(String(cString: strerror(errno)))")
+        }
+        // SO_REUSEADDR：上一次的连接处于 TIME_WAIT 时也要能马上重绑，
+        // 否则「停掉再起」会随机失败，而失败原因是一句看不懂的 "Address
+        // already in use"。
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        // inet_addr 返回的已经是网络字节序，别再 htonl 一次。
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafeMutablePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bound != 0 {
+            let why = String(cString: strerror(errno))
+            close(fd)
+            var hint = ""
+            if errno == EADDRINUSE {
+                hint = "\n这个端口已经被别的程序占了。换一个端口，"
+                    + "或者先停掉那个程序（lsof -nP -iTCP:\(port) 能看出是谁）。"
+            } else if errno == EACCES {
+                hint = "\n1024 以下的端口要 root 权限，而这个工具不要求以 root 跑——"
+                    + "换一个 1024 以上的端口。"
+            }
+            throw MacVMError("宿主机端口 \(port) 绑不上：\(why)。\(hint)")
+        }
+        guard listen(fd, 128) == 0 else {
+            let why = String(cString: strerror(errno))
+            close(fd)
+            throw MacVMError("宿主机端口 \(port) listen 失败：\(why)")
+        }
+        // 非阻塞：accept 循环要把队列里排队的连接一次收干净。阻塞的 listen fd
+        // 会让第二次 accept 挂住，而 DispatchSourceRead 是电平触发的——
+        // 挂着不放，这个队列上别的事件（包括 stop）就全堵死了。
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        return fd
+    }
+
+    /// 把监听 fd 上排队的连接一次收干净。
+    private func acceptOne(listenFD fd: Int32, guestPort: UInt32) {
+        var accepted = 0
+        while true {
+            let client = accept(fd, nil, nil)
+            if client < 0 {
+                // 这几个 errno 是「没有更多连接了」而不是出错，别报警：
+                //   EAGAIN/EWOULDBLOCK —— 非阻塞 listen fd 收完之后的常态；
+                //   ECONNABORTED —— 客户端连上又立刻断开（扫端口、超时重试）；
+                //   EINTR —— 被信号打断，重试即可。
+                // 原来不管三七二十一都打一句 warn，表现是日志里周期性刷
+                // 「accept 失败：Resource temporarily unavailable」，
+                // 看着像坏了，其实一切正常。
+                let benign = errno == EAGAIN || errno == EWOULDBLOCK
+                    || errno == ECONNABORTED || errno == EINTR
+                if !benign, accepted == 0 {
+                    // accept 失败必须说。静默失败的症状是「端口听着但连上去
+                    // 就断」，而日志里一个字都没有。
+                    MacEmit.log("accept 失败：\(String(cString: strerror(errno)))",
+                                level: "warn")
+                }
+                break
+            }
+            accepted += 1
+            // SSH 是交互式的：小包也要马上发出去，不然敲一个字符顿一下。
+            var yes: Int32 = 1
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &yes,
+                       socklen_t(MemoryLayout<Int32>.size))
+            connect(client: client, guestPort: guestPort, attempt: 0)
+        }
+    }
+
+    // ------------------------------------------------------------ 连接 --
+
+    /// 把一条客户端连接送到客人机的 vsock 端口上，失败重试。
+    private func connect(client: Int32, guestPort: UInt32, attempt: Int) {
+        lock.lock()
+        let dev = device
+        let isStopped = stopped
+        lock.unlock()
+        if isStopped || dev == nil {
+            close(client)
+            return
+        }
+        guard let dev else { close(client); return }
+
+        // 只认第一个回调。看门狗超时之后旧的那次 connect 万一又成功了，
+        // 会多出一条没人管的连接——客人机那端要等到超时才断，而用户看到的是
+        // 「连上了但没反应」。所以迟到的成功要立刻关掉。
+        let finishLock = NSLock()
+        var finished = false
+
+        // 看门狗：Apple 头文件说客人机没监听时这个调用「does nothing」，
+        // completion 永远不来。干等会把客户端挂死，所以到点也算一次失败。
+        let watchdog = DispatchWorkItem { [weak self] in
+            finishLock.lock()
+            let first = !finished
+            finished = true
+            finishLock.unlock()
+            guard first, let self else { return }
+            self.retry(client: client, guestPort: guestPort, attempt: attempt,
+                       reason: "客人机还没监听 vsock 端口 \(guestPort)")
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.retryInterval,
+                                          execute: watchdog)
+
+        // VZVirtioSocketDevice 必须在 VM 的队列上 touch，见类注释坑2。
+        // 这个 completion 由 VZ 在调用时所用的队列上回调，也就是下面这条
+        // vmQueue——所以里面直接 close() 连接对象仍然满足「在 vmQueue 上」。
+        vmQueue.async { [weak self] in
+            dev.__connect(toPort: guestPort) { conn, err in
+                finishLock.lock()
+                let first = !finished
+                finished = true
+                finishLock.unlock()
+                watchdog.cancel()
+                guard first else {
+                    // 迟到的成功：没人要这条连接，关掉别泄漏。
+                    conn?.close()
+                    return
+                }
+                guard let self else {
+                    // 代理已经没了（VM 停了）。两边都要关，各漏一个 fd 的
+                    // 症状是「用着用着 descriptor 不够了」。
+                    conn?.close()
+                    close(client)
+                    return
+                }
+                if self.isStopped {
+                    // stop() 之后迟到的成功：VM 都没了，这条连接没有对端可接。
+                    conn?.close()
+                    close(client)
+                    return
+                }
+                if let conn {
+                    self.bridge(client: client, connection: conn)
+                } else {
+                    self.retry(client: client, guestPort: guestPort, attempt: attempt,
+                               reason: err?.localizedDescription ?? "没给原因")
+                }
+            }
+        }
+    }
+
+    /// 代理是不是已经停了。stop() 之后迟到的 connect 回调要靠它把连接收掉。
+    private var isStopped: Bool {
+        lock.lock(); defer { lock.unlock() }; return stopped
+    }
+
+    private func retry(client: Int32, guestPort: UInt32, attempt: Int, reason: String) {
+        // 客户端已经走了就别再等：等客人机就绪是把一条没人要的连接挂在那儿，
+        // 而挂着的连接会让客人机那侧的服务一直开着。
+        if Self.clientGone(client) {
+            MacEmit.log("客户端在客人机就绪之前就断开了（vsock \(guestPort)）")
+            close(client)
+            return
+        }
+        guard attempt < Self.maxRetries else {
+            MacEmit.log("等客人机监听 vsock 端口 \(guestPort) 等不到"
+                + "（等了 \(Self.maxRetries * 1500 / 60) 秒，最后一句：\(reason)），"
+                + "这条连接放弃。", level: "warn")
+            close(client)
+            return
+        }
+        if attempt == 0 {
+            // 说清楚在等什么。用户看到的是「ssh 卡住不动」，不知道卡在哪。
+            MacEmit.log("客人机还没监听 vsock 端口 \(guestPort)（\(reason)）。"
+                + "先挂着这条连接等它，最多 \(Self.maxRetries * 1500 / 60) 秒"
+                + "——客户端看到的是握手慢，不是连接被拒。")
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.retryInterval) {
+            [weak self] in
+            self?.connect(client: client, guestPort: guestPort, attempt: attempt + 1)
+        }
+    }
+
+    /// 客户端是不是已经走了。用 TCP 连接状态而不是 peek：SSH 客户端会先发
+    /// banner，未读的数据会把 FIN 挡住，peek 看不出来（vzvm 同一个坑）。
+    private static func clientGone(_ fd: Int32) -> Bool {
+        var info = tcp_connection_info()
+        var size = socklen_t(MemoryLayout<tcp_connection_info>.size)
+        guard getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &size) == 0 else {
+            return true     // 问不出来就当走了：宁可早断，别挂着一个死连接
+        }
+        return info.tcpi_state != TCPS_ESTABLISHED
+    }
+
+    // ------------------------------------------------------------ 桥 --
+
+    private func bridge(client: Int32, connection: VZVirtioSocketConnection) {
+        let b = Bridge(tcpFD: client, connection: connection, vmQueue: vmQueue) {
+            [weak self] finished in
+            guard let self else { return }
+            self.lock.lock()
+            self.bridges.remove(finished)
+            self.lock.unlock()
+        }
+        lock.lock()
+        bridges.insert(b)
+        lock.unlock()
+        b.start()
+    }
+}
+
+/// 把一条 TCP 连接和一条 vsock 连接对着抽，两个方向各一条 DispatchIO。
+///
+/// 单独一个类而不是闭包里硬写：它要自己把自己留在 MacVsockProxy 的集合里
+/// （两个方向都结束了才摘），还要在 VM 队列上关 VZ 的连接对象。
+private final class Bridge: Hashable {
+    private let tcpFD: Int32
+    /// 强引用：这个对象被释放时会自动关掉它的 fd，所以必须活到桥结束。
+    private let connection: VZVirtioSocketConnection
+    /// dup 出来的副本。DispatchIO 的清理处理器会关一次 fd，而那个 fd 归
+    /// VZVirtioSocketConnection 所有——两边都关就是 double close，之后新
+    /// accept 到的连接会拿到这个已经关掉的 fd 号，读写全错。vzvm 的 Bridge
+    /// 就是这么处理的。
+    private let vsockFD: Int32
+    private let vmQueue: DispatchQueue
+    private let queue = DispatchQueue(label: "macvm.vsock.bridge")
+    private let onFinish: (Bridge) -> Void
+    private var tcpIO: DispatchIO?
+    private var vsockIO: DispatchIO?
+    private var closed = false
+
+    init(tcpFD: Int32, connection: VZVirtioSocketConnection,
+         vmQueue: DispatchQueue, onFinish: @escaping (Bridge) -> Void) {
+        self.tcpFD = tcpFD
+        self.connection = connection
+        self.vmQueue = vmQueue
+        self.vsockFD = dup(connection.fileDescriptor)
+        self.onFinish = onFinish
+    }
+
+    func start() {
+        guard vsockFD >= 0 else {
+            close()
+            return
+        }
+        let tcp = DispatchIO(type: .stream, fileDescriptor: tcpFD, queue: queue) { _ in
+            Darwin.close(self.tcpFD)
+        }
+        let vsock = DispatchIO(type: .stream, fileDescriptor: vsockFD, queue: queue) { _ in
+            Darwin.close(self.vsockFD)
+        }
+        // 有字节就转发，不等缓冲区填满——SSH 敲一个字符也要马上过去。
+        tcp.setLimit(lowWater: 1)
+        vsock.setLimit(lowWater: 1)
+        tcpIO = tcp
+        vsockIO = vsock
+        pump(from: tcp, to: vsock)
+        pump(from: vsock, to: tcp)
+    }
+
+    private func pump(from source: DispatchIO, to sink: DispatchIO) {
+        // 这两个变量只在本队列上碰（read/write 的 handler 都跑在 queue 上）。
+        var writesInFlight = 0
+        var sourceDone = false
+        // 任一侧读完就整个拆掉。**不能做半关闭**：半关闭不会翻译成 vsock 的
+        // 关闭语义，客人机那侧的服务要等到超时才断——症状是 ssh 退出后
+        // 客人机里那个 sshd 会话还挂着。vzvm 在同一个地方留了同样的注释。
+        let teardown: () -> Void = { [weak self] in
+            if sourceDone && writesInFlight == 0 { self?.close() }
+        }
+        source.read(offset: 0, length: Int.max, queue: queue) { [weak self] done, data, error in
+            guard let self else { return }
+            if let data, !data.isEmpty {
+                writesInFlight += 1
+                sink.write(offset: 0, data: data, queue: self.queue) { written, _, writeError in
+                    // 写不动了就别等了：这条链路已经坏了，整个拆掉。
+                    if writeError != 0 { self.close(); return }
+                    if written {
+                        writesInFlight -= 1
+                        teardown()
+                    }
+                }
+            }
+            if done || error != 0 {
+                sourceDone = true
+                teardown()
+            }
+        }
+    }
+
+    func close() {
+        queue.async {
+            guard !self.closed else { return }
+            self.closed = true
+            self.tcpIO?.close(flags: .stop)
+            self.vsockIO?.close(flags: .stop)
+            // VZ 的对象也要在 VM 的队列上 touch，见 MacVsockProxy 类注释坑2。
+            self.vmQueue.async { self.connection.close() }
+            self.onFinish(self)
+        }
+    }
+
+    static func == (lhs: Bridge, rhs: Bridge) -> Bool { lhs === rhs }
+    func hash(into hasher: inout Hasher) { hasher.combine(ObjectIdentifier(self)) }
+}
+
+/// 启动前确认要转发的宿主机端口都空着。
+///
+/// 为什么单独做一次预检：代理自己 bind 失败时 VM 已经起来了，那时候只能记
+/// 一笔 warn——用户看到的是「启动成功了但转发不通」，而真实原因是端口撞了。
+/// 在这儿失败，启动压根不开始，错误直接到用户脸上。
+///
+/// 做法就是真的 bind 一次再关掉：SO_REUSEADDR 下这个检查和代理随后那次 bind
+/// 等价（都允许 TIME_WAIT，都不允许已被 listen 的端口），没有「检查通过但
+/// 随后绑不上」的口子。
+func macAssertPortsFree(_ forwards: [MacVMForward]) throws {
+    for f in forwards {
+        let fd = try MacVsockProxy.bindLoopback(port: UInt16(f.hostPort))
+        close(fd)
+    }
+}
+
+// MARK: - 磁盘空间 --
+
+/// 装之前确认这个卷装得下。不够就明确说差多少，别让用户白等。
+///
+/// 为什么要有：这条路上原来唯一和空间有关的动作是建盘时的
+/// `fh.truncate(atOffset:)`——稀疏盘 truncate 不分配块，所以它永远成功，
+/// 真正的失败发生在下载写到 90%（ENOSPC）或者安装过程的中途。那时用户
+/// 已经等了几十分钟，而「空间不够」这件事在开始之前花一次 statfs 就知道。
+///
+/// 估法：镜像（本地文件按精确大小；远程按 UniversalMac IPSW 的实测值
+/// 25.6 GB 估）+ 系统盘标称大小。快照和克隆走 clonefile，底册共用，
+/// 不额外算。
+func macAssertFreeSpace(ipsw: UInt64, disk: UInt64) throws {
+    let root = MacVMPaths.root
+    let free = (try? root.resourceValues(forKeys: [.volumeAvailableCapacityKey]))
+        .flatMap { $0.volumeAvailableCapacity } ?? 0
+    // 问不出来（只读挂载、网络卷）就不拦：误拦比漏拦烦人，
+    // 后面的下载和建盘会给出真正的错误。
+    guard free > 0 else { return }
+    let need = ipsw + disk
+    guard UInt64(free) >= need else {
+        throw MacVMError("磁盘空间不够：还需要约 \(macHuman(need))"
+            + "（镜像 \(macHuman(ipsw)) + 系统盘 \(macHuman(disk))），"
+            + "而 \(root.path) 所在的卷只剩 \(macHuman(UInt64(free)))。\n"
+            + "清出空间再装，或者把 --disk 改小。")
     }
 }
 
@@ -997,6 +1942,10 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
         guard FileManager.default.fileExists(atPath: ipswPath.path) else {
             throw MacVMError("找不到 IPSW：\(ipswPath.path)")
         }
+        // 本地镜像的大小是精确的，照它算。
+        let ipswSize = (try? FileManager.default
+            .attributesOfItem(atPath: ipswPath.path)[.size] as? UInt64) ?? 0
+        try macAssertFreeSpace(ipsw: ipswSize, disk: macParseSize(spec.disk))
         MacEmit.stage("catalog", "读取本地恢复镜像")
     } else {
         // 先问 Apple 要一份最新受支持的镜像地址。这个调用要 entitlement，
@@ -1008,6 +1957,13 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
         // Swift 6 把 ObjC 的 URL 属性重命名成 url。
         let remote = fetched.url
         ipswPath = MacVMPaths.ipsw(name, file: remote.lastPathComponent)
+        // 下载之前先确认装得下。已经下过的那份镜像不占新空间（ipsw: 0）；
+        // 没下过的按 UniversalMac 的实测大小 25.6 GB 往上取整成 26 GB 估
+        // ——远程拿不到精确大小（要 HEAD 一次，而 macFetchIPSW 自己会问），
+        // 宁可多估，也别让用户下到 90% 才失败。
+        try macAssertFreeSpace(
+            ipsw: macDownloadedBytes(ipswPath) > 0 ? 0 : 26 * 1024 * 1024 * 1024,
+            disk: macParseSize(spec.disk))
         if macDownloadedBytes(ipswPath) > 0 {
             MacEmit.log("复用已下载的 \(remote.lastPathComponent)", level: "info")
         } else {
@@ -1046,10 +2002,18 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
     }
     let minMem = requirement.minimumSupportedMemorySize
     if macParseSize(spec.ram) < minMem {
-        MacEmit.log("内存从 \(spec.ram) 提到 \(macHuman(UInt64(minMem)))"
+        // 提到「整数 GiB」再拼成 "4G" 这样的串。
+        //
+        // 原来是 macHuman() + 把 " GB" 替换成 "G"：ByteCountFormatter 的
+        // .file 风格是**十进制**单位，4 GiB 会显示成 "4.29 GB"，替换之后
+        // macParseSize 又按 1024³ 解析——同一个数字在两种单位制里各走一遍，
+        // 客人机实际拿到 4.29 GiB，而日志和界面上那句 "4.29G" 说的是另一回事。
+        // 向上取整到整 GiB，显示值和 VZ 真正拿到的字节数就是同一个数。
+        let gib = (minMem + 1024 * 1024 * 1024 - 1) / (1024 * 1024 * 1024)
+        let want = "\(gib)G"
+        MacEmit.log("内存从 \(spec.ram) 提到 \(want)"
             + "（这个 macOS 版本的最低要求）", level: "warn")
-        spec.ram = macHuman(UInt64(minMem)).replacingOccurrences(of: " GB", with: "G")
-            .replacingOccurrences(of: " MB", with: "M")
+        spec.ram = want
     }
     try Data(requirement.hardwareModel.dataRepresentation)
         .write(to: MacVMPaths.hardwareModel(name), options: .atomic)
@@ -1235,25 +2199,41 @@ func macSnapshotApply(_ name: String, tag: String) throws {
     guard FileManager.default.fileExists(atPath: src.path) else {
         throw MacVMError("没有叫 \(tag) 的快照")
     }
-    // 先 clone 到一个临时名，成功了才替换正式的 disk.img。
+    // 分两步，顺序是「先把活盘改名成备份，再让副本改回来」。
+    //
     // 原来是「先删活盘再 clonefile」：clonefile 一失败（空间不够、权限、
     // 快照文件损坏）系统盘就直接没了，而它是唯一一份——回滚失败比不回滚
-    // 糟得多。
+    // 糟得多。后来改成「删活盘 → move 副本」，仍然有窗口期：两步之间
+    // disk.img 这个文件名不存在，此刻断电 = 盘没了。
+    // 改名不删数据：任何一步失败，最坏的情况是盘躺在 .prev 里，
+    // 用户改个名就能回去。
     let dst = MacVMPaths.disk(name)
+    guard FileManager.default.fileExists(atPath: dst.path) else {
+        throw MacVMError("找不到系统盘（\(dst.lastPathComponent)），这个虚拟机可能还没装完。")
+    }
     let tmp = MacVMPaths.dir(name).appendingPathComponent("disk.img.rollback")
+    // 上一回回滚到一半留下的临时文件。留着会碍事（clonefile 要求目标不存在）。
     try? FileManager.default.removeItem(at: tmp)
     if clonefile(src.path, tmp.path, 0) != 0 {
         let e = String(cString: strerror(errno))
         try? FileManager.default.removeItem(at: tmp)
         throw MacVMError("回滚失败：\(e)。系统盘没有被改动。")
     }
-    try? FileManager.default.removeItem(at: dst)
+    let backup = MacVMPaths.dir(name).appendingPathComponent("disk.img.prev")
+    try? FileManager.default.removeItem(at: backup)
     do {
+        try FileManager.default.moveItem(at: dst, to: backup)
         try FileManager.default.moveItem(at: tmp, to: dst)
     } catch {
+        // 把活盘改回原名。第一步就失败的话 backup 还不存在，这次 move 会
+        // 白白失败，无所谓；第二步失败的话它真能把盘救回来。
+        try? FileManager.default.moveItem(at: backup, to: dst)
         throw MacVMError("回滚到 \(dst.path) 失败：\(error.localizedDescription)。"
-            + "副本还在 \(tmp.path)，可以手动改回去。")
+            + "系统盘没有被改动，副本还在 \(tmp.path)。")
     }
+    // 新盘已经上位，旧盘的备份可以删了。删不掉也只多一个没人看的 .prev，
+    // 比回滚失败好。
+    try? FileManager.default.removeItem(at: backup)
     MacEmit.log("已回滚到快照 \(tag)", level: "info")
 }
 
@@ -1261,7 +2241,19 @@ func macSnapshotList(_ name: String) -> [[String: Any]] {
     // list 也要校验名字。原来只有 create/apply/delete 校验：
     // `snapshot list --name ../../etc` 会把目录外的 .img 条目当快照列出来。
     // 只读、危害有限，但白名单漏一个入口就等于没有。
-    try? MacVMPaths.validateName(name)
+    //
+    // 必须是 do/catch 而不是 `try?`：静默丢掉错误的话，非法名字和「这台机器
+    // 真的没有快照」在调用方眼里一模一样（都是空列表），用户永远不知道是
+    // 名字写错了。
+    do {
+        try MacVMPaths.validateName(name)
+    } catch let e as MacVMError {
+        MacEmit.log(e.message, level: "warn")
+        return []
+    } catch {
+        MacEmit.log(error.localizedDescription, level: "warn")
+        return []
+    }
     let dir = MacVMPaths.snapshots(name)
     guard let files = try? FileManager.default.contentsOfDirectory(
         at: dir, includingPropertiesForKeys: [.fileSizeKey, .creationDateKey]) else { return [] }

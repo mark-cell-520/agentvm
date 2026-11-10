@@ -54,8 +54,21 @@ def _coerce(key: str, value: str, default, where: str):
     默认值是 int 而用户写了 `vm_memory_mb=abc` 时，isdigit() 为假，字符串原样留下，
     一路流到 create_vm 里的 `int(memory_mb) * 1048576` 才 ValueError 裸栈——
     报错指向一个跟配置毫无关系的内部行。VM_CPU=x 同理。
+
+    bool 要单独一条：`secure_boot=false` 原来原样返回字符串，而
+    `bool("false")` 是 True——用户在 .agentvmrc 里关不掉 Secure Boot，
+    改完一点变化都没有，而配置明明是那么写的。
     """
-    if not isinstance(default, int) or isinstance(default, bool):
+    if isinstance(default, bool):
+        low = str(value).strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+        raise BackendError(
+            f"{where}：{key} 要给 true/false，你给了 {value!r}"
+        ) from None
+    if not isinstance(default, int):
         return value
     try:
         return int(value)
@@ -83,6 +96,14 @@ def load_config() -> dict:
         "secure_boot": True,
         "tart_bin": str(Path.home() / ".local" / "bin" / "tart"),
         "qemu_img": "qemu-img",
+        # tart run 的三个透传参数，只有 tart 后端用得到。写成字符串而不是
+        # 列表：.agentvmrc 和环境变量天生是字符串，_coerce 也只认 bool/int
+        # 两种默认值类型，列表会让它原样返回一个 str，反而要到处判类型。
+        # 逗号分隔多条：tart_dirs=~/Shared:host,~/Code:code
+        #              tart_expose=8080:80,9090:443
+        "tart_dirs": "",
+        "tart_vnc": "",
+        "tart_expose": "",
     }
 
     rc = REPO_ROOT / ".agentvmrc"
@@ -108,6 +129,9 @@ def load_config() -> dict:
         "AGENTVM_SSH_PORT": "ssh_port",
         "AGENTVM_QEMU_IMG": "qemu_img",
         "AGENTVM_TART_BIN": "tart_bin",
+        "AGENTVM_TART_DIRS": "tart_dirs",
+        "AGENTVM_TART_VNC": "tart_vnc",
+        "AGENTVM_TART_EXPOSE": "tart_expose",
     }
     for env_key, cfg_key in env_map.items():
         if os.environ.get(env_key):
@@ -133,6 +157,10 @@ def info(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(f"  ok {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"  warn {msg}")
 
 
 # ---------------------------------------------------------------- 子命令 --
@@ -204,6 +232,11 @@ def cmd_start(args, cfg, backend) -> int:
     只是 args.func 里没有任何子命令调用它。
     """
     name = args.name or cfg["vm_name"]
+    # --dir / --vnc / --expose 只对 tart 后端有意义，Hyper-V 那边没有对应物，
+    # 给了也不生效。不报错：用户两边切换着用时不该为一条用不上的参数卡住。
+    if backend.name == "tart":
+        backend.set_share_options(
+            dirs=args.dir, vnc=args.vnc, expose=args.expose)
     backend.run_vm(name)
     try:
         backend.wait_ready(name)
@@ -253,27 +286,24 @@ def _push_secret(backend, name: str, b64: str, dest: str) -> None:
     同时送达。所以这里用 `sh -c` 收一个固定命令，让 base64 内容独占 stdin。
     """
     cmd = f"umask 077; base64 -d > {dest}; chmod 600 {dest}"
-    if backend.name == "tart":
-        import subprocess
+    import subprocess
 
+    if backend.name == "tart":
+        argv = [backend.tart, "exec", name, "sh", "-c", cmd]
+    else:
+        argv = backend._ssh_base() + ["sh", "-c", cmd]
+    # timeout 必须给：guest 卡住时这条命令会挂到天荒地老，而 main 只接
+    # BackendError 和 KeyboardInterrupt，用户除了 Ctrl-C 没有任何出路。
+    try:
         proc = subprocess.run(
-            [backend.tart, "exec", name, "sh", "-c", cmd],
+            argv,
             input=b64,
             capture_output=True,
             text=True,
+            timeout=180,
         )
-        if proc.returncode != 0:
-            raise BackendError(f"密钥写入 guest 失败：{(proc.stderr or '').strip()}")
-        return
-
-    import subprocess
-
-    proc = subprocess.run(
-        backend._ssh_base() + ["sh", "-c", cmd],
-        input=b64,
-        capture_output=True,
-        text=True,
-    )
+    except subprocess.TimeoutExpired as e:
+        raise BackendError(f"密钥写入 guest 超时（{dest}）") from e
     if proc.returncode != 0:
         raise BackendError(f"密钥写入 guest 失败：{(proc.stderr or '').strip()}")
 
@@ -340,22 +370,40 @@ def cmd_configure(args, cfg, backend) -> int:
         ok("飞书密钥已传输并校验长度")
 
     info("在客人机内应用配置")
-    # 每一行都要 export。原来写成 `AGENTVM_X=value` 而不带 export：
-    # 那是 sh 的 shell 变量，不是环境变量，子进程（patch 脚本里的 python3）
-    # 的 os.environ 根本读不到——配置看着应用了，实际一个值都没进去。
-    env_lines = [
-        f"export AGENTVM_LLM_BASE_URL={_sh_quote(args.llm_base_url or '')}",
-        f"export AGENTVM_LLM_MODEL={_sh_quote(args.llm_model or '')}",
-        f"export AGENTVM_FEISHU_APP_ID={_sh_quote(args.feishu_app_id or '')}",
-        f"export AGENTVM_FEISHU_DOMAIN={_sh_quote(args.feishu_domain)}",
-        f"export AGENTVM_YOLO={'1' if args.yolo else '0'}",
+    # 配置值不走环境变量传参，也不走命令行：全部以 Python 赋值的形式拼在
+    # 脚本开头，随脚本一起经 stdin 进 guest。原来是 `export K=V` 的 sh 写法，
+    # 因为整段是经 `sh -s` 喂进去的；解释器换成 python3 之后那几行就是
+    # SyntaxError。每一行都要让子进程读到，赋值给 os.environ 正是干这个的。
+    env_pairs = [
+        ("AGENTVM_LLM_BASE_URL", args.llm_base_url or ""),
+        ("AGENTVM_LLM_MODEL", args.llm_model or ""),
+        ("AGENTVM_FEISHU_APP_ID", args.feishu_app_id or ""),
+        ("AGENTVM_FEISHU_DOMAIN", args.feishu_domain),
+        ("AGENTVM_YOLO", "1" if args.yolo else "0"),
     ]
-    script = Path(patch).read_text(encoding="utf-8")
-    combined = "\n".join(env_lines) + "\n" + script
-    out = _stdin_run(backend, name, combined)
+    script = _with_env(Path(patch).read_text(encoding="utf-8"), env_pairs)
+    out = _stdin_run(backend, name, script)
     if out:
         print(out)
     ok("配置已应用")
+
+    # 兜底删掉客人机里的明文密钥，并且真的去看一眼。
+    # 清理动作原本只存在于 patch 脚本末尾，而那个脚本经 `sh -s` 永远跑不到
+    # 最后一行（见 _stdin_run）——guest /tmp 里两份明文密钥永久滞留。
+    # 解释器修好之后脚本会自己删，这里再补一刀：patch 中途失败时密钥照样
+    # 不留。「删完看一眼」不能省，rm 的退出码只说明命令跑没跑，不说明文件
+    # 真的没了。
+    info("清理客人机里的明文密钥")
+    backend.exec_vm(name, "rm -f /tmp/.llmkey /tmp/.fssecret")
+    left = backend.exec_vm(
+        name, "ls /tmp/.llmkey /tmp/.fssecret 2>/dev/null | wc -l"
+    ).strip()
+    if left not in ("0", ""):
+        raise BackendError(
+            f"客人机里还留着 {left} 个明文密钥文件，请登录 guest 手动删除"
+        )
+    ok("客人机 /tmp 已无明文密钥")
+
     print()
     print("下一步：")
     print(f"  1. 确认 LLM 账户有余额（402 是计费问题，不是配置问题）")
@@ -364,44 +412,58 @@ def cmd_configure(args, cfg, backend) -> int:
     return 0
 
 
-def _sh_quote(v: str) -> str:
-    """把一个任意字符串变成安全的 sh 单引号字面量。
+def _with_env(script: str, pairs: list[tuple[str, str]]) -> str:
+    """把配置值以 Python 赋值的形式注入脚本开头。
 
-    这些值来自命令行参数或配置文件，会被拼进一段喂给 sh -s 的脚本。
-    一个单引号就能闭合字符串接任意命令——和 hyperv 那边 PowerShell
-    单引号插值是同一类面，所以在拼之前就挡掉。
+    值来自命令行参数或配置文件，是任意字符串。用 repr() 而不是手拼引号：
+    repr 对换行、引号、反斜杠都给出合法字面量，而手拼的转义漏一个就是一次
+    注入——和 hyperv 那边 PowerShell 单引号插值是同一类面。
+
+    插入点必须在 `from __future__ import annotations` 之后：future import
+    只准出现在模块最开头（文档串之后），前面多一行 `import os` 就是
+    SyntaxError，而 patch-agent-config.py 正带着这一行。
     """
-    return "'" + str(v).replace("'", "'\\''") + "'"
+    block = "import os\n" + "".join(
+        f"os.environ[{key!r}] = {value!r}\n" for key, value in pairs
+    )
+    lines = script.splitlines(keepends=True)
+    cut = 0
+    for i, line in enumerate(lines):
+        if line.startswith("from __future__"):
+            cut = i + 1
+    if not cut:
+        return block + "\n" + script
+    return "".join(lines[:cut]) + "\n" + block + "\n" + "".join(lines[cut:])
 
 
-def _stdin_run(backend, name: str, script: str) -> str:
-    """把整段脚本经 stdin 送进 guest 的 sh -s。
+def _stdin_run(backend, name: str, script: str, timeout: int = 300) -> str:
+    """把整段脚本经 stdin 送进 guest 的 python3 -。
 
     这是唯一不把内容放进任何命令行的通道。exec_vm_script 从文件读，
     这里直接从字符串来，因为密钥来自内存而非文件。
-    """
-    if backend.name == "tart":
-        import subprocess
 
+    解释器只能是 python3，不能是 sh：喂进来的是 patch-agent-config.py，
+    一个 Python 源码文件。原来走 `sh -s`，sh 拿它当 shell 逐行解释，
+    第一行 `#!/usr/bin/env python3` 就被当成命令执行，必然失败——而清理
+    guest /tmp 里两份明文密钥的代码正在那个跑不起来的脚本末尾，于是密钥
+    永久留在客人机里。cmd_configure 里另有兜底删除，但根子在这儿。
+    """
+    import subprocess
+
+    if backend.name == "tart":
+        argv = [backend.tart, "exec", name, "python3", "-"]
+    else:
+        argv = backend._ssh_base() + ["python3", "-"]
+    try:
         proc = subprocess.run(
-            [backend.tart, "exec", name, "sh", "-s"],
+            argv,
             input=script,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
-        if proc.returncode != 0:
-            raise BackendError(f"guest 内执行失败：{(proc.stderr or '').strip()}")
-        return (proc.stdout or "").strip()
-
-    # Hyper-V：SSH 的 stdin 通道
-    import subprocess
-
-    proc = subprocess.run(
-        backend._ssh_base() + ["sh -s"],
-        input=script,
-        capture_output=True,
-        text=True,
-    )
+    except subprocess.TimeoutExpired as e:
+        raise BackendError(f"guest 内执行 {timeout} 秒超时") from e
     if proc.returncode != 0:
         raise BackendError(f"guest 内执行失败：{(proc.stderr or '').strip()}")
     return (proc.stdout or "").strip()
@@ -514,8 +576,26 @@ def build_parser() -> argparse.ArgumentParser:
     add("check", cmd_check, "检查宿主机是否满足条件")
     add("install", cmd_install, "装虚拟化后端及其依赖")
     add("fetch", cmd_fetch, "下载并校验基础镜像")
-    add("start", cmd_start, "启动 VM 并等它就绪")
-    add("create-vm", cmd_create_vm, "造 VM（CoW 增量盘）")
+    # tart 的三个透传参数。action="append" 是为了让 --dir 能重复给；
+    # 默认 None（而不是空列表）才能区分「没给」和「给了空」——前者用配置里
+    # 的值，后者是显式关掉。
+    st = add("start", cmd_start, "启动 VM 并等它就绪")
+    st.add_argument("--dir", action="append", default=None,
+                    help="共享目录「宿主机路径:标签」，可重复。仅 tart")
+    st.add_argument("--vnc", default=None,
+                    help="VNC 监听「地址:端口」，如 127.0.0.1:5901。仅 tart")
+    st.add_argument("--expose", action="append", default=None,
+                    help="端口暴露「宿主端口:客人端口」，可重复。仅 tart")
+    cv = add("create-vm", cmd_create_vm, "造 VM（CoW 增量盘）")
+    # cmd_create_vm 读 args.cpu / args.memory / args.disk / args.from_image，
+    # 而原来这四个参数一个都没注册：在 Mac 上跑 create-vm 就是 AttributeError，
+    # 报错指向一个跟用户输入毫无关系的内部行。默认值一律 None，让
+    # `args.cpu or cfg["vm_cpu"]` 的回退生效——给 0 会把配置里的值顶掉。
+    cv.add_argument("--cpu", type=int, help="CPU 核心数，默认取配置 vm_cpu")
+    cv.add_argument("--memory", type=int, help="内存 MB，默认取配置 vm_memory_mb")
+    cv.add_argument("--disk", type=int, help="磁盘 GB，默认取配置 vm_disk_gb")
+    cv.add_argument("--from-image", dest="from_image",
+                    help="基础镜像地址，默认用后端自己的默认源")
     add("provision", cmd_provision, "客人机内 provisioning")
     add("status", cmd_status, "VM 与客人机服务状态")
     add("logs", cmd_logs, "客人机网关日志")

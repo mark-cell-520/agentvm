@@ -29,11 +29,11 @@ CONCURRENCY=4
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) REPO="$2"; shift 2 ;;
-    --tag) TAG="$2"; shift 2 ;;
-    --dest) DEST="$2"; shift 2 ;;
+    --repo) [ $# -ge 2 ] || die "--repo 需要一个值"; REPO="$2"; shift 2 ;;
+    --tag) [ $# -ge 2 ] || die "--tag 需要一个值"; TAG="$2"; shift 2 ;;
+    --dest) [ $# -ge 2 ] || die "--dest 需要一个值"; DEST="$2"; shift 2 ;;
     --verify) VERIFY=1; shift ;;
-    --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --concurrency) [ $# -ge 2 ] || die "--concurrency 需要一个值"; CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -127,10 +127,16 @@ fi
 # ~/.local/bin 里可能是 3.8（Makefile 就把 ~/.local/bin 放到最前），那时会在
 # manifest 解析阶段直接 AttributeError。改成 startswith 判断，3.6 就能跑。
 printf '%s' "$MANIFEST" | python3 -c '
-import sys, json
+import sys, json, re
 m = json.load(sys.stdin)
 def hexdigest(d):
-    return d[7:] if d.startswith("sha256:") else d
+    d = d[7:] if d.startswith("sha256:") else d
+    # digest 会被原样拼成 blobs/sha256/<digest> 的文件路径，而 --repo 支持任意
+    # 第三方 registry（57 行注释明确支持任意主机）。一个带 ../ 或 shell 特殊字符的
+    # digest 会写到预期之外的路径。必须是 64 位小写十六进制，否则整个流程作废。
+    if not re.fullmatch(r"[0-9a-f]{64}", d):
+        sys.exit(1)
+    return d
 seen = set()
 out = [("CONFIG", hexdigest(m["config"]["digest"]), m["config"]["size"])]
 for l in m["layers"]:
@@ -156,11 +162,30 @@ file_size() {
 
 fetch_one() {
   local digest="$1" want="$2" out="$BLOBS/$1"
+  # digest 未校验就拼进路径：hexdigest() 只剥 sha256: 前缀，不校验 64 位十六进制，
+  # 而 out="$BLOBS/$1" 直接拼接。--repo 支持任意第三方 registry，一个带 ../ 或
+  # shell 特殊字符的 digest 会写到预期之外的路径。python 侧已校验，bash 侧再挡一道。
+  case "$digest" in
+    *[!0-9a-f]*|"") die "非法 digest：$digest" ;;
+  esac
   local have=0
   [ -f "$out" ] && have="$(file_size "$out")"
 
   if [ "$have" -eq "$want" ]; then
-    [ "$VERIFY" -eq 1 ] || return 0
+    # 大小已经对上了。带 --verify 时把哈希也验一遍，对得上就提前返回——原来
+    # have==want 且 --verify 时不提前返回，落到下面的 curl，重跑 make fetch
+    # 每个 blob 白跑一次 HTTP 往返。哈希对不上才删掉重下。
+    if [ "$VERIFY" -eq 1 ]; then
+      local got
+      got="$(shasum -a 256 "$out" | cut -d' ' -f1)"
+      if [ "$got" = "$digest" ]; then
+        return 0
+      fi
+      warn "hash mismatch for $digest; re-downloading"
+      rm -f "$out"
+    else
+      return 0
+    fi
   elif [ "$have" -gt "$want" ]; then
     warn "$digest is larger than expected ($have > $want); re-downloading"
     rm -f "$out"; have=0

@@ -44,8 +44,12 @@ create-vm: ## Clone the local image into a VM and size it
 #     编译器一样都没做，要到后面某个包编译失败才间接暴露。
 #  2. 宿主机环境变量不会透传进 tart exec。原来读 ${AGENTVM_APT_MIRROR:-...}
 #     永远拿到默认值，用户设了镜像也看不出来。现在显式拼一行 export 送进去。
+#  3. APT_MIRROR 必须转义后再拼。原来用 %s 原样进客人机脚本：
+#     make provision APT_MIRROR='http://x; rm -rf /; #' 会在客人机里执行任意
+#     命令。改用 %q（Makefile 的 SHELL 是 bash，支持），产出可被 shell 安全再解析
+#     一次的串——和 50-configure.sh 处理 LLM_BASE_URL 的做法一致。
 provision: ## Inside the guest: fast apt mirror + build toolchain
-	@{ if [ -n "$(APT_MIRROR)" ]; then printf 'AGENTVM_APT_MIRROR=%s\n' "$(APT_MIRROR)"; fi; \
+	@{ if [ -n "$(APT_MIRROR)" ]; then printf 'AGENTVM_APT_MIRROR=%q\n' "$(APT_MIRROR)"; fi; \
 	   cat scripts/40-provision-guest.sh; } \
 		| $(TART_BIN) exec $(VM_NAME) bash -s
 
@@ -100,11 +104,21 @@ lint: ## Syntax-check every script
 			-target arm64-apple-macos14.0 \
 			app/Sources/MacVMEngine.swift scripts/vmz/main.swift \
 			&& echo "  ok swift (MacVMEngine + vmz)"; \
-	 else echo "  ok swift (没有 swiftc，跳过)"; fi
+	 else echo "  skip swift (没有 swiftc)"; fi
+	# vzrun.swift 必须单独 parse：它和 vmz/main.swift 一样是带顶层可执行代码的
+	# CLI 入口，两个入口放进同一次 swiftc -parse 会互相报
+	# "statements are not allowed at the top level"——那不是代码错，是编译单元
+	# 里出现了两个 main。分开各查一次才查得出各自的真错。
+	@if command -v swiftc >/dev/null 2>&1; then \
+		swiftc -parse -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
+			-target arm64-apple-macos14.0 \
+			scripts/vzrun.swift \
+			&& echo "  ok swift (vzrun)"; \
+	 else echo "  skip swift (没有 swiftc)"; fi
 	@if ls config/launchd/*.plist >/dev/null 2>&1; then \
 		for p in config/launchd/*.plist; do plutil -lint "$$p" || exit 1; done; \
-	 else echo "  ok plutil (config/launchd/ 下没有 plist，跳过)"; fi
+	 else echo "  skip plutil (config/launchd/ 下没有 plist，未检查)"; fi
 
 clean: ## Remove local state (keeps scripts and config)
-	@rm -rf $(HOME)/.agentvm/image
+	@test -n "$$HOME" || { echo "HOME 未设置，拒绝 rm -rf 一个根路径"; exit 1; }; rm -rf "$$HOME/.agentvm/image"
 	@echo "removed $$HOME/.agentvm/image"

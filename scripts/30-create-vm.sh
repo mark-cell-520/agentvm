@@ -24,11 +24,11 @@ SOURCE="127.0.0.1:${PORT}/${LOCAL_REPO_NAME}:latest"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --name) VM_NAME="$2"; shift 2 ;;
-    --cpu) VM_CPU="$2"; shift 2 ;;
-    --memory) VM_MEMORY_MB="$2"; shift 2 ;;
-    --port) PORT="$2"; SOURCE="127.0.0.1:${PORT}/${LOCAL_REPO_NAME}:latest"; shift 2 ;;
-    --from) SOURCE="$2"; shift 2 ;;
+    --name) [ $# -ge 2 ] || die "--name 需要一个值"; VM_NAME="$2"; shift 2 ;;
+    --cpu) [ $# -ge 2 ] || die "--cpu 需要一个值"; VM_CPU="$2"; shift 2 ;;
+    --memory) [ $# -ge 2 ] || die "--memory 需要一个值"; VM_MEMORY_MB="$2"; shift 2 ;;
+    --port) [ $# -ge 2 ] || die "--port 需要一个值"; PORT="$2"; SOURCE="127.0.0.1:${PORT}/${LOCAL_REPO_NAME}:latest"; shift 2 ;;
+    --from) [ $# -ge 2 ] || die "--from 需要一个值"; SOURCE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -43,18 +43,23 @@ if ! curl -fsS "http://127.0.0.1:${PORT}/v2/" >/dev/null 2>&1; then
 fi
 ok "registry reachable on 127.0.0.1:${PORT}"
 
-# tart list 的第一列是 NAME，第二列是 SOURCE。原来写 $2 取到的是源镜像，
-# 「已存在就跳过克隆」那个分支永远不命中，重跑一律死在 tart clone 的
-# 「already exists」上——而 README 明写每一步都可重跑。
-# grep -F：VM 名不是正则，名字里的 `.` 会误匹配（`agent` 对上 `agentx`）。
-if "$TART_BIN" list 2>/dev/null | awk '{print $1}' | grep -Fqx "$VM_NAME"; then
-  info "VM '$VM_NAME' already exists; skipping clone"
-else
-  info "cloning $SOURCE -> $VM_NAME (uses APFS copy-on-write, so this is fast)"
-  # --insecure is required: Tart refuses plain-HTTP registries without it.
-  "$TART_BIN" clone "$SOURCE" "$VM_NAME" --insecure --concurrency 16
-  ok "cloned"
-fi
+# tart list 的第一列是 NAME，第二列是 SOURCE，所以先用 awk 取出每行第一列。
+# 关键是不能再 `"$TART_BIN" list | awk | grep -Fqx`：set -o pipefail 下 grep -q
+# 命中后立刻关掉管道读端，上游 tart/awk 接着写会吃到 SIGPIPE，整条管道返回 141
+# ——tart list 输出超过管道缓冲时，明明命中「已存在」却返回非零而走 else 重新
+# clone，tart clone 报 already exists，set -e 让脚本死在一句看不懂的错误上。
+# 存进变量就没有这条管道了；tr 把换行也变成空格，好用 `" $VM_NAME "` 按整词匹配
+# ——等价于原来的 grep -Fqx，VM 名里的 `.` 不会误匹配（`agent` 不对上 `agentx`）。
+vms="$("$TART_BIN" list 2>/dev/null | awk '{print $1}' | tr '\n' ' ' || true)"
+case " $vms " in
+  *" $VM_NAME "*)
+    info "VM '$VM_NAME' already exists; skipping clone" ;;
+  *)
+    info "cloning $SOURCE -> $VM_NAME (uses APFS copy-on-write, so this is fast)"
+    # --insecure is required: Tart refuses plain-HTTP registries without it.
+    "$TART_BIN" clone "$SOURCE" "$VM_NAME" --insecure --concurrency 16
+    ok "cloned" ;;
+esac
 
 info "setting resources: ${VM_CPU} CPU / ${VM_MEMORY_MB} MB"
 "$TART_BIN" set "$VM_NAME" --cpu "$VM_CPU" --memory "$VM_MEMORY_MB"

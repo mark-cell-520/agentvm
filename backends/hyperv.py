@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -49,16 +50,62 @@ GUEST_BOOT_TIMEOUT = 240
 #   agentvm.py create-vm --name "x'; Remove-Item -Recurse C:\Users; '"
 # 这在 macOS 上碰不到（后端直接拒绝运行），但在 Windows 上是实打实的注入。
 # 与其给二十处插值逐个转义（漏一处就前功尽弃），不如在入口挡住。
-_VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+#
+# 必须用 fullmatch 而不是 match：match 只要求开头对上，而 `$` 在正则里
+# 「允许匹配末尾换行之前」——"agent\n" 能过校验，而换行后面的内容可以
+# 是任意 PowerShell 语句，拼接出来的脚本照样执行。
+_VM_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+
+# 登录名与 apt 镜像的白名单。这两个值会原样插进 cloud-init 的 user-data
+# （YAML），而值里带一个换行就能注入任意 cloud-config 指令：runcmd 的每
+# 一条都在 guest 首次启动时以 root 执行。换行一律拒，不限于换行——
+# 白名单只放真正需要的字符。
+_SSH_USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,31}")
+_APT_MIRROR_RE = re.compile(
+    r"https?://[A-Za-z0-9.\-]+(?::\d+)?(?:/[A-Za-z0-9._\-]*)*/?"
+)
+
+# VMState 枚举的数值 → 名字。Get-VM 的 .State 打印出来是名字，而经
+# ConvertTo-Json 是数值，同一个状态两种口径，见 vm_state。
+_VM_STATE_NAMES = {
+    "0": "Unknown", "1": "Other", "2": "Running", "3": "Off",
+    "4": "Stopping", "5": "Saved", "6": "Paused", "7": "Starting",
+    "8": "Reset", "9": "Saving", "10": "Pausing", "11": "Resuming",
+    "12": "FastSaved", "13": "FastSaving", "14": "ForceCriticalShutdown",
+    "15": "ForceShutdown", "16": "ShuttingDown",
+}
 
 
 def check_vm_name(name: str) -> str:
-    if not _VM_NAME_RE.match(name or ""):
+    if not _VM_NAME_RE.fullmatch(name or ""):
         raise BackendError(
             f"VM 名不合法：{name!r}。只能用字母、数字、点、下划线、连字符，"
             f"字母或数字开头，最长 63 字符。"
         )
     return name
+
+
+def check_home(path: Path) -> Path:
+    """校验 AGENTVM_HOME，拒掉会破坏 PowerShell 插值的字符。
+
+    self.home 来自 AGENTVM_HOME 环境变量或 .agentvmrc，两个入口都不校验，
+    而它会以单引号插值的形式出现在几乎每条 PowerShell 语句里
+    （`New-VHD -Path '{disk}'`、`$image.Root.AddTree('{stage}')`）。
+    AGENTVM_HOME="C:\\Users\\O'Brien\\.agentvm" 一个单引号就能闭合字符串、
+    后面接任意 PowerShell，以当前用户权限执行。
+
+    _ps 已经改走 -EncodedCommand（base64，不含可被闭合的引号），这里是
+    第二道防线：目录名里出现引号本身也说明路径不是我们该用的那个。
+    """
+    s = str(path)
+    for ch in s:
+        if ch in "'\"`" or ord(ch) < 32:
+            raise BackendError(
+                f"agentvm 目录路径含非法字符 {ch!r}：{s}\n"
+                "它来自 AGENTVM_HOME 或 .agentvmrc 的 agentvm_home。"
+                "请改用一个不含引号和反引号的目录。"
+            )
+    return path
 
 
 class HyperVBackend(Backend):
@@ -69,20 +116,44 @@ class HyperVBackend(Backend):
         # cfg 是 dict，键见 agentvm.py 的 load_config。None 时用默认值，
         # 便于单独 import 本类做单元测试。
         cfg = cfg or {}
-        self.home = Path(cfg.get("agentvm_home") or Path.home() / ".agentvm")
+        self.home = check_home(
+            Path(cfg.get("agentvm_home") or Path.home() / ".agentvm")
+        )
         self.base_dir = self.home / "base"
         self.vms_dir = self.home / "vms"
         self.keys_dir = self.home / "keys"
         self.ssh_key = self.keys_dir / "agentvm_ed25519"
         self.ssh_port = int(cfg.get("ssh_port") or DEFAULT_SSH_PORT)
-        self.ssh_user = cfg.get("ssh_user") or "agent"
+        self.ssh_user = self._check_ssh_user(cfg.get("ssh_user") or "agent")
         self.image_url = cfg.get("image_url") or DEFAULT_IMAGE_URL
         self.image_sha_url = cfg.get("image_sha_url") or DEFAULT_IMAGE_SHA_URL
-        self.apt_mirror = cfg.get(
-            "apt_mirror", "https://mirrors.tuna.tsinghua.edu.cn/debian/"
+        self.apt_mirror = self._check_apt_mirror(
+            cfg.get("apt_mirror", "https://mirrors.tuna.tsinghua.edu.cn/debian/")
         )
         self.secure_boot = bool(cfg.get("secure_boot", True))
         self.qemu_img = cfg.get("qemu_img") or "qemu-img"
+
+    # 这三项的值来自 .agentvmrc 或环境变量，却原样插进 PowerShell 语句和
+    # cloud-init 的 user-data，所以一律白名单 + fullmatch（`$` 允许匹配末尾
+    # 换行之前，match 会放行 "agent\n"）。校验放在 __init__：每个入口都过
+    # 这儿，比在每个使用点各自判断可靠。
+    @staticmethod
+    def _check_ssh_user(v: str) -> str:
+        if not _SSH_USER_RE.fullmatch(str(v)):
+            raise BackendError(
+                f"登录名不合法：{v!r}。要用字母或下划线开头，只含字母、数字、"
+                "点、下划线、连字符，最长 32 字符。"
+            )
+        return str(v)
+
+    @staticmethod
+    def _check_apt_mirror(v: str) -> str:
+        if not _APT_MIRROR_RE.fullmatch(str(v)):
+            raise BackendError(
+                f"apt 镜像地址不合法：{v!r}。要给 http(s):// 开头、只含字母"
+                "数字和 . - _ / : 的地址，不能带换行、空格或 |。"
+            )
+        return str(v)
 
     # ------------------------------------------------------- PowerShell 封装 --
 
@@ -91,6 +162,18 @@ class HyperVBackend(Backend):
 
         -STA 是必须的：IMAPI2 的 COM 对象只在单线程单元里工作，
         默认的 MTA 模式下造 ISO 会失败，且报错不指向根因。
+
+        -EncodedCommand 而不是 -Command：脚本里到处是单引号插值出来的路径
+        和 VM 名（`New-VHD -Path '{disk}'`），base64 之后命令行里不再有
+        任何可被闭合的引号。与其给二十处插值逐个转义（漏一处就是一次以当前
+        用户权限的任意代码执行），不如让命令行里根本不出现引号。
+
+        $ErrorActionPreference = 'Stop' + 末尾查 $Error：PowerShell 对非
+        终止错误默认只写进 $Error、退出码仍是 0，调用方看着像成功——
+        Get-VM 找不到 VM、New-VHD 父盘不存在都是这条路，原来全部静默。
+        配套的是本文件里所有「查不到是正常」的探针都用 -ErrorAction Ignore
+        而不是 SilentlyContinue：只有 Ignore 不进 $Error，SilentlyContinue
+        进，一并算失败会让 vm_exists / _vm_ip 全部改成抛异常。
         """
         if os.name != "nt":
             raise BackendError(
@@ -103,10 +186,17 @@ class HyperVBackend(Backend):
                 "找不到 powershell.exe。Windows on ARM 应自带 PowerShell，"
                 "若被精简掉请从微软官方渠道恢复。"
             )
+        wrapped = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"{script}\n"
+            "if ($Error) { exit 1 }\n"
+        )
+        # -EncodedCommand 要的是 UTF-16LE 的 base64
+        encoded = base64.b64encode(wrapped.encode("utf-16-le")).decode("ascii")
         try:
             proc = subprocess.run(
                 [powershell, "-NoProfile", "-NonInteractive", "-STA",
-                 "-Command", script],
+                 "-EncodedCommand", encoded],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -159,7 +249,7 @@ class HyperVBackend(Backend):
         try:
             feat = self._ps_json(
                 "Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V "
-                "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty State"
+                "-ErrorAction Ignore | Select-Object -ExpandProperty State"
             )
             if feat is not None and str(feat).lower() != "enabled":
                 missing.append(
@@ -334,18 +424,30 @@ class HyperVBackend(Backend):
         except Exception as exc:  # 网络失败不该阻断已有镜像的使用
             print(f"  warn 无法获取官方校验值（{exc}），跳过校验")
 
+        # 先写 .part 再原子改名。原来直接写最终 vhdx，而「已转换」的判据是
+        # vhdx.exists()：转换中断（磁盘满、Ctrl-C、断电）会留下一个不完整
+        # 但已存在的文件，此后永远跳过转换——而它是所有 differencing disk
+        # 的父盘，每台新 VM 都建在一个残缺的盘上，报错还指向完全不相干的地方。
+        part = vhdx.with_suffix(".vhdx.part")
         if not vhdx.exists():
             print(f"==> 转换 qcow2 → VHDX（用 {self.qemu_img}，仅离线转换）")
+            if part.exists():
+                # 上一次转换没成功就退了。留着它只会让 rename 覆盖一个
+                # 可能是好文件的产物，直接删掉重来。
+                part.unlink()
             proc = subprocess.run(
-                [self.qemu_img, "convert", "-O", "vhdx", str(qcow2), str(vhdx)],
+                [self.qemu_img, "convert", "-O", "vhdx", str(qcow2), str(part)],
                 capture_output=True,
                 text=True,
             )
-            if proc.returncode != 0 or not vhdx.exists():
+            if proc.returncode != 0 or not part.exists():
                 raise BackendError(
                     f"qemu-img 转换失败：{(proc.stderr or proc.stdout).strip()}\n"
                     "请确认安装的是 QEMU for Windows 且 qemu-img.exe 在 PATH 中。"
                 )
+            # rename 在同一卷内是原子的：要么是完整的旧盘，要么是完整的新盘，
+            # 不会出现「半个父盘」这个状态。
+            part.replace(vhdx)
             print(f"  ok 父盘就绪 {vhdx.name}（{vhdx.stat().st_size / 1e6:.0f} MB）")
         return vhdx
 
@@ -416,7 +518,7 @@ class HyperVBackend(Backend):
         """
         check_vm_name(name)
         out = self._ps(
-            f"Get-VM -Name '{name}' -ErrorAction SilentlyContinue | "
+            f"Get-VM -Name '{name}' -ErrorAction Ignore | "
             "Get-VMNetworkAdapter | Select-Object -ExpandProperty IPAddresses"
         )
         for cand in out.split():
@@ -436,7 +538,7 @@ class HyperVBackend(Backend):
             return  # guest 还没拿到地址，等 wait_ready 再试
 
         exists = self._ps(
-            "Get-NetNatStaticMapping -ErrorAction SilentlyContinue "
+            "Get-NetNatStaticMapping -ErrorAction Ignore "
             f"| Where-Object {{$_.ExternalPort -eq {self.ssh_port}}} "
             "| Select-Object -First 1 -ExpandProperty InternalIPAddress"
         )
@@ -444,17 +546,30 @@ class HyperVBackend(Backend):
             return
         if exists:
             self._ps(
-                "Get-NetNatStaticMapping -ErrorAction SilentlyContinue "
+                "Get-NetNatStaticMapping -ErrorAction Ignore "
                 f"| Where-Object {{$_.ExternalPort -eq {self.ssh_port}}} "
                 "| Remove-NetNatStaticMapping -Confirm:$false"
             )
         # ExternalIPAddress 0.0.0.0 表示监听宿主所有地址
         self._ps(
-            "Get-NetNat -ErrorAction SilentlyContinue | Select-Object -First 1 "
+            "Get-NetNat -ErrorAction Ignore | Select-Object -First 1 "
             f"-ExpandProperty Name | ForEach-Object {{ Add-NetNatStaticMapping "
             f"-NatName $_ -ExternalIPAddress '0.0.0.0' -InternalIPAddress '{ip}' "
             f"-InternalPort 22 -ExternalPort {self.ssh_port} -Protocol TCP }}"
         )
+
+    def vm_state(self, name: str) -> str:
+        """VM 状态，统一成枚举名（"Running" / "Off" / ...）。VM 不存在返回 ""。
+
+        同一个 .State 有两种渲染：直接打印出来是枚举名（Running），经
+        ConvertTo-Json 出来是枚举的数值（2）。原来 wait_ready 和 run_vm 拿
+        它跟 "2" 比，而 PowerShell 渲染 VMState 用的是名字——Running 的
+        轮询一次都不命中，白等 240 秒再报「未进入 Running」，而 VM 明明
+        早就起来了。三处口径在这里统一成枚举名，谁都不用猜。
+        """
+        check_vm_name(name)
+        out = self._ps(f"(Get-VM -Name '{name}' -ErrorAction Ignore).State")
+        return _VM_STATE_NAMES.get(out.strip(), out.strip())
 
     def wait_ready(self, name: str, timeout: int = GUEST_BOOT_TIMEOUT) -> None:
         """轮询等 guest 就绪。
@@ -466,10 +581,7 @@ class HyperVBackend(Backend):
         deadline = time.time() + timeout
         running = False
         while time.time() < deadline:
-            state = self._ps(
-                f"(Get-VM -Name '{name}' -ErrorAction SilentlyContinue).State"
-            )
-            if state.strip().isdigit() and int(state.strip()) == 2:  # 2 = Running
+            if self.vm_state(name) == "Running":
                 running = True
                 break
             time.sleep(5)
@@ -508,13 +620,13 @@ class HyperVBackend(Backend):
     def vm_exists(self, name: str) -> bool:
         check_vm_name(name)
         out = self._ps(
-            f"@(Get-VM -Name '{name}' -ErrorAction SilentlyContinue).Count"
+            f"@(Get-VM -Name '{name}' -ErrorAction Ignore).Count"
         )
         return out.strip().isdigit() and int(out.strip()) > 0
 
     def list_vms(self) -> list[dict]:
         data = self._ps_json(
-            "Get-VM -ErrorAction SilentlyContinue | "
+            "Get-VM -ErrorAction Ignore | "
             "Select-Object Name, State, ProcessorCount, MemoryStartup"
         )
         if not data:
@@ -524,7 +636,10 @@ class HyperVBackend(Backend):
         return [
             {
                 "name": vm.get("Name"),
-                "state": str(vm.get("State")),
+                # ConvertTo-Json 给的是 VMState 的数值，换算成枚举名，
+                # 跟 vm_state 和 agentvm.py status 打印出来的那一种对齐。
+                "state": _VM_STATE_NAMES.get(str(vm.get("State")),
+                                             str(vm.get("State"))),
                 "cpu": vm.get("ProcessorCount"),
                 "memory_mb": int((vm.get("MemoryStartup") or 0) / 1048576),
             }
@@ -666,8 +781,10 @@ try {{ $stream.Save($target) }} finally {{ $target.Close() }}
         check_vm_name(name)
         if not self.vm_exists(name):
             raise BackendError(f"VM '{name}' 不存在，先 create_vm")
-        state = self._ps(f"(Get-VM -Name '{name}').State")
-        if state.strip() == "2":
+        # 比枚举名，不比值。PowerShell 把 .State 渲染成 "Running"，
+        # 原来跟 "2" 比永远不相等，于是每次 start 都去 Start-VM，
+        # 对已经在跑的机器再发一次（部分版本会报「已启动」而返回 0）。
+        if self.vm_state(name) == "Running":
             print(f"  ok VM '{name}' 已在运行")
             return
         print(f"==> 启动 VM '{name}'")
@@ -678,7 +795,40 @@ try {{ $stream.Save($target) }} finally {{ $target.Close() }}
         if not self.vm_exists(name):
             return
         print(f"==> 停止 VM '{name}'")
-        self._ps(f"Stop-VM -Name '{name}' -Force -TurnOff -ErrorAction SilentlyContinue")
+        # Ignore 只给「本来就停着」留门：Stop-VM 对已关机的机器在部分版本上
+        # 会报非终止错误，那是正常状态不是失败。但压掉之后必须自己看一眼
+        # 状态——否则停不下来也照样往下走，而 VM 还在往磁盘写，
+        # 调用方（尤其 delete）会把盘从它脚下抽走。
+        self._ps(f"Stop-VM -Name '{name}' -Force -TurnOff -ErrorAction Ignore")
+        # Stop-VM -TurnOff 多数版本是同步的，但不保证：刚发完命令那一下
+        # 状态可能还是 Running。给半分钟宽限再看，别把「还在停」报成
+        # 「停不下来」——那是拿一个假失败换一个真失败。
+        for _ in range(30):
+            state = self.vm_state(name)
+            if state in ("Off", "Stopped", "Stopping", ""):
+                return
+            time.sleep(1)
+        raise BackendError(
+            f"VM '{name}' 没停下来（当前状态 {state}）。请用 Get-VM 查看，"
+            "确认停机后再重试。"
+        )
+
+    def _rmtree_vm(self, name: str) -> None:
+        """删掉 VM 目录，并且确认它真的没了。
+
+        ignore_errors=True 会把一切失败咽掉——句柄被占、文件只读、权限
+        不够——然后调用方无条件打印「已删除」。用户看到的是成功，
+        磁盘上却还留着一个几十 GB 的 vhdx，而下次 create-vm 会撞在
+        New-VHD 的「文件已存在」上。失败必须说出来。
+        """
+        d = self.vms_dir / name
+        shutil.rmtree(d, ignore_errors=True)
+        if d.exists():
+            raise BackendError(
+                f"删不掉 {d}。常见原因：VM 没真正停下来（Stop-VM 带的是 "
+                "-ErrorAction Ignore，失败无声）、文件被别的进程占用、"
+                "或权限不足。请手动确认后重试。"
+            )
 
     def delete_vm(self, name: str) -> None:
         """连 VM 带盘一起删。对应 Tart 的「不想要了一条命令删干净」。
@@ -690,13 +840,13 @@ try {{ $stream.Save($target) }} finally {{ $target.Close() }}
         check_vm_name(name)
         if not self.vm_exists(name):
             print(f"  ok VM '{name}' 不存在")
-            shutil.rmtree(self.vms_dir / name, ignore_errors=True)
+            self._rmtree_vm(name)
             return
         print(f"==> 删除 VM '{name}'")
-        self._ps(f"Stop-VM -Name '{name}' -Force -TurnOff -ErrorAction SilentlyContinue")
+        self._ps(f"Stop-VM -Name '{name}' -Force -TurnOff")
         self._ps(f"Remove-VM -Name '{name}' -Force")
         # 种子盘、seed-src、临时文件都在这个目录下，一起清
-        shutil.rmtree(self.vms_dir / name, ignore_errors=True)
+        self._rmtree_vm(name)
         print("  ok 已删除")
 
     # -------------------------------------------------------- guest 内执行 --
@@ -710,12 +860,20 @@ try {{ $stream.Save($target) }} finally {{ $target.Close() }}
         """
         check_vm_name(name)
         self._ensure_nat(name)
-        proc = subprocess.run(
-            self._ssh_base() + [command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        try:
+            proc = subprocess.run(
+                self._ssh_base() + [command],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            # 必须转成 BackendError：agentvm.py 的 main 只接 BackendError 和
+            # KeyboardInterrupt，超时会以完整 traceback 砸到用户脸上——而
+            # 客人机卡住时超时恰恰是最常见的那种失败。tart.py 两处都转了。
+            raise BackendError(
+                f"guest 内命令 {timeout} 秒超时：{command[:200]}"
+            ) from e
         if proc.returncode != 0:
             err = (proc.stderr or "").strip()
             raise BackendError(
@@ -732,13 +890,21 @@ try {{ $stream.Save($target) }} finally {{ $target.Close() }}
         check_vm_name(name)
         script = Path(script_path).read_text(encoding="utf-8")
         self._ensure_nat(name)
-        proc = subprocess.run(
-            self._ssh_base() + ["sh -s"],
-            input=script,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        try:
+            proc = subprocess.run(
+                # 必须是两个参数。合成一个 "sh -s" 也能跑（ssh 会把参数用空格
+                # 接起来交给远端 shell），但那是在赌 ssh 的拼接行为，
+                # 而 -EncodedCommand 那条路上已经没有可赌的空间了。
+                self._ssh_base() + ["sh", "-s"],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise BackendError(
+                f"guest 内脚本 {timeout} 秒超时（{Path(script_path).name}）"
+            ) from e
         if proc.returncode != 0:
             err = (proc.stderr or "").strip()
             raise BackendError(

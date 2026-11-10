@@ -15,6 +15,8 @@ import SwiftUI
 struct ConsoleView: View {
     let name: String
     let port: Int
+    /// 端口不合法时的说明。空串表示端口正常，可以连。
+    @State private var portError = ""
 
     @StateObject private var client: VNCClient
     @State private var locked = false
@@ -22,19 +24,44 @@ struct ConsoleView: View {
     init(name: String, port: Int) {
         self.name = name
         self.port = port
-        _client = StateObject(
-            wrappedValue: VNCClient(host: "127.0.0.1", port: UInt16(port)))
+        // UInt16(port) 在越界时直接 trap：vm.json 是用户可手改的文件，
+        // vnc_port 写成 99999 就走到了这条路上。那是配置错误，该给的是一句
+        // 人能看懂的话，不是整个 app 崩掉。
+        if (0...65535).contains(port) {
+            _client = StateObject(
+                wrappedValue: VNCClient(host: "127.0.0.1", port: UInt16(port)))
+        } else {
+            _portError = State(initialValue:
+                "端口 \(port) 不是合法的 TCP 端口（要 0 到 65535）。"
+                + "这个虚拟机的 vm.json 里 vnc_port 被改坏了，改回去再打开控制台。")
+            // 端口 0 连不上，但客户端照样建得起来，界面逻辑不用为它分叉。
+            _client = StateObject(
+                wrappedValue: VNCClient(host: "127.0.0.1", port: 0))
+        }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            screen
+            if portError.isEmpty {
+                screen
+            } else {
+                // 端口非法：把原因写在屏幕上，不去连一个连不上的端口。
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 34))
+                        .foregroundStyle(.orange)
+                    Text(portError)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 440)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             Divider()
             footer
         }
-        .onAppear { client.connect() }
+        .onAppear { if portError.isEmpty { client.connect() } }
         .onDisappear {
             client.disconnect()
             locked = false
@@ -65,6 +92,8 @@ struct ConsoleView: View {
             Button("重连") { client.connect() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                // 端口非法时重连没有意义（连的是端口 0）。
+                .disabled(!portError.isEmpty)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
