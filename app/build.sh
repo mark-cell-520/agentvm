@@ -97,9 +97,14 @@ if [ -f "$VMBIN" ]; then
     fi
 fi
 
-echo "==> 拷后端（vmkit.py + winarm-vm.py + catalog.json + lib/ + vmz）"
+echo "==> 拷后端（vmkit.py + winarm-vm.py + autoinstall.py + catalog.json + lib/ + vmz）"
 cp "$ROOT/scripts/vmkit.py"          "$RES/backend/"
 cp "$ROOT/scripts/winarm-vm.py"      "$RES/backend/"
+# autoinstall.py 必须一起拷。vmkit.py 用 importlib 按**自己所在目录**加载它，
+# 而 app 里 vmkit.py 在 Resources/backend/ 下——少拷这一个文件，从 app 里装
+# 自己的安装包会直接 FileNotFoundError，而命令行下手工跑的一条不少。这种
+# 「app 里整条路不能用」的差距在单元测试里看不出来，只有真去装才发现。
+cp "$ROOT/scripts/autoinstall.py"    "$RES/backend/"
 cp "$ROOT/scripts/catalog.json"      "$RES/backend/"
 # scripts/lib/ 必须一起拷进来。vmkit.py 现在 import 这里的 qga.py（客人机
 # 代理客户端），少拷一个目录的后果是：从 AgentVM.app 里起的 Linux 虚拟机
@@ -108,7 +113,8 @@ cp "$ROOT/scripts/catalog.json"      "$RES/backend/"
 # 才发现。vmkit.py 侧已用 AGENTVM_QGA_LIB 兜底并告警，这里是根治。
 mkdir -p "$RES/backend/lib"
 cp "$ROOT"/scripts/lib/*.py          "$RES/backend/lib/"
-chmod 755 "$RES/backend/vmkit.py" "$RES/backend/winarm-vm.py"
+chmod 755 "$RES/backend/vmkit.py" "$RES/backend/winarm-vm.py" \
+	"$RES/backend/autoinstall.py"
 find "$RES/backend/lib" -name '*.py' -exec chmod 644 {} +
 
 echo "==> 写 Info.plist"
@@ -202,7 +208,7 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 # lib/*.py 一起查——qga.py 有语法错的话 vmkit.py 每次 import 才炸，
 # 那时候错误信息指向的是 import 那一行，不是真正写错的那一行。
 python3 - "$RES/backend/vmkit.py" "$RES/backend/winarm-vm.py" \
-	"$RES"/backend/lib/*.py <<'PY'
+	"$RES/backend/autoinstall.py" "$RES"/backend/lib/*.py <<'PY'
 import ast, sys
 for f in sys.argv[1:]:
 	ast.parse(open(f, encoding="utf-8").read(), filename=f)

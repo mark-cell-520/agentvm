@@ -319,7 +319,15 @@ private struct InstallProgress: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                ProgressView(value: state.backend.progress)
+                // 自动安装那一阶段没有百分比可显示（后端不知道安装器走到第几步），
+                // 进度一直是 0。这时候画一条空进度条会让用户以为卡死了，所以换成
+                // 不确定进度的转圈样式；下载阶段有真百分比，照旧画确定的。
+                // （Swift 注释里不能有全角标点，所以这里的括号逗号都是半角。）
+                if state.backend.progress > 0 {
+                    ProgressView(value: state.backend.progress)
+                } else {
+                    ProgressView()
+                }
                 if !state.backend.progressDetail.isEmpty {
                     Text(state.backend.progressDetail)
                         .font(.caption)
@@ -341,8 +349,12 @@ private struct InstallProgress: View {
         .padding(20)
     }
 
-    /// 虚拟机画面。这是一个真 VNC 客户端，不是隔几秒抓一张图——Windows 和
-    /// 本地包的安装过程都要人在画面上点，抓图点不了。
+    /// 虚拟机画面。这是一个真 VNC 客户端，不是隔几秒抓一张图——Windows 的
+    /// Setup 和本地包的图形安装器都要人在画面上点，抓图点不了。
+    ///
+    /// 本地包那条路现在默认由后端自动点完（见 scripts/autoinstall.py），这个
+    /// 控制台的作用从「让人点」变成「让人看见它在点什么」——自动安装中途想接手，
+    /// 直接在这儿点就行。
     ///
     /// 端口从 status 里拿：装到「启动安装器」那一步之前 VM 还没起来，端口
     /// 也拿不到，这时先显示一句在等什么，别画一个永远连不上的控制台。

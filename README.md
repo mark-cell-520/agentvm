@@ -17,11 +17,14 @@ Windows 约 10 到 15 分钟，Linux 约 1 到 3 分钟。装完虚拟机是一�
 
 ## 四件事
 
-**1. 可视化安装。** 装系统那十几分钟里，app 内嵌的控制台是一个真 VNC 客户端——
-不是隔几秒抓一张图，是真画面，能拖动滚动条、能在输入框里打字、能点「下一步」。
-实测用它在 app 里把 fnOS（飞牛）ARM64 从 ISO 一步步装到了能用的系统，宿主机上
-直接打开它的 Web 界面。也支持自己的安装包：向导第一步下面有「用自己的安装包装」，
-选一个本地 ISO，或者贴一个下载网址（后端带断点续传）。
+**1. 一键安装。** 云镜像下载完就能登，Windows 走无人值守应答文件，macOS 从 Apple
+恢复镜像全自动装。**自己的安装包也默认一键装完**：后端有一个自己当 RFB 客户端的
+驱动器，按回车推完图形安装器、该拔盘时拔盘、装好了自己从硬盘启起来，全程不需要人
+在画面上点。想中途接手随时可以在画面上点，`vmkit.py install --no-auto` 则完全退回
+手动。实测用它在 app 里把 fnOS（飞牛）ARM64 从 ISO 一键装到了能用的系统，宿主机上
+直接打开它的 Web 界面。向导第一步下面有「用自己的安装包装」，选一个本地 ISO，或者贴
+一个下载网址（后端带断点续传）。装系统那十几分钟里，app 内嵌的控制台是一个真 VNC
+客户端——不是隔几秒抓一张图，是真画面。
 
 **2. 可视化配置。** 装完之后改 CPU、内存、磁盘、显示模式、三个端口、挂不挂安装
 光盘、共享目录、端口转发，都在「配置」面板里。改完点「保存并重启」立刻生效——不用重新安装系统，
@@ -373,11 +376,16 @@ open /Applications/AgentVM.app
 
 Four things it does that most one-click VM installers do not:
 
-1. **Visual installation.** A real RFB/VNC client is embedded in the app — not a
-   screenshot every few seconds. You can drag scrollbars, type into text fields,
-   and click "Next" inside the guest. It was used to install fnOS ARM64 from an
-   ISO to a working system entirely inside the app, then reach its web UI from
-   the host. Bring your own ISO, or paste a download URL (resumable).
+1. **One-click install.** Cloud images boot straight to a login, Windows runs an
+   unattended answer file, macOS installs itself from Apple's recovery image.
+   **Your own ISO is one-click too**: a small RFB client inside the backend
+   presses Return through the graphical installer, pulls the install media when
+   the installer is done with it, and reboots off the disk — no clicking needed.
+   Take over on screen whenever you like, or pass `--no-auto` for a fully manual
+   run. It was used to install fnOS ARM64 from an ISO to a working system
+   entirely inside the app, then reach its web UI from the host. Bring your own
+   ISO, or paste a download URL (resumable). A real RFB/VNC client is embedded
+   in the app — not a screenshot every few seconds.
 2. **Visual configuration.** After install, change CPU, RAM, disk, display mode,
    three ports, and whether the install ISO is attached — then hit "Save and
    Restart" and it takes effect. No reinstall, and nothing inside the guest is

@@ -7,7 +7,7 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 
 .DEFAULT_GOAL := help
 .PHONY: help check install-tart fetch serve create-vm provision configure autostart \
-        status logs stop clean lint
+        status logs stop clean lint test
 
 # 这些变量原来一个都没定义，而 provision/status/logs/stop/configure 五个目标
 # 都在用。展开出来是 `tart stop `（VM 名是空的）、`--llm-key-file  --llm-base-url`
@@ -101,6 +101,9 @@ stop: ## Stop the VM (autostart 装过的话重启后会再起来，见 autostar
 #  - bash -n 查不出「全角标点紧跟变量名」。那不是语法错，是 bash 的变量名
 #    解析把高位字节并进了名字：`"$X，y"` 里的名字是 X<U+FF0C>，set -u 下
 #    直接 unbound variable。见 docs/PITFALLS.md M20。
+test: ## Unit-test the local-ISO auto-install driver (offline, no VM needed)
+	@python3 -I scripts/test-autoinstall.py
+
 lint: ## Syntax-check every script
 	@bash scripts/lint-wide-punct.sh
 	@for f in scripts/*.sh scripts/lib/*.sh scripts/agentvm-fetch scripts/agentvm-serve \

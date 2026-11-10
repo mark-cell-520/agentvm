@@ -120,14 +120,18 @@ fi
 app_is_stale() {
     [ -x "$APP_SRC/Contents/MacOS/AgentVM" ] || return 0
     # find 列表要覆盖 build.sh 真正拷进 bundle 的每个源：app/Resources
-    # （entitlements.plist）、scripts/winarm-vm.py、scripts/catalog.json，
-    # 以及整个 scripts/lib/（qga.py 住这儿，vmkit.py import 它）。
+    # （entitlements.plist）、scripts/winarm-vm.py、scripts/autoinstall.py、
+    # scripts/catalog.json，以及整个 scripts/lib/（qga.py 住这儿，vmkit.py
+    # import 它）。
     # 原来只列 app/Sources、build.sh、vmz/main.swift、vmkit.py，改了后三样再跑
     # ./install.sh 会复用旧 app，而日志打印「源码没有比它新」。少列 lib/ 的
-    # 后果更具体：改了客人机代理客户端，重装后 app 里还是旧的那份。
+    # 后果更具体：改了客人机代理客户端，重装后 app 里还是旧的那份。少列
+    # autoinstall.py 的后果同型：改了自动安装驱动器，app 里还是旧的那份，
+    # 而症状是「一键安装还和以前一样」。
     newer=$(find "$ROOT/app/Sources" "$ROOT/app/Resources" "$ROOT/app/build.sh" \
                 "$ROOT/scripts/vmz/main.swift" "$ROOT/scripts/vmkit.py" \
-                "$ROOT/scripts/winarm-vm.py" "$ROOT/scripts/catalog.json" \
+                "$ROOT/scripts/winarm-vm.py" "$ROOT/scripts/autoinstall.py" \
+                "$ROOT/scripts/catalog.json" \
                 "$ROOT/scripts/lib" \
                 -newer "$APP_SRC/Contents/MacOS/AgentVM" 2>/dev/null | head -1)
     [ -n "$newer" ]

@@ -243,7 +243,15 @@ struct VMDetailView: View {
                     .foregroundStyle(.orange)
                 Text("这台上次没装完").bold()
             }
-            Text("缺的文件：\(vm.broken ?? "")。现在这样既启动不了，也没法原地修好。"
+            // 不写死「缺的文件：」前缀——broken 现在有两种成因：真缺文件（原来
+            // 那种），以及文件在但盘是空的（本地包建了稀疏盘、安装没写进去，
+            // 2026-11-11 新增）。后一种点「启动」会落进 UEFI Interactive
+            // Shell，一屏英文，比报错难懂得多。两种都直接印后端给的理由。
+            //
+            // 注意：Swift 的注释里不能出现全角标点（括号、逗号都不行），
+            // swiftc 会报「invalid character in source file」而指不出是哪个字。
+            // 中文说明照写，标点一律用半角。
+            Text("\(vm.broken ?? ""). 现在这样既启动不了，也没法原地修好。"
                  + "重装会清掉它的目录从头装——它没有可用数据，不用担心丢东西。")
                 .font(.caption)
                 .foregroundStyle(.secondary)

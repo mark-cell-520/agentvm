@@ -89,6 +89,7 @@ ASSETS = ROOT / "assets"
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "catalog.json"
 WINARM = HERE / "winarm-vm.py"
+AUTOINSTALL = HERE / "autoinstall.py"
 
 # 端口分配起点。避开常见的 5900（macOS 屏幕共享）和 22/3389。
 PORT_BASE_SSH = 20000
@@ -100,6 +101,10 @@ PORT_BASE_VNC = 22000
 # 大概率已经有东西占了，转过去必然冲突。
 PORT_BASE_WEB = 23000
 WEB_GUEST_PORT = 5666
+
+# 本地包的盘小于这么多字节就算「没装过」。真正的安装至少会写进去几百 MB
+# （fnOS 1.2.07 实测 7.5G），而这个门槛要低到不会把任何一次真实安装误判掉。
+LOCAL_MIN_DISK = 32 << 20
 
 # QEMU 的 -vnc 收的是显示编号，实际监听 5900 + 编号。vm.json 里存编号，
 # 界面和 app 用的是端口。两个空间不能混着比，见 alloc_vnc_display。
@@ -1274,16 +1279,49 @@ def local_source_from_url(name: str, url: str) -> Path:
     return dest
 
 
-def cmd_install_local(vm: dict, source: Path) -> dict:
+def _reboot_local_from_disk(vm: dict) -> bool:
+    """让一台本地 ISO 装的虚拟机从硬盘进系统。
+
+    只有一种情况会走到这儿：安装器自己走完了，但光盘没拔掉，重启后又退回了
+    安装器。fnOS 在最后一屏明说「请拔出安装引导盘」，而 QEMU 这边光盘是
+    `-drive ...media=cdrom`，用户没法真的伸手拔线——只能我们替它拔。
+
+    为什么是「停掉再起」而不是 `system_reset`：2026-11-11 实测，拔了盘之后发
+    system_reset，固件仍然按 NVRAM 里那个指向光盘的启动项走，介质不在就落到
+    UEFI Interactive Shell——用户看到一屏英文 shell，比退回安装器更难懂。
+    而 QEMU 整个停掉、启动参数里不带光盘重起，固件只能看到硬盘，一定从盘启。
+    这条路也就是用户以后 `start --name X` 走的那条，顺便一起验了。
+
+    返回真表示「已经让它重启了」。
+    """
+    name = vm["name"]
+    d = vm_dir(name)
+    ai = autoinstall()
+    mon = d / "monitor.sock"
+    if not ai.cd_is_empty(mon):
+        if not (ai.eject_cd(mon)
+                or (ai.eject_cd_force(mon) and ai.cd_is_empty(mon))):
+            warn("光盘取不出来，仍然试着从硬盘起一次")
+    log("停掉虚拟机，不带安装光盘重新启动")
+    _stop_vm_by_name(name)
+    vm["attach_iso"] = False
+    save_vm(vm)
+    start_local(vm)
+    return True
+
+
+def cmd_install_local(vm: dict, source: Path, auto: bool = True,
+                      wait_minutes: int = 40) -> dict:
     """从用户自己挑的本地 ISO 装一个虚拟机。
 
-    和另两条路最大的区别：**这条不可能全自动**。Windows 有应答文件可喂，
-    Linux 云镜像压根没有安装程序，而 fnOS 这类定制安装器是图形交互的——要人选
-    盘、确认格式化、看进度。所以这里只做能做的：建盘、建 EFI 变量、把安装器
-    跑起来，然后明确告诉用户「剩下的你在画面里点完」。
+    这条路的安装器是图形交互的（fnOS 这类定制安装器要人选盘、确认格式化、
+    看进度、设网络），所以**默认由 autoinstall 那个驱动器自己点完**。
+    2026-11-11 实测：fnOS 1.2.07 从「选择安装位置」到 Web 界面 HTTP 200，
+    全程自动，没有一个手点的按钮。做法和边界见 autoinstall.py 的 docstring。
 
-    不假装能自动装完。原来那种「等 SSH 就绪」的循环在这条路上只会空等四十分钟
-    然后报超时，而用户早就装完了——撒谎比报错更难排查。
+    `--no-auto` 退回原来的手动流程：把安装器跑起来，然后明确告诉用户剩下的
+    在画面里点完。那条路留着不是偷懒——有些安装器（或者用户自己改过的系统）
+    的点法不在驱动器的判据里，硬点比不点更危险。
 
     画面给谁看：**不给 QEMU 原生窗口，只给 VNC**，理由见 local_qemu_args 里
     `headless` 那段。用户通过 app 里内嵌的控制台操作，那是一个真 RFB 客户端，
@@ -1315,6 +1353,68 @@ def cmd_install_local(vm: dict, source: Path) -> dict:
     save_vm(vm)
     start_local(vm, with_iso=True)
 
+    if not auto:
+        _local_manual_instructions(vm)
+        # 不置 ready：装没装完只有用户知道。等他 start 过一次才算数。
+        save_vm(vm)
+        return vm
+
+    # ---- 自动安装 ----
+    Emit.stage("install", "自动安装中")
+    ai = autoinstall()
+    result = ai.drive(vm, d, budget_minutes=wait_minutes,
+                      emit=lambda m, lv="info": Emit.log(m, lv))
+
+    if result == "done":
+        return _local_mark_ready(vm)
+
+    if result == "reboot":
+        # 装完了，但光盘没弹掉，重启退回了安装器。替它拔盘重启一次。
+        Emit.stage("install", "重启进系统")
+        _reboot_local_from_disk(vm)
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            if ai.service_ready(vm):
+                return _local_mark_ready(vm)
+            time.sleep(3)
+        warn("拔了光盘重启之后服务还是没起来。盘上应该已经装好了，"
+             "您可以自己在画面里看一眼，或者重试一次安装。")
+
+    # manual / timeout / 上面那个拔盘重启也没等到服务：VM 留着运行，
+    # 控制权交还用户。这时候绝不能报「装完了」——那是最难排查的一种谎。
+    _local_manual_instructions(vm)
+    save_vm(vm)
+    return vm
+
+
+def _local_mark_ready(vm: dict) -> dict:
+    """自动安装走完了：置 ready、告诉用户从哪儿进这个系统。"""
+    vm["ready"] = True
+    save_vm(vm)
+    Emit.log("")
+    Emit.log(f"虚拟机 {vm['name']} 装好了，系统已经自己起来了。", "info")
+    _local_after_ready(vm)
+    save_vm(vm)
+    return vm
+
+
+def _local_after_ready(vm: dict) -> None:
+    """装好之后告诉用户从哪儿进这个系统。"""
+    name = vm["name"]
+    web = vm.get("web_port")
+    if web:
+        Emit.log(f"  Web 界面：http://127.0.0.1:{web}", "info")
+    port = vm.get("ssh_port")
+    if port:
+        Emit.log(f"  SSH：ssh -p {port} {vm.get('user', 'agent')}@127.0.0.1",
+                 "info")
+    Emit.log(f"命令行要看画面：vmkit.py screenshot --name {name}", "info")
+    Emit.log(f"想要一个原生 macOS 窗口：vmkit.py window --name {name}", "info")
+
+
+def _local_manual_instructions(vm: dict) -> None:
+    """把控制权交还用户时，说清楚现在屏幕上有什么、下一步点什么。"""
+    name = vm["name"]
     Emit.log("")
     Emit.log("安装器已经跑起来了，画面在 app 的「控制台」里。在那里完成安装：",
              "info")
@@ -1323,12 +1423,8 @@ def cmd_install_local(vm: dict, source: Path) -> dict:
     Emit.log("  3. 等它复制完文件、设好网络，然后重启", "info")
     Emit.log("重启后它会再次进入安装器——这是正常的，直接关机即可。", "info")
     Emit.log(f"然后用 start --name {name} 就从硬盘进系统。", "info")
-    Emit.log("命令行要看画面：vmkit.py screenshot --name " + name, "info")
-    Emit.log("想要一个原生 macOS 窗口：vmkit.py window --name " + name, "info")
-
-    # 不置 ready：装没装完只有用户知道。等他 start 过一次才算数。
-    save_vm(vm)
-    return vm
+    Emit.log(f"命令行要看画面：vmkit.py screenshot --name {name}", "info")
+    Emit.log(f"想要一个原生 macOS 窗口：vmkit.py window --name {name}", "info")
 
 
 def extra_disk_args(vm: dict) -> list[str]:
@@ -1873,6 +1969,35 @@ def winarm():
         _winarm = mod
         _winarm._Die = _Die  # type: ignore[attr-defined]
     return _winarm
+
+
+_autoinstall = None
+
+
+def autoinstall():
+    """惰性加载 autoinstall.py——本地安装包的一键自动安装驱动器。
+
+    和 winarm() 同一个理由：只有本地 ISO 这条路真的用到它。另外几条路
+    （Linux 云镜像、Windows 应答文件、macOS IPSW）压根没有图形向导要点，
+    为一个用不到的特性引依赖没有意义。
+    """
+    global _autoinstall
+    if _autoinstall is None:
+        spec = importlib.util.spec_from_file_location("autoinstall",
+                                                      AUTOINSTALL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        _autoinstall = mod
+    return _autoinstall
+
+
+def _stop_vm_by_name(name: str) -> None:
+    """按名字停一台虚拟机。
+
+    cmd_stop 收的是 argparse 的 Namespace，而这里是从安装流程内部调的，
+    手上只有一个字符串。造一个最小 Namespace 比把 cmd_stop 拆成两半干净。
+    """
+    cmd_stop(argparse.Namespace(name=name))
 
 
 _qga = None
@@ -2671,7 +2796,8 @@ def cmd_install(args) -> int:
         save_vm(vm)
         Emit.stage("source", f"使用本地安装包 {src.name}"
                             f"（{human(src.stat().st_size)}）")
-        vm = cmd_install_local(vm, src)
+        vm = cmd_install_local(vm, src, auto=not args.no_auto,
+                               wait_minutes=args.wait)
         Emit.done(vm_record(vm))
         return 0
 
@@ -3131,6 +3257,17 @@ def cmd_stop(args) -> int:
             pass
     warn("优雅关机超时，强杀。qcow2 可能留下脏数据，下次开机会自愈")
     run(["kill", "-9", str(pid)], check=False)
+    # 发完 -9 必须等它真的退干净再返回。
+    #
+    # kill 是异步的：信号发出去到进程变成僵尸/消失之间有一段窗口，这时候 ps
+    # 还看得见它。紧接着任何「起虚拟机」都会走 qemu_pid → 看到「VM 已在运行」
+    # → 什么都不做就返回。用户看到的是虚拟机凭空没了，而日志说它还在跑。
+    # 2026-11-11 实测踩到：自动安装的拔盘重启路径，日志依次是
+    # 「已强杀」「VM 已在运行（pid N）」，然后卡在永远起不来的状态。
+    for _ in range(50):
+        if not qemu_pid(vm):
+            break
+        time.sleep(0.2)
     ok("已强杀")
     return 0
 
@@ -3248,7 +3385,25 @@ def vm_broken(vm: dict) -> str:
         need = ("disk.qcow2", "seed.iso")
     d = vm_dir(name)
     missing = [f for f in need if not (d / f).is_file()]
-    return ("缺 " + "、".join(missing)) if missing else ""
+    if missing:
+        return "缺 " + "、".join(missing)
+    # 文件在，但里面是空的。
+    #
+    # 本地包这条路建的是稀疏空盘：`truncate` 一下就是用户选的 32G，一个字节都没写。
+    # 安装器没跑起来、或者刚起来就被掐了，留下的正是这种状态。它不算「缺文件」，
+    # 于是 list / status 把它当成一台正常虚拟机，用户点「启动」→ 固件找不到任何
+    # 可启动项 → 落进 UEFI Interactive Shell，一屏英文，比报错难懂得多。
+    # 2026-11-11 实测：linux1 就是这么个状态（32G 盘、0 字节、stale pid 和
+    # monitor.sock 都还在），而所有命令都报告「已关机」——听着像没事。
+    if kind == "local":
+        try:
+            used = (d / "data.img").stat().st_blocks * 512
+        except OSError:
+            used = 0
+        if used < LOCAL_MIN_DISK:
+            return ("盘还是空的，安装没写进去"
+                    "（重启装一次就好，这台没有可用数据）")
+    return ""
 
 
 def vm_record(vm: dict) -> dict:
@@ -4449,6 +4604,9 @@ def main() -> int:
     p.add_argument("--ssh-key")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--wait", type=int, default=40, help="等就绪的分钟数")
+    p.add_argument("--no-auto", action="store_true",
+                   help="本地安装包不要自动点安装器，跑起来之后用户自己在"
+                        "画面里点完（默认自动点）")
     p.add_argument("--force", action="store_true",
                     help="同名就整个目录删掉重装（里面的数据一起没）")
     p.add_argument("--detach", action="store_true",

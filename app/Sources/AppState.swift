@@ -240,7 +240,9 @@ final class AppState: ObservableObject {
             args = ["--source-url", u]
         } else if let src = d.sourcePath {
             // 本地安装包。没有 catalog 条目、没有校验和、没有推荐配置，
-            // 后端直接走 cmd_install_local——建盘、开控制台，剩下的用户自己点。
+            // 后端走 cmd_install_local——建盘、把图形安装器跑起来，然后由
+            // autoinstall 那个驱动器自己点完（2026-11-11 起默认如此）。
+            // 不传 --no-auto：这条路的卖点就是「一键」，多问一句反而添乱。
             args = ["--source", src]
         } else {
             args = ["--distro", d.id]
