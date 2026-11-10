@@ -305,8 +305,28 @@ case "install":
             if macReadPID(name) != nil {
                 MacEmit.error("\(name) 正在运行。先 stop 再 --force。")
             }
-            try? FileManager.default.removeItem(at: MacVMPaths.dir(name))
-            MacEmit.log("--force：清掉 \(name) 重新装", level: "warn")
+            // 只清 vmz 自己的产物，别把整个目录端掉。两个理由，都是实测踩的：
+            //
+            // 1. **日志会凭空消失。** vmkit 的 spawn_detached_install 在起这个
+            //    进程之前就 open("a") 了 <vm>/install.log，stdout 也重定向到
+            //    那个句柄。整目录 removeItem 之后句柄还开着、文件已经 unlink，
+            //    于是安装照跑、输出写进一个谁都打不开的 inode：install.log
+            //    不再出现，`vmkit status` 的日志路径指向空气，而 macOS 安装要
+            //    几十分钟，全程零可观测。
+            // 2. **25.6 GB 的 IPSW 白下。** ipsw/ 在这个目录里，一起删等于
+            //    macInstall 再也走不到「复用已下载的」那条分支，重装必须重新
+            //    下 25.6 GB（本次实测下载要 19 分钟）。
+            //
+            // 所以逐项删：系统盘、NVRAM、机器标识、硬件模型、配置。快照留着
+            // 不合理（那是旧盘的 COW 克隆，底册变了就是脏数据），一起删。
+            for u in [MacVMPaths.spec(name), MacVMPaths.disk(name),
+                      MacVMPaths.auxStorage(name), MacVMPaths.machineID(name),
+                      MacVMPaths.hardwareModel(name), MacVMPaths.pidFile(name),
+                      MacVMPaths.snapshots(name)] {
+                try? FileManager.default.removeItem(at: u)
+            }
+            MacEmit.log("--force：清掉 \(name) 的磁盘与配置重新装（已下的 IPSW 保留）",
+                        level: "warn")
         }
         var spec = MacVMSpec()
         spec.name = name
