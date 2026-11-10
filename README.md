@@ -97,6 +97,44 @@ OpenAVB ROM、idevicerestore 补丁一整套。而 VZ 的 `VZMacOSRestoreImage` 
 `VZMacOSInstaller` / `VZMacOSBootLoader` 是公开 API，宿主机上直接拿到
 macOS 27.2.1 的 IPSW 地址。详见 [docs/AGENTVM-APP.md](docs/AGENTVM-APP.md)。
 
+## 装机速度：把 apt 那段从几分钟压到几十秒
+
+Linux 云镜像「下载完就能用」，但 `install` 报「已就绪」之后还有一段在跑：
+cloud-init 要现装 `qemu-guest-agent`，而那之前有一次 `apt-get update`。
+2026-11-10 实测这一段要 25 到 140 秒（Debian 13 更是永远完不成），
+占掉整个装机时间的大头。三件事把它压下来：
+
+**1. 装之前先给 apt 镜像测速。** 官方源实测只有 0.3 MB/s，国内镜像 5 到 10 MB/s。
+`install` 会并发探四个源、取最快的写进种子盘，全程约 4 秒。
+不想测就指定：`AGENTVM_APT_MIRROR=https://...` 环境变量，或 vm.json 里的
+`apt_mirror` 字段。海外用户会测出官方源最快，不会被迫走国内镜像。
+
+**2. 裁掉用不到的索引。** 种子盘里写一份 `/etc/apt/apt.conf.d/99zz-agentvm-fastindex`：
+不下载 Translation（每个 suite×component 一份）、索引就地压缩不展开、
+只用 IPv4、关掉 DEP-11 和 CNF 两个索引目标。Ubuntu 24.04 上实测
+`apt-get update` 从 155 秒降到 46 秒，落盘从 152 MB 降到 57 MB。
+代价写在那份文件的注释里（`apt show` 没有本地化描述、`command-not-found` 失效），
+删掉文件就回默认行为。
+
+**3. Debian 的 security 源地址是错的，得换。** Debian trixie 云镜像自带的
+`/etc/apt/mirrors/debian-security.list` 指向 `<镜像>/debian/`，而 Debian 的
+security 套件在这些镜像上是**另一条树** `<镜像>/debian-security/`——四个源
+实测前者全 404、后者全 200。apt 反复重试之后报
+`does not have a Release file`，cloud-init 的装包模块失败，
+`cloud-init status` 停在 `error`。这就是 docs/PITFALLS.md M8 记了半天的
+「Debian 13 apt 卡住」的真正原因。现在对 Debian 走
+`preserve_sources_list` 加自写 deb822，实测 `qemu-guest-agent` 从永远装不上
+变成 8 秒上线。
+
+三件加起来，三个系统等 guest agent 的时间：
+
+    Ubuntu 24.04   169 秒 → 38 秒
+    Ubuntu 22.04   132 秒 → 72 秒
+    Debian 13      永远卡住 → 8 秒
+
+SSH 就绪之后会显示「等 guest agent 上线」并报进度，不再是干等。
+到 180 秒还不通才 warn，VM 照样能用（SSH 和窗口不受影响）。
+
 ## 客人机代理与共享目录
 
 Linux 云镜像那条路从 install 起就带着 QEMU guest agent：cloud-init 装

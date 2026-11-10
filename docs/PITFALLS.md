@@ -553,7 +553,7 @@ YAML 注入」），而引号外跟内容是同一个病的另一个实例。
 **影响范围.** 只有 `linux_seed()` 这两行。改完之后 user-data 和 meta-data
 都用 `yaml.safe_load` 验过能解析，`passwd` 里的 `p@ss #word` 也还是原值。
 
-## M8. Debian 13 云镜像的 apt 在 QEMU 里下载完就挂住，cloud-init 永远不完成
+## M8. Debian 13 云镜像的 apt 卡住——根因是镜像自带的 security 源地址是错的（已修）
 
 **症状.** 2026-11-10 装 `debian-13`（trixie genericcloud arm64），SSH 12 秒
 就通、`vmkit.py install` 打印「已就绪」，但 `guest ping` 报「guest agent 不可达」，
@@ -580,24 +580,59 @@ YAML 注入」），而引号外跟内容是同一个病的另一个实例。
 `do_select`，而 `sqv`（apt 2.9 的签名验证器，`/usr/lib/apt/methods/sqv`）
 CPU 时间是 `00:00:00`——一个跑了十几分钟却一秒 CPU 都没用过的进程。
 
-**结论.** 挂在 apt 下载完成之后的 sqv 验证上，是 Debian trixie 的 apt 2.9
+**结论（当时）. 挂在 apt 下载完成之后的 sqv 验证上，是 Debian trixie 的 apt 2.9
 在这个 VM 环境里的内部问题，与本项目的 QEMU 参数、网络、cloud-init 配置都无关。
 没有找到不需要关闭签名验证的规避手段，所以不默认改 seed——为装一个包
 全局禁掉 `APT::Get::AllowUnauthenticated` 不划算。
 
-**影响与现状.** 只影响 Debian 系：`qemu-guest-agent` 装不上，于是
-`vmkit.py guest` 子命令和 stop 的「agent 优先」关机在 Debian 上不可用，
-stop 会走 SSH 那条路（照样能优雅关机）。Ubuntu 24.04 与 22.04 实测不受影响，
-cloud-init 十几秒内就把包装好了。VM 本身完全可用，登得进去、有网、能 SSH。
+**后来找到了真正的根因（2026-11-10 当天晚上，已修）.** 上面五条排除都对，
+但方向找错了：问题不在「下载完成之后」，而在 **security 那个套件的地址根本是
+404**。Debian trixie 云镜像的源长这样：
 
-**怎么让这件事当场可见.** `start_linux()` 在 SSH 就绪后多探一次 guest agent
-（`_warn_if_no_guest_agent`）：不通就明说「cloud-init 可能还在装包或装失败了」
-并给出客人机里的排查命令，而不是让「已就绪」把两种情况混成一句。装好包之后
-`guest ping` 会自己通，不需要重装 VM。
+    URIs: mirror+file:///etc/apt/mirrors/debian-security.list
+    Suites: trixie-security
 
-**待验证.** apt 挂起是否只出现在 trixie 的 apt 2.9。bookworm（debian-12）
-用的是 apt 2.6，没有 sqv，理论上不受影响——但 debian-12 本轮没有完整装过，
-这条是推断不是实测。
+而 `/etc/apt/mirrors/debian-security.list` 里写的是
+`https://mirrors.tuna.tsinghua.edu.cn/debian/`——**少了 `-security` 后缀**。
+Debian 的 security 套件在这些镜像上是一条独立的树。实测四个源：
+
+    <镜像>/debian/dists/trixie-security/Release          全部 404
+    <镜像>/debian-security/dists/trixie-security/Release  全部 200
+    （清华、阿里、USTC、deb.debian.org 四个源都是这个规律）
+
+apt 拿到 404 会重试，最后报
+`E: The repository 'mirror+file:/etc/apt/mirrors/debian-security.list trixie-security Release' does not have a Release file`，
+cloud-init 的 `package_update_upgrade_install` 随之失败，`cloud-init status`
+变成 `error`。而「下载完 9614 kB 之后卡住」那个表象，是 main/updates/backports
+三个套件下完之后、security 那个 404 在重试——`ss` 看到一条 ESTAB 且
+Recv-Q=0 的连接、sqv 零 CPU，都是重试间隔里的样子，不是验签卡住。
+
+**为什么之前没看出来.** 手动 `apt-get update` 的报错被 `-o Debug::Acquire::http=1`
+的输出淹没了，而当时的排查一直在追「下载完成之后发生了什么」。
+`Acquire::ForceIPv4=true` 一度让症状从「挂住」变成「快速报错」，
+反而成了定位它的线索。
+
+**修法.** `linux_seed` 对 Debian 走另一条路：`apt: {preserve_sources_list: true}`
+让 cloud-init 别重写源，然后自己写一份 deb822，security 指向
+`<镜像>/debian-security/`，顺带去掉用不到的 `deb-src`。镜像根由
+`pick_apt_mirror` 测速选出来（官方 deb.debian.org 实测 0.0–0.1 MB/s，
+清华 5 MB/s、阿里 8–10 MB/s），测不出就用官方地址。
+实测效果：`qemu-guest-agent` 从「永远装不上」变成 8 秒上线，
+`cloud-init status` 从 `error` 变成 `done`。
+
+**影响与现状.** 已修。修完之后 Debian 13 与 Ubuntu 一样：
+`cloud-init status: done`、`qemu-guest-agent` 8 秒上线、`guest` 子命令和
+stop 的 agent 优先关机都可用。VM 本身一直完全可用（登得进去、有网、能 SSH），
+受影响的只是 guest agent 那一条路。
+
+**怎么让这类问题当场可见.** `start_linux()` 在 SSH 就绪后改成有上限地等
+guest agent（`_wait_guest_agent`，180 秒）并报进度：apt 在装包时 VM 早就能
+登录了，探一次就 warn 会让「已就绪」把「装好了」和「还在装」混成一句。
+到点仍不通才 warn，并给出客人机里的排查命令。
+
+**另一条同类坑.** cloud-init 的 `apt.primary` / `apt.security` 在 Ubuntu 上
+直接生效，在 Debian 上**完全无效**——Debian 的源走 `mirror+file:` 重定向，
+改 `apt.primary` 之后 `URIs` 原样不动（实测）。两家的源机制不是一套。
 
 ## M9. Windows RDP：guest 内完全正常，但宿主机经 hostfwd 连不上
 
@@ -729,3 +764,79 @@ pid 文件还在，所以 `vmkit stop --name X` 事后能停；但没有任何�
 不再把 SIGPIPE 转成 BrokenPipeError，`vmkit install | head` 这类用法会安静地
 把客人机一起带走——那正是想要的行为，但意味着别指望能靠管道中途断开来
 「只看看前几行」而不影响安装。
+
+## M14. macOS/HVF 上几条「调优手段」其实是无效的，别浪费时间
+
+2026-11-10 逐条查了 QEMU 11.1.3 源码加本机实测，结论都带证据。记下来是为了
+下次别再被网上的说法带跑。
+
+**`-global virtio-blk-pci.cache-size=2M` 会让 QEMU 起不来。** `cache-size`
+从来不是 virtio-blk 的设备属性——`-device virtio-blk-pci,help` 列出的 75 个
+属性里只有 `write-cache`，写成 `-global` 直接
+`Property 'virtio-blk-pci.cache-size' not found` 然后 exit 1。它是 **qcow2
+镜像格式**的选项（L2/refcount 块缓存）。而且 `-global` 是懒生效的：命令行里
+有它但没创建对应设备时 QEMU 不报错，等到某天加了块盘才炸。
+macOS 上 qcow2 的 L2 缓存默认只有 8 MiB（Linux 是 32 MiB），`cache-size=2M`
+是把 8 MiB 砍到 2 MiB，方向是反的。
+
+**`cache=none` 在 macOS 上不绕开宿主 page cache。** macOS 没有 `O_DIRECT`
+（clang 探测确认，`os.O_DIRECT` 也不存在），QEMU 的 `block/file-posix.c` 把
+`O_DIRECT` 定义成 `O_DSYNC`。于是四种 cache 模式在 macOS 上的真实行为是：
+`writeback` 无附加标志、`writethrough` 无、`none` O_DSYNC、`directsync`
+O_DSYNC——**没有一种是真 O_DIRECT**。`writeback`（默认）就是对的。
+
+**`aio=native` / `aio=io_uring` 在 macOS 上直接拒绝。** 实测
+`aio=native was specified, but is not supported in this build.` 和
+`invalid aio option`。macOS 上默认就是 `aio=threads`，而且没有别的可选。
+
+**iothread 在 HVF 下拿不到主要收益。** `accel/hvf/hvf-all.c` 的 memory
+listener 没有 `eventfd_add`/`eventfd_del`（整个 `accel/hvf/` 目录 grep
+`eventfd` 零命中），而 `hw/virtio/virtio-pci.c` 的
+`memory_region_add_eventfd()` 是无条件调的——只是没人接。所以 virtio 门铃在
+HVF 上永远走 data abort → VM exit → 用户态 `virtio_queue_notify()`，
+iothread 只影响 `handle_output` 之后跑在哪个 AioContext。UTM 的 QEMU 配置里
+也没有 iothread / num-queues / vectors（`UTMQemuConfiguration+Arguments.swift`
+全文 grep 零命中）。
+
+**`num-queues` 的默认值是 1，而且上限是 vCPU 数。**
+`include/hw/virtio/virtio-blk.h` 的 `VIRTIO_BLK_AUTO_NUM_QUEUES = UINT16_MAX`
+被解析成 `conf->num_queues = 1`；实测 2 vCPU 下 `num-queues=4/8` 都只建出
+2 个队列，写吞吐 2.0–2.4 GB/s 与默认无差别。
+
+**`virtio-balloon` 在 macOS 上是结构性失效。** QEMU issue #4170：
+`ram_block_discard_range()` 在 macOS 上返回成功但不真的把内存还给宿主机，
+于是 balloon 充气、free page reporting、virtio-mem 全部变成 no-op，
+「没有 error、没有 warning，trace 里每次调用都是 `ret: 0`」。这不是配置问题。
+
+**`gic-version=3` 设不设都一样。** HVF 下 GICv3 的可用条件是
+`!kernel_irqchip || !vms->virt`，而 `-machine virt,virtualization=` 默认 false，
+所以任何组合下 GICv3 都成立。真正起作用的 `kernel-irqchip` 在 virt-11.1 及以后
+**默认就是 on**（`hw/arm/virt.c` 的 `virt_machine_11_1_options()` 不设
+`hvf_no_kernel_irqchip_default`），运行时 `info qtree` 能看到
+`dev: hvf-arm-gicv3`。UTM 那个 in-kernel GICv3 补丁已经被上游吸收，
+我们用 11.1.3 等于白拿到了。
+
+**qcow2 `cluster_size` 越大越占空间。** 实测首启后实际占用：
+默认 64K 是 27 MB，1M 是 131 MB，2M 是 182 MB。L2 缓存上限只有 8 MiB，
+大 cluster 不会提升命中率，只会让 `max_l2_cache` 更大、更占空间。
+
+**窗口不可见时 QEMU 慢 5 到 10 倍。** QEMU issue #3190，macOS App Nap 导致。
+我们是 launchd 无人值守跑的，如果哪天发现「同配置前台跑就是快」，先查这条。
+`-display none` 不起 Cocoa 前端，理论不受影响，但没有实测过。
+
+## M15. Apple CDN 加连接不会更快，反而更慢
+
+2026-11-10 实测 `updates.cdn-apple.com`（UniversalMac IPSW）：
+
+    串行单连接，4 个 100 MB 段   2.8 / 3.1 / 3.0 / 5.5 秒（19–36 MB/s）
+    6 个 curl 并发，每段 100 MB  段耗时 8.8–16.2 秒，聚合 37 MB/s
+    2 个 curl 并发              段耗时 12.2–17.9 秒，比串行还慢
+
+CDN 是按客户端限速的，加连接只是把每条的份额摊薄，聚合不涨。
+所以下载就是一条 curl 连接加 `-C -` 续传。
+
+顺带记一个反例：早前一版的 `SegmentedDownloader`（URLSession 多连接分段）
+文档里写「单连接 1 MB/s、6 连接聚合 18.8 MB/s」，那个数与这次实测不符，
+而且那条路在 Apple CDN 上每次都稳定卡在同一个段、根本下不完
+（四种修法全部实测排除，见 MacVMEngine.swift 里 `macFetchWithCurl` 的注释）。
+那个类已经删掉。

@@ -76,6 +76,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:      # 只在拼 cloud-config 时才需要，见 linux_seed
+    yaml = None
+
 HOME = Path.home()
 ROOT = HOME / ".agentvm"
 IMAGES = ROOT / "images"
@@ -649,6 +654,16 @@ def alloc_vnc_display(taken_displays: set[int]) -> int:
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
+def indent(text: str, n: int) -> str:
+    """给多行文本每行加 n 个空格，供嵌进 YAML 的 `content: |` 块。
+
+    YAML 的块标量看的是缩进，少一个空格整块就不是它的内容——那种错不会报错，
+    只会让 cloud-init 拿到一份错乱的用户数据。所以宁可走函数也不手写空格。
+    """
+    pad = " " * n
+    return "\n".join(pad + line if line.strip() else "" for line in text.splitlines())
+
+
 def _yaml_scalar(s: str) -> str:
     """把一个任意字符串变成安全的 YAML 双引号标量。
 
@@ -658,13 +673,178 @@ def _yaml_scalar(s: str) -> str:
     return json.dumps(str(s), ensure_ascii=False)
 
 
-def linux_seed(vm: dict) -> Path:
+def _apt_suite(distro: dict) -> str:
+    """从 catalog 的镜像地址里解出 suite 名（noble / jammy / trixie）。
+
+    两种地址形状：
+      cloud-images.ubuntu.com/<suite>/current/xxx.img
+      cloud.debian.org/images/cloud/<suite>/latest/xxx.qcow2
+
+    解不出来就返回空串，调用方退回官方源、不测速——猜一个错的 suite 会让
+    探测全数 404，白等一轮超时。
+    """
+    u = distro.get("url", "")
+    m = re.search(r"cloud-images\.ubuntu\.com/([^/]+)/", u)
+    if m:
+        return m.group(1)
+    m = re.search(r"/images/cloud/([^/]+)/", u)
+    if m:
+        return m.group(1)
+    return ""
+
+
+# 首启 apt 的镜像候选。**为什么不写死用官方源**：2026-11-10 实测同一个
+# 15.3 MB 的 Packages.xz，ports.ubuntu.com 要 13.13 秒（1.17 MB/s），
+# 清华源 0.81 秒（19 MB/s），差 16 倍。cloud-init 首启要下约 40 MB 索引
+# （解压后落盘 229 MB），这一段就是「SSH 12 秒就绪、guest agent 却还要
+# 25 到 140 秒才上线」的全部原因。
+#
+# 也不写死用国内源：那会把海外用户卡死。所以装的时候现场测一轮取最快的，
+# 测不了就退回官方源。指定过的（AGENTVM_APT_MIRROR 或 vm.json 的
+# apt_mirror）直接用它，不测。
+_APT_MIRRORS = {
+    "ubuntu": [
+        "http://ports.ubuntu.com/ubuntu-ports",
+        "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/",
+        "https://mirrors.aliyun.com/ubuntu-ports/",
+        "https://mirrors.ustc.edu.cn/ubuntu-ports/",
+    ],
+    "debian": [
+        "http://deb.debian.org/debian",
+        "https://mirrors.tuna.tsinghua.edu.cn/debian/",
+        "https://mirrors.aliyun.com/debian/",
+        "https://mirrors.ustc.edu.cn/debian/",
+    ],
+}
+
+# 每个镜像下多大的片段来测速。2 MB：足够分辨 0.3 MB/s 和 3 MB/s 这种量级差，
+# 又不至于在慢源上把安装卡住。四个源并行、每个有独立超时，见 _mirror_speed。
+_MIRROR_PROBE_BYTES = 2 << 20
+# 单个源的测速预算。慢源上多等没意义——它已经证明自己慢了。
+_MIRROR_BUDGET = 5.0
+
+
+def _mirror_speed(base: str, probe: str, budget: float = _MIRROR_BUDGET) -> float:
+    """下一个固定大小的 range，返回字节/秒。失败或超时返回 0。"""
+    url = base.rstrip("/") + probe
+    try:
+        r = subprocess.run(
+            [find_tool("curl"), "-sS", "-L", "--max-time", f"{budget:g}",
+             "-o", os.devnull, "-r", f"0-{_MIRROR_PROBE_BYTES - 1}",
+             "-w", "%{speed_download}", url],
+            capture_output=True, text=True, timeout=budget + 5)
+        return float(r.stdout.strip() or 0)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0
+
+
+def pick_apt_mirror(vm: dict, distro: dict) -> str:
+    """给这台 VM 选一个 apt 镜像，返回 deb822 的 URIs 值（空串 = 用镜像默认）。
+
+    现场测速而不是写死：官方源与国内镜像差一个数量级，而这个差距反过来在
+    海外也是成立的。测速总共约几秒（四个源并行），而首启能省几十秒。
+
+    suite 解不出来时不测：探测路径是 `/dists/<suite>/main/binary-arm64/Packages.xz`，
+     suite 错了全部 404，测出来是「官方源最快」——一个完全错误的结论。
+    """
+    forced = (os.environ.get("AGENTVM_APT_MIRROR")
+              or vm.get("apt_mirror") or "").strip()
+    if forced:
+        return forced.rstrip("/") + "/"
+
+    suite = _apt_suite(distro)
+    family = "debian" if distro.get("id", "").startswith("debian") else "ubuntu"
+    cands = _APT_MIRRORS.get(family) or []
+    if not suite or not cands:
+        return ""
+    probe = f"/dists/{suite}/main/binary-arm64/Packages.xz"
+    Emit.stage("mirror", "测速选 apt 镜像")
+    # 并行测：串行四个源在最慢的那个上能白等半分钟。
+    speeds: dict[str, float] = {}
+    threads = []
+    for base in cands:
+        def _go(b: str = base) -> None:
+            speeds[b] = _mirror_speed(b, probe)
+        t = threading.Thread(target=_go, daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=_MIRROR_BUDGET + 3)
+    best = max(cands, key=lambda b: speeds.get(b, 0.0))
+    got = speeds.get(best, 0.0)
+    if got <= 0:
+        # 一个都没测出来（没网、或者全部超时）。不猜，用镜像默认源。
+        log("apt 镜像测速没结果，用云镜像自带的源")
+        return ""
+    for b in cands:
+        if speeds.get(b):
+            log(f"  apt 镜像 {b.split('/')[2]:32s} {speeds[b] / 1e6:6.1f} MB/s")
+    log(f"选用最快的 apt 镜像：{best}（{got / 1e6:.1f} MB/s）")
+    return best.rstrip("/") + "/"
+
+
+# 首启 apt 调优。写进 /etc/apt/apt.conf.d/99zz-agentvm-fastindex，apt 每次启动
+# 都重读这个目录，所以一定生效；`99zz` 开头是为了排在 cloud-init 自己那两个
+# 片段（90cloud-init-aptproxy、94cloud-init-config）和镜像自带的
+# 99needrestart / 99update-notifier 后面，不被它们盖掉。
+#
+# **四个设置都是实测出来的**（2026-11-10，Ubuntu 24.04 ARM64 客人机，清空
+# /var/lib/apt/lists 后从头 apt-get update）：
+#
+#   基线（官方源）                        155.24 s   152 MB 落盘
+#   + Acquire::Languages none              （省 8.25 MB 网络 / 64 MB 落盘）
+#   + Acquire::GzipIndexes true             78.89 s    64 MB
+#   + Acquire::ForceIPv4 true               58.67 s    64 MB
+#   + 关 DEP-11 / CNF 索引目标              45.77 s    57 MB
+#
+# 没有把 Acquire::http::Pipeline-Depth 放进来：它只值 11%（79→70 秒），却是
+# 唯一一个「镜像不支持就整次 update 失败」的设置，不值得拿可靠性换。
+#
+# 代价，说清楚免得以后有人查「为什么 apt show 没有中文描述」：
+#   Languages none    `apt show` / `apt-cache show` 不再有本地化描述
+#   GzipIndexes       apt 每次构建包缓存要现场解压，弱 CPU 上略慢
+#   DEP-11 / CNF 关   没有软件中心元数据；`command-not-found` 失效
+#   三者对「装一个包」都没有影响，实测 qemu-guest-agent 照常装上。
+_APT_FASTINDEX = """\
+# 由 agentvm 生成。删掉这个文件就回到 apt 默认行为。
+# 依据与各项代价见 scripts/vmkit.py 的 _APT_FASTINDEX 注释。
+Acquire::Languages "none";
+Acquire::GzipIndexes "true";
+Acquire::ForceIPv4 "true";
+Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
+Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";
+"""
+
+# Debian trixie 云镜像的源。镜像自带的那份两个问题：security 指向不带
+# `/debian-security` 后缀的树（404），以及开着 deb-src（源码索引，装二进制包
+# 用不到，每套件多一倍索引目标）。2026-11-10 实测四个镜像的
+# `/debian/dists/trixie-security/Release` 全 404、`/debian-security/` 全 200。
+_DEBIAN_SOURCES = """\
+# 由 agentvm 生成。cloud-init 的 preserve_sources_list 不让它覆盖这个文件。
+Types: deb
+URIs: {main}
+Suites: {suite} {suite}-updates {suite}-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: {security}
+Suites: {suite}-security
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+"""
+
+
+def linux_seed(vm: dict, distro: dict | None = None) -> Path:
     """生成 cloud-init 的 NoCloud 配置盘。
 
     为什么用云镜像 + NoCloud，而不是 netinst 加 preseed：云镜像本身就是
     装好的系统，qcow2 叠一层 overlay 就能跑，没有安装程序要交互；账号、
     密码、SSH 公钥全从配置盘喂进去。用 netinst 的话要多伺候一套 preseed
     和安装期网络镜像，出问题的地方多一个数量级。
+
+    distro 给了才会做 apt 镜像测速（见 pick_apt_mirror）。只重写种子盘而不
+    重装的时候没有 catalog 条目，那时沿用云镜像自带的源。
 
     卷标必须是 cidata，这是 cloud-init 的 NoCloud 数据源认的标签；
     hdiutil 的 -default-volume-name 会给 ISO9660 的 CIDATA，正好对上。
@@ -699,6 +879,74 @@ def linux_seed(vm: dict) -> Path:
     # 但漏了「引号外不能跟内容」这一条。
     fqdn = _yaml_scalar(vm['name'] + '.local')
     instance_id = _yaml_scalar(vm['name'] + '-001')
+    mirror = pick_apt_mirror(vm, distro)
+    is_debian = bool(distro) and str(distro.get("id", "")).startswith("debian")
+    apt_block = ""
+    extra_files = ""
+    if is_debian:
+        # Debian 和 Ubuntu 的源机制不一样，得分开处理，2026-11-10 两条都实测过。
+        #
+        # **Ubuntu**：`apt.primary` / `apt.security` 直接生效（cloud-init 的
+        # cc_apt_configure 会重写 ubuntu.sources，而 arm64 的 primary 和
+        # security 都指向官方源，所以两个都要给）。
+        #
+        # **Debian trixie 云镜像根本不吃这一套**：它的源是
+        # `mirror+file:///etc/apt/mirrors/debian.list`，由那个文件里的地址
+        # 重定向，cloud-init 的 apt.primary 改了也没用（实测 URIs 原样不动）。
+        # 而镜像自带的 `debian-security.list` 写的是
+        # `https://mirrors.tuna.tsinghua.edu.cn/debian/`——**不带 security 后缀**，
+        # 于是 trixie-security 404。实测：清华/阿里/USTC/官方四个源的
+        # `/debian/dists/trixie-security/Release` 全部 404，而它们的
+        # `/debian-security/dists/trixie-security/Release` 全部 200。
+        # Debian 的 security 套件在这些镜像上是一条独立的树。
+        #
+        # 这一条就是 docs/PITFALLS.md M8「Debian 13 apt 卡住」的真正原因：
+        # apt 拿到 404 会重试，cloud-init 的 package_update_upgrade_install
+        # 最终报 `does not have a Release file` 失败，`cloud-init status`
+        # 变成 error——而 SSH 和窗口都是好的，VM 看着像装成功了。
+        #
+        # 修法：preserve_sources_list 让 cloud-init 别重写源，然后自己写一份
+        # 正确的 deb822。顺带把 deb-src 去掉——那是源码索引，装二进制包用不到，
+        # 每套件少一半索引目标。
+        if mirror:
+            root = mirror.rstrip("/")
+            # 候选列表里 Debian 项自带 `/debian` 尾巴，去掉才是镜像根
+            if root.endswith("/debian"):
+                root = root[: -len("/debian")]
+        else:
+            root = "http://deb.debian.org"
+        main_uri = root + "/debian/"
+        sec_uri = root + "/debian-security/"
+        suite = _apt_suite(distro) or "trixie"
+        apt_block = (
+            f"\n# preserve_sources_list：不让 cloud-init 重写源，下面那份\n"
+            f"# deb822 才是最终生效的。\n"
+            f"apt:\n"
+            f"  preserve_sources_list: true\n")
+        extra_files = (
+            f"\n  # Debian 的 security 套件在镜像上是一条独立的树（<镜像>/debian-security），\n"
+            f"  # 而云镜像自带的 debian-security.list 少写了这一段，导致 404。\n"
+            f"  - path: /etc/apt/sources.list.d/debian.sources\n"
+            f"    permissions: '0644'\n"
+            f"    content: |\n"
+            f"{indent(_DEBIAN_SOURCES.format(main=main_uri, security=sec_uri, suite=suite), 6)}\n")
+    elif mirror:
+        # **primary / security 是列表，不是单个字典。** 2026-11-10 实测踩过：
+        # 写成 `primary: {{arches: [...], uri: ...}}` 时 cloud-init 的 schema
+        # 校验报 warning、`config-apt_configure` 直接
+        # `AttributeError: 'str' object has no attribute 'get'` 崩掉，
+        # `cloud-init status` 变成 error，而 packages 那条路照样跑成功——
+        # 表象是「镜像没换成、cloud-init 报错」，两件事看起来无关。
+        apt_block = (
+            f"\n# 用测速选出来的快镜像。官方源实测 0.3 MB/s、国内镜像 7.6 MB/s，\n"
+            f"# 首启那 40 MB 索引就是 guest agent 迟迟不上线的原因。\n"
+            f"apt:\n"
+            f"  primary:\n"
+            f"    - arches: [default]\n"
+            f"      uri: {mirror}\n"
+            f"  security:\n"
+            f"    - arches: [default]\n"
+            f"      uri: {mirror}\n")
     ud = f"""#cloud-config
 # 由 agentvm 生成，改这个文件不如改 vm.json 后重跑 install。
 hostname: {_yaml_scalar(vm['name'])}
@@ -721,6 +969,12 @@ disable_root: true
 chpasswd:
   expire: false
 
+write_files:
+  - path: /etc/apt/apt.conf.d/99zz-agentvm-fastindex
+    permissions: '0644'
+    content: |
+{indent(_APT_FASTINDEX, 6)}
+{extra_files}{apt_block}
 # 云镜像默认只装最小集。把常用的补上，省得用户登进去再 apt 一遍。
 packages:
   - openssh-server
@@ -757,6 +1011,34 @@ runcmd:
   # stdout 重定向到具体的 /dev/ttyN 才能作用到那个 VT。
   - [ sh, -c, "for n in 0 1 2 3 4 5 6; do setterm -blank 0 -powersave off -powerdown 0 >/dev/tty$n 2>/dev/null || true; done" ]
 """
+    # 落盘前先自己解一遍 YAML。cloud-config 是拼出来的 f-string，一个缩进错
+    # 就能让整份作废——而作废的现场是「VM 起来了但登不进去」，宿主机这一路
+    # 全是成功。实测踩过两次：`fqdn: "x".local` 引号外跟内容（整份被丢），
+    # 和 `apt.primary` 写成字典而不是列表（schema 校验 warning 加
+    # apt_configure 崩掉，cloud-init status 变 error）。两次都是装机之后才
+    # 发现，而这里一行 parse 就能当场抓住。
+    if yaml is None:
+        warn("没有 PyYAML，跳过 cloud-config 自检（pip install pyyaml 可补上）")
+    else:
+        try:
+            parsed = yaml.safe_load(ud)
+        except yaml.YAMLError as e:
+            die(f"生成的 cloud-config 不是合法 YAML：{e}\n这是 agentvm 的 bug，"
+                f"请把这段报错提到 issue。")
+        if not isinstance(parsed, dict):
+            die(f"生成的 cloud-config 不是一个映射：{type(parsed).__name__}。"
+                f"这是 agentvm 的 bug。")
+        # apt.primary / apt.security 必须是列表。写成字典时 cloud-init 的
+        # apt_configure 会 AttributeError 崩掉，而 packages 照样装成功——
+        # 现场是「镜像没换成 + cloud-init 报错」，两件事看不出关联。
+        for key in ("primary", "security"):
+            v = (parsed.get("apt") or {}).get(key)
+            if v is not None and not isinstance(v, list):
+                die(f"cloud-config 里 apt.{key} 必须是列表，实际是 "
+                    f"{type(v).__name__}。这是 agentvm 的 bug。")
+        if not isinstance(parsed.get("write_files"), list):
+            die("cloud-config 里 write_files 必须是列表。这是 agentvm 的 bug。")
+
     (src / "user-data").write_text(ud)
     (src / "meta-data").write_text(
         f"instance-id: {instance_id}\n"
@@ -935,7 +1217,7 @@ def cmd_install_linux(vm: dict, distro: dict) -> dict:
         ok(f"已建 {vm['disk']} overlay 磁盘 {disk}（底册 {img.name}）")
 
     Emit.stage("seed", "写入 cloud-init 账号配置")
-    linux_seed(vm)
+    linux_seed(vm, distro)
 
     Emit.stage("boot", "首次启动")
     start_linux(vm, wait_ssh=True)
