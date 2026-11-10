@@ -1639,21 +1639,23 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
     /// 把进程带走，客人机从没收到 ACPI 关机事件，那一下跟 kill -9 等效。
     func stop(completion: ((_ timedOut: Bool) -> Void)? = nil) {
         guard let machine = vm else { completion?(false); return }
-        guard machine.canStop else {
-            // 已经停了（或者正在停）。收尾。
-            vm = nil
-            try? FileManager.default.removeItem(at: MacVMPaths.pidFile(specName))
-            DispatchQueue.main.async { self.state = .stopped }
-            completion?(false)
-            return
-        }
         DispatchQueue.main.async { self.state = .stopping }
         // 优雅停机。macOS 会收到关机事件、正常 flush 磁盘。
         // 强杀（kill -9）会让 APFS 留下未干净的日志，下次启动跑 fsck
         // 要好几分钟——跟 QEMU 那边 Windows 的坑同源。
+        //
+        // canStop 也必须在 vmQueue 上：VZVirtualMachine 的属性内部有
+        // dispatch_assert_queue，在主线程读它和调它的方法一样直接 SIGTRAP。
+        // 原来那句 `guard machine.canStop` 就在主线程，app 里点一次关机
+        // 就是一个没有日志的崩溃。
         let box = Box()
         vmQueue.async {
-            machine.stop { err in box.err = err; box.sem.signal() }
+            if machine.canStop {
+                machine.stop { err in box.err = err; box.sem.signal() }
+            } else {
+                // 已经停了（或者正在停）。
+                box.sem.signal()
+            }
         }
         // 等，但在 vmQueue 之外的后台队列上等：调用方（app 主线程、CLI 信号
         // 队列）都不被堵住。
@@ -1681,19 +1683,19 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
     /// 超时不抛错：等不到也只能让进程走，但日志里要说清楚这次是非优雅停机。
     func stopAndWait(timeout: TimeInterval = 45) {
         guard let machine = vm else { return }
-        guard machine.canStop else {
-            // 已经停了（或者正在停）。收尾。
-            vm = nil
-            try? FileManager.default.removeItem(at: MacVMPaths.pidFile(specName))
-            DispatchQueue.main.async { self.state = .stopped }
-            return
-        }
         DispatchQueue.main.async { self.state = .stopping }
         // 代理先拆：进程马上就要没了，而桥里的 DispatchIO 还在跑的话，
         // 退出时那些队列会被硬停，客人机侧的连接变成没人关的半开状态。
         teardownVsockProxy()
         let box = Box()
-        vmQueue.async { machine.stop { _ in box.sem.signal() } }
+        // canStop 和 stop 都在 vmQueue 上，理由同 stop()。
+        vmQueue.async {
+            if machine.canStop {
+                machine.stop { _ in box.sem.signal() }
+            } else {
+                box.sem.signal()
+            }
+        }
         if box.sem.wait(timeout: .now() + timeout) == .timedOut {
             MacEmit.log("退出时优雅关机等不到（等了 \(Int(timeout)) 秒）。"
                 + "这一次是非优雅停机，APFS 可能留下未干净的日志，下次启动会跑 fsck。",
@@ -2382,8 +2384,19 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
     // 两条路都要先优雅停机。原来只在成功路径上 stop：装到一半失败时直接
     // throw → 进程退出 → 客人机是「拔电源」式死亡，APFS 留下未干净日志，
     // 下次启动跑好几分钟 fsck。
-    if machine.canStop {
-        let _ = vzWait(vmQueue) { done in machine.stop { _ in done(nil) } }
+    //
+    // canStop 和 stop **都**必须在 vmQueue 上。VZVirtualMachine 的属性和方法
+    // 内部都有 dispatch_assert_queue，断言当前队列是创建它时给的那个队列，
+    // 在主线程调它们和调 VZMacOSInstaller.init 一样直接 SIGTRAP。实测
+    // （2026-11-10）：安装跑到 90% 崩在 -[VZVirtualMachine canStop]，
+    // 栈顶是 dispatch_assert_queue——离装完只差一步，而日志里最后一个字
+    // 是「进度 90%」，没有任何错误。
+    let _ = vzWait(vmQueue) { done in
+        if machine.canStop {
+            machine.stop { _ in done(nil) }
+        } else {
+            done(nil)
+        }
     }
     if let e = box.err {
         // 装到一半失败时把 IPSW 留着：25 GB 再下一遍太痛，重跑能直接复用。
