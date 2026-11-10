@@ -111,6 +111,13 @@ final class AppState: ObservableObject {
     }
 
     private func handleCatalog(_ ev: [String: Any]) {
+        // catalog 失败（catalog.json 不在、python3 报错）时原来这个 guard 会把
+        // error 事件一起挡掉，界面表现是向导第一步永远转「正在读镜像目录…」，
+        // 不给任何原因。命令行跑同样的命令却能看出问题。2026-11-10 审计补上。
+        if ev["t"] as? String == "error" {
+            backend.errorMessage = (ev["msg"] as? String) ?? "镜像目录读不到"
+            return
+        }
         guard ev["t"] as? String == "catalog",
               let arr = ev["distros"] as? [[String: Any]] else { return }
         // compactMap 会把解码失败的条目静默丢掉：vmkit 侧加字段、改类型或漏发
@@ -135,6 +142,12 @@ final class AppState: ObservableObject {
     }
 
     private func handleStatus(_ ev: [String: Any]) {
+        // 同上。status 失败时原来界面显示「还没有虚拟机」，而 ~/.agentvm/vms 下
+        // 明明有东西——用户会以为自己记错，或者去点新建，装出第二份来。
+        if ev["t"] as? String == "error" {
+            backend.errorMessage = (ev["msg"] as? String) ?? "虚拟机状态读不到"
+            return
+        }
         guard ev["t"] as? String == "vms",
               let arr = ev["vms"] as? [[String: Any]] else { return }
         // 同上：静默丢条目会让虚拟机从列表里消失，而终端里 status 完全正常。
@@ -150,7 +163,29 @@ final class AppState: ObservableObject {
             }
             vms.append(one)
         }
-        DispatchQueue.main.async { [weak self] in self?.vms = vms }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.vms = vms
+            // 打开着的面板要跟着换成新的一份。
+            //
+            // settingsVM / storageVM / consoleVM 都是点按钮时赋一次值的快照，
+            // 不同步的话：加完一块盘，列表还写着「还没有附加盘」；改完 CPU 内存，
+            // 面板里显示的仍是旧值——用户以为没生效，会反复点同一个按钮。
+            // 「保存」按钮拿旧 vm 当 dirty 基线，还会出现「什么都没改却可点」
+            // 的反向情况。macVM 那边本来就是同步的（见 startMacVM 收尾），
+            // 这三个漏了。2026-11-10 审计补上。
+            sync(&self.settingsVM)
+            sync(&self.storageVM)
+            sync(&self.consoleVM)
+        }
+    }
+
+    /// 按名字把一份可能过期的 VMInfo 换成 status 刚给的新那份。找不到就原样留着
+    /// （VM 被删了的情况由各面板自己的逻辑处理）。
+    private func sync(_ vm: inout VMInfo?) {
+        guard let old = vm, let fresh = vms.first(where: { $0.name == old.name })
+        else { return }
+        vm = fresh
     }
 
     func runCheck() {
@@ -158,6 +193,13 @@ final class AppState: ObservableObject {
     }
 
     private func handleCheck(_ ev: [String: Any]) {
+        if ev["t"] as? String == "error" {
+            backend.errorMessage = (ev["msg"] as? String) ?? "宿主机检查没跑起来"
+            return
+        }
+        // check 失败时原来 checkItems 空 + checkOk == false，每个详情页顶一条
+        // 「宿主机检查没全过」而下面一条明细都没有——看着像一堆故障，实际只是
+        // 这条命令没跑成。
         guard ev["t"] as? String == "check" else { return }
         let items = (ev["items"] as? [[String: Any]] ?? []).compactMap { d -> CheckItem? in
             guard let data = try? JSONSerialization.data(withJSONObject: d)

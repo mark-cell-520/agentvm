@@ -367,7 +367,7 @@ private struct InstallProgress: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
         } else if let name = state.watchingInstall, let port = vncPort(for: name) {
-            ConsoleView(name: name, port: port)
+            ConsoleView(name: name, port: port, embedded: true)
                 // 端口从无到有只会变一次，但每次变都必须重建客户端：
                 // 旧的那个连的是不存在的端口。
                 .id(port)
@@ -486,8 +486,16 @@ private struct DoneView: View {
 
             HStack(spacing: 8) {
                 Button("打开控制台") {
-                    state.consoleVM = vm
+                    // **必须先撤下自己，再让控制台出来，中间隔一帧。**
+                    // 原来 `state.consoleVM = vm; dismiss()` 写在一起：同一次
+                    // 状态更新里既撤销本 sheet 又呈现另一个，SwiftUI 对这种事
+                    // 的处理不可靠——结果是 consoleVM 留着非 nil、控制台 sheet 却
+                    // 不显示，而此后在详情页点「控制台」也不会再弹（item 没变），
+                    // 用户完全没有入口。2026-11-10 实测踩过。
                     dismiss()
+                    DispatchQueue.main.async {
+                        state.consoleVM = vm
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)

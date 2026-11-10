@@ -400,13 +400,16 @@ final class VNCClient: ObservableObject {
         let dst = dst0.assumingMemoryBound(to: UInt8.self)
         buf.withUnsafeBytes { raw in
             guard let src = raw.baseAddress?.advanced(by: off) else { return }
-            if x == 0 && w == fbW {
-                memcpy(dst + y * rowBytes, src, w * h * 4)
-            } else {
-                for r in 0..<h {
-                    memcpy(dst + (y + r) * rowBytes + x * 4,
-                           src + r * w * 4, w * 4)
-                }
+            // **必须逐行翻转着写。** RFB 的矩形数据第一行是画面顶部，而
+            // CGContext 的数据缓冲区第 0 行是画面底部（CG 的原点在左下角）。
+            // 原样按 y+r 写进去，整个画面上下颠倒——而 VNCScreenView 的
+            // isFlipped 只管鼠标坐标换算、不管图像方向，于是症状是「文字是反的」
+            // 加上「点哪儿都中不了」：用户看到按钮在右下，framebuffer 里它在左上，
+            // 手指点下去命中另一个控件。实测 2026-11-10：fnOS 安装界面在 app 里
+            // 上下颠倒，用 python 按同一套字节抓下来的帧却是正的。
+            for r in 0..<h {
+                memcpy(dst + (fbH - 1 - y - r) * rowBytes + x * 4,
+                       src + r * w * 4, w * 4)
             }
         }
         // 不在这里发帧：一帧可能有多个矩形，每个都发会白出几张半截画面。

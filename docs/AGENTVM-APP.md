@@ -830,6 +830,64 @@ harness 在 `/tmp/vncharness`：一个 python RFB 服务端（自己实现握手
 
 ---
 
+## 画面是倒的、窗口关不掉、鼠标点不中（2026-11-10 第六轮）
+
+用户报：「窗口只能打开，无法关闭，文字窗口都是倒置的，内部无法选择，很多问题」。
+
+### 先分清是谁的问题
+
+倒置这条先做了排除法：用 python 按 app 的同一套 RFB 字节连 QEMU 抓一帧，
+画面是正的；QEMU 的 stderr 全在 qemu.log 里且是 0 字节。所以数据没错，是 app
+把它放错了位置——RFB 矩形数据第一行是画面顶部，而 CGContext 数据缓冲区第 0 行
+是画面底部，原样 memcpy 就是上下颠倒。
+
+同一个根因还解释了「内部无法选择」：`VNCScreenView.isFlipped` 只换算鼠标坐标、
+不管图像方向，于是用户看到按钮在右下、framebuffer 里它在左上，点下去命中别的
+控件。**两句抱怨是一个 bug。**
+
+### 改了什么
+
+    VNCClient.blit        逐行翻转写（CG 第 0 行是画面底部），删掉原来的整块
+                          memcpy 快路——它在新方向下是错的
+    VNCScreenView.keyDown Esc 按场景分流：锁鼠标时释放鼠标，没锁时关窗口
+    ConsoleView           加「关闭」和「Esc 键」按钮；embedded 参数
+    VNCScreenView         viewWillMove 里置窗口的 acceptsMouseMovedEvents
+    VNCScreenView.scrollWheel  垂直方向掩码对调（往上滚是 8 不是 16）
+    VNCScreenView         resignFirstResponder + 窗口失焦通知里补发修饰键释放
+    ConsoleView.keyUp     Esc 不再发一次孤立的释放
+    ConsoleView           不再自动抢 first responder（原来抢走后向导的 Tab/Enter 全废）
+    AppState.refreshStatus  settingsVM / storageVM / consoleVM 换成新快照
+    Backend.cancel        兜底不再 terminate 共享的 process 字段
+    NewVMWizard           dismiss 与 consoleVM 赋值隔一帧
+    AppState              catalog / status / check 三个 handler 认 error 事件
+    MacVMWindow           加「关闭窗口」按钮（原来一个关闭控件都没有）
+
+### 一个自己造的回归
+
+刚给独立控制台加「关闭」按钮时没考虑 `ConsoleView` 是被复用的：新建向导的安装页
+嵌着一块 300px 高的，那里的 `dismiss()` 作用的是最外层 sheet，一按就把整个安装
+向导关了——而用户只是想收起那块画面。加了 `embedded` 参数才堵住。
+**给复用组件加控件之前，先数一遍它有几处调用点。**
+
+### 验证
+
+- 翻转：服务端发「上白下黑」一帧，CG 第 0 行（画面底部）必须黑、最后一行
+  （画面顶部）必须白。修好后通过。
+- 上一轮那两个 harness（a 旧连接 EOF 不误杀新连接、b 断开后自动重连）复跑仍旧通过。
+- `make lint` 全绿，`app/build.sh` 完整编译通过。
+- ./install.sh 装进 /Applications，二进制 md5 与本地构建一致，VM（linux1 pid 59232）
+  全程未受影响。
+
+### 没验证的
+
+- 没有在真实 GUI 里点过：按钮位置、Esc 关窗口、滚轮方向、鼠标锁定/释放。
+  这些都要用户实际点一遍才算数。
+- 安装向导里那块 300px 高的内嵌画面：缩放后能不能点中小按钮，没实测。
+- `acceptsMouseMovedEvents` 那条是照 AppKit 语义改的，没有写 harness 验证
+  （需要真实窗口）。
+
+---
+
 ## macOS 客人机（2026-11-10 新增）
 
 ### 为什么 macOS 走 VZ，另外两种走 QEMU

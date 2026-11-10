@@ -14,6 +14,7 @@ import Virtualization
 struct MacVMWindow: View {
     @EnvironmentObject var state: AppState
     let vm: VMInfo
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         Group {
@@ -77,6 +78,13 @@ struct MacVMWindow: View {
             Text("关掉这个窗口 = 关机")
                 .font(.caption)
                 .foregroundStyle(.orange)
+            // 明确的关闭出口。这个面板原来一个关闭控件都没有：没有按钮、
+            // 没有 .cancelAction，而 VZVirtualMachineView 会把 Esc 转给客人机。
+            // 「关掉 = 关机」这件事又让用户不敢去点窗口那张 ×。2026-11-10 审计补上。
+            Button("关闭窗口") { dismiss() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("会先优雅停机再关——不关机就等于丢数据")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

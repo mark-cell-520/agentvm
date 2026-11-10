@@ -1062,3 +1062,96 @@ app 的画面会被一下踢没，而它只会说「虚拟机那边把连接关�
 客户端只是多几个入口。
 
 注意 `share` 是启动参数，**对已经跑起来的 VM 无效**，要下次启动才生效。
+
+## M24. RFB 的第一行是画面顶部，CGContext 的第 0 行是画面底部——原样 memcpy 就是上下颠倒（已修）
+
+用户报「文字窗口都是倒置的，内部无法选择」。
+
+先证明不是 QEMU：用 python 按 app 的同一套字节（SetPixelFormat 32/24 小端真彩、
+位移 16-8-0、SetEncodings raw + DesktopSize、ClientInit shared=1）连上去抓一帧，
+画面是正的。所以数据没问题，是 app 把它放错了位置。
+
+RFB 的矩形数据第一行对应画面顶部；而 `CGContext(data:width:height:...)` 的数据
+缓冲区第 0 行是画面底部（CG 的原点在左下角）。原样 `memcpy(dst + y * rowBytes, ...)`
+等于把顶部数据写进底部，整个画面颠倒。
+
+连带的是鼠标：`VNCScreenView` 的 `isFlipped = true` 只换算鼠标坐标，不管图像方向。
+于是用户看到按钮在右下、framebuffer 里它在左上，手指点下去命中另一个控件——
+「点哪儿都中不了」。这两句抱怨是同一个根因。
+
+修法：逐行翻转着写，`dst + (fbH - 1 - y - r) * rowBytes`。顺手删掉了原来
+「x == 0 && w == fbW 时整块 memcpy」那条快路——它在新方向下是错的。
+
+验证：服务端发一帧「上白下黑」，检查 CG 数据第 0 行（画面底部）是黑、
+最后一行（画面顶部）是白。修好后通过；修好前第 0 行是白的。
+
+## M25. 控制台窗口关不掉：Esc 被画面视图无条件吃掉，而窗口里根本没有关闭按钮（已修）
+
+用户报「窗口只能打开，无法关闭」。两条叠在一起：
+
+一、`VNCScreenView.keyDown` 里 `if event.keyCode == 0x35 { ...; return }` 是
+无条件消费。这个视图是 first responder，事件到不了 SwiftUI 的 `.cancelAction`。
+新建向导的安装页和详情页的控制台都嵌着同一个视图，两边同时中——安装页那个
+「关闭（后台继续装）」按钮绑的就是 `.cancelAction`。
+
+二、`ConsoleView` 原来一个关闭控件都没有：没有按钮，sheet 那张 × 在全屏画面上
+不一定点得到。于是 Esc 失效之后用户没有任何出路。
+
+修法：Esc 按场景分流——锁鼠标时释放鼠标，没锁时 `window?.performClose(nil)`；
+另外加一个看得见的「关闭」按钮，和单独给客人机发 Esc 的「Esc 键」按钮
+（键盘上那个 Esc 被占了，而装系统时取消对话框全靠它）。
+
+**顺带踩到一个自己造的回归**：刚加「关闭」按钮时没考虑 `ConsoleView` 是被复用的——
+新建向导的安装页嵌着一块 300px 高的，那里的 `dismiss()` 作用的是最外层 sheet，
+一按就把整个安装向导关了。加了 `embedded` 参数，嵌入时不显示关闭按钮、Esc 也不
+关窗口（改成把 Esc 转给客人机）。
+
+## M26. 非锁定模式下鼠标移动送不到客人机；滚轮垂直方向是反的；切 app 时修饰键卡住（已修）
+
+三条都藏在 `VNCScreenView` 里，都是「代码看着对、路径从来没走到」。
+
+一、`mouseMoved` 里有段「不锁鼠标时也要把移动发下去」的修复，但
+**`NSWindow.acceptsMouseMovedEvents` 只在 `acquireLock()` 里置过**。从没锁过鼠标
+的用户在画面上滑动，客人机光标一动不动——只有点下去那一下才跳过去。安装器里的
+悬停高亮、Tooltip、菜单展开全部无效，而用户完全看不出是客户端的问题。修法：
+`viewWillMove(toWindow:)` 里置上，`releaseLock()` 故意不复位（解锁后也该收到移动）。
+
+二、滚轮垂直方向反了。`scrollingDeltaY > 0` 是往上滚，而 RFB 的 button 4（掩码 8）
+才是往上滚——原来把正的发给 16（button 5）。手指往上推、内容往下跑，每次都得
+反向操作。水平方向本来是对的，不要一起动。
+
+三、修饰键只在视图内部维护 `prevFlags`。按住 Shift 去点标题栏按钮，或者 Cmd+Tab
+切走再松开，视图都收不到 flagsChanged，而客人机那边的 Shift 一直按着——切回来
+打字全是 Shift+a。装系统要敲大写字母和符号，正好卡在这。修法：
+`resignFirstResponder()` 和窗口失焦通知里补发释放。
+
+## M27. 面板里的 VMInfo 是过期快照；cancel 的兜底打的是 status 子进程（已修）
+
+一、`settingsVM` / `storageVM` / `consoleVM` 都是点按钮时赋一次值的快照，
+`refreshStatus()` 之后不同步。症状：加完一块盘，列表还写着「还没有附加盘」；
+改完 CPU 内存，面板里还是旧值——用户以为没生效，会反复点同一个按钮。
+「保存」按钮拿旧 vm 当 dirty 基线，还会出现「什么都没改却可点」的反向情况。
+`macVM` 那边本来就是同步的，这三个漏了。
+
+二、`Backend.cancel()` 的兜底 `process?.terminate()` 打的是「最近启动的那条命令」，
+而安装期间每个 stage 都会 `refreshStatus()` 把 `process` 覆盖成一条 status 子进程。
+install.pid 丢失、pid 被复用、ps 起不来导致 `installAlive` 返回 nil 时，用户点
+「停止」→ SIGTERM 发不到真正的安装进程，界面说停了、横幅消失了、向导跳回配置页，
+而 4 GB 还在后台继续下载。兜底改成给一句能照着做的提示，不去 terminate 那条
+本来就该退的 status。
+
+## M28. 同一次状态更新里 dismiss 一个 sheet 又 present 另一个；启动时三条命令的 error 被整个丢掉（已修）
+
+一、`state.consoleVM = vm; dismiss()` 写在一起。SwiftUI 对「同一事务里撤销 A、
+呈现 B」的处理不可靠：结果是 consoleVM 留着非 nil、控制台 sheet 却不显示，
+而此后在详情页点「控制台」也不会再弹（item 没变，SwiftUI 认为已经呈现过了）。
+用户完全没有入口。修法：先 `dismiss()`，再用 `DispatchQueue.main.async` 隔一帧设
+`consoleVM`。
+
+二、`init()` 里 catalog / status / check 三条命令，各自的 handler 都 guard 了一个
+特定的事件类型，`error` 事件被一起挡掉，terminationHandler 也不看退出码。于是：
+catalog.json 不在 → 向导第一步永远转「正在读镜像目录…」，不给任何原因；
+status 失败 → 主窗口显示「还没有虚拟机」，而 ~/.agentvm/vms 下明明有东西，
+用户会以为自己记错，去点新建装出第二份；check 失败 → 每个详情页顶一条
+「宿主机检查没全过」而下面一条明细都没有。操作类命令早就用 handleCommandEvent
+堵过这一类，只是这三条读命令漏了。

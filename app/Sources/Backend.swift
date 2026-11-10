@@ -181,8 +181,22 @@ final class Backend: ObservableObject {
             DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
                 if self.installAlive(name: name) != nil { kill(pid, SIGKILL) }
             }
+            return
         }
-        process?.terminate()
+        // 兜底**不能**去 terminate 那个共享的 process 字段。
+        //
+        // 安装期间每个 stage 都会 refreshStatus()，把 process 覆盖成一条 status
+        // 子进程。terminate() 打在它身上什么用都没有——真正下载/安装的进程照样
+        // 跑，而界面这边 installEnded = true、横幅消失、向导跳回配置页，
+        // 用户以为停了，4 GB 还在后台继续下。2026-11-10 审计补上。
+        //
+        // installAlive 拿不到 pid 只有两种原因：进程真的已经退了（没什么可杀），
+        // 或者那个 pid 已经被系统复用给别的进程（这时更不能按数字乱杀）。
+        // 两种都该说清楚，让用户自己看一眼。
+        errorMessage = "没能定位到正在安装的进程（install.pid 不在，或者那个 pid 已经"
+            + "不是安装进程了）。在终端里确认一下：\n"
+            + "  ps aux | grep vmkit.py | grep install\n"
+            + "确认还在跑就按上面的 pid 手动 kill，然后重新安装。"
     }
 
     /// cancel() 要杀的安装进程属于哪个虚拟机。由 AppState 在开始安装时设上。

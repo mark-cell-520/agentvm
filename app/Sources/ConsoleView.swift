@@ -17,6 +17,16 @@ struct ConsoleView: View {
     let port: Int
     /// 端口不合法时的说明。空串表示端口正常，可以连。
     @State private var portError = ""
+    /// 是不是被嵌在别的面板里（新建向导的安装页就嵌了一块 300px 高的）。
+    ///
+    /// 嵌着的时候不能给「关闭」按钮、也不能让 Esc 去关窗口：`dismiss()` 和
+    /// `performClose` 作用的是最外层那个 sheet，一关就把整个向导关了，而用户
+    /// 只是想收起那块画面。2026-11-10 实测踩过——刚给独立控制台加的「关闭」
+    /// 按钮，在向导里变成了「关闭整个安装」。
+    var embedded = false
+    /// 关掉这个窗口。sheet 自己那张 × 在某些窗口配置下点不到，而 Esc 又会
+    /// 被画面视图吃掉（见 VNCScreenView.keyDown），所以必须给一个看得见的出口。
+    @Environment(\.dismiss) private var dismiss
 
     @StateObject private var client: VNCClient
     @State private var locked = false
@@ -25,9 +35,10 @@ struct ConsoleView: View {
     /// 连两次就白丢一次已建好的连接，用户看到的是「画面卡一下又重来」。
     @State private var didConnect = false
 
-    init(name: String, port: Int) {
+    init(name: String, port: Int, embedded: Bool = false) {
         self.name = name
         self.port = port
+        self.embedded = embedded
         // UInt16(port) 在越界时直接 trap：vm.json 是用户可手改的文件，
         // vnc_port 写成 99999 就走到了这条路上。那是配置错误，该给的是一句
         // 人能看懂的话，不是整个 app 崩掉。
@@ -103,6 +114,22 @@ struct ConsoleView: View {
                 .controlSize(.small)
                 // 端口非法时重连没有意义（连的是端口 0）。
                 .disabled(!portError.isEmpty)
+            // 关闭。放在这儿而不是只靠窗口的 × / Esc：控制台是个全屏画面，
+            // 用户操作久了会想关掉它。关窗口等于断开 VNC，客人机继续跑。
+            // 嵌在向导里时不给：那会关掉整个向导（见 embedded 的注释）。
+            if !embedded {
+                Button("关闭") { dismiss() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("只是关掉这个画面，虚拟机还在后台跑")
+                // 给客人机发 Esc。键盘上那个 Esc 归「关窗口 / 释放鼠标」了，
+                // 而装系统时取消对话框、退回上一步全靠它。
+                Button("Esc 键") { sendEsc() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("把 Esc 送给虚拟机（键盘上的 Esc 用来关窗口和释放鼠标）")
+                    .disabled(!client.connected)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -110,7 +137,7 @@ struct ConsoleView: View {
 
     private var screen: some View {
         GeometryReader { geo in
-            VNCScreen(client: client, locked: $locked)
+            VNCScreen(client: client, locked: $locked, embedded: embedded)
                 .frame(width: geo.size.width, height: geo.size.height)
                 .background(Color.black)
                 .clipped()
@@ -119,10 +146,14 @@ struct ConsoleView: View {
 
     private var footer: some View {
         HStack(spacing: 16) {
-            Label("点进去就能操作，Esc 释放鼠标", systemImage: "cursorarrow")
+            // 原来写「Esc 释放鼠标」，而 Esc 现在归关窗口用了（没锁鼠标时）。
+            // 照旧写，用户按下去发现窗口关了，会以为出了故障。
+            Label("点进去就能操作；锁定鼠标后能把指针拖出画面", systemImage: "cursorarrow")
             Spacer()
-            if !client.connected {
-                Text("虚拟机可能没在跑，或者刚起来 VNC 还没监听")
+            // 端口非法时画面里已经写了原因，footer 再说一句「虚拟机可能没在跑」
+            // 是把用户往错的方向引。
+            if !client.connected, portError.isEmpty, !hint.isEmpty {
+                Text(hint)
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -132,6 +163,25 @@ struct ConsoleView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
     }
+
+    /// 给客人机发一个 Esc。键盘上那个 Esc 被「关窗口 / 释放鼠标」占了，
+    /// 而装系统时取消对话框、退回上一步全靠它——不给这条路，用户只能对着
+    /// 画面干瞪眼。
+    private func sendEsc() {
+        // ConsoleView 这边的 client 是 @StateObject，不是可空的。
+        client.key(0xFF1B, down: true)
+        client.key(0xFF1B, down: false)
+    }
+
+    /// 连不上的时候给的那句补充。分两种，原来是一句通用的「虚拟机可能没在跑」：
+    /// 还在试的时候说 VM 没跑是冤枉它（TCP 通了、正在等画面尺寸也是这个状态），
+    /// 而真断了才该提示去检查 VM。
+    private var hint: String {
+        if client.statusText.contains("正在") {
+            return "等虚拟机给出画面…"
+        }
+        return "虚拟机可能没在跑，或者刚起来 VNC 还没监听"
+    }
 }
 
 // ------------------------------------------------------------ 画面视图 --
@@ -139,17 +189,21 @@ struct ConsoleView: View {
 private struct VNCScreen: NSViewRepresentable {
     @ObservedObject var client: VNCClient
     @Binding var locked: Bool
+    /// 嵌在向导里时为真：Esc 不关窗口（那会关掉整个向导）。
+    var embedded = false
 
     func makeNSView(context: Context) -> VNCScreenView {
         let v = VNCScreenView()
         v.client = client
         v.onLock = { locked = $0 }
+        v.embedded = embedded
         return v
     }
 
     func updateNSView(_ v: VNCScreenView, context: Context) {
         v.client = client
         v.locked = locked
+        v.embedded = embedded
         v.needsDisplay = true
     }
 }
@@ -171,6 +225,8 @@ final class VNCScreenView: NSView {
             if locked { acquireLock() } else { releaseLock() }
         }
     }
+    /// 嵌在向导里时为真，见 ConsoleView.embedded：Esc 不关窗口。
+    var embedded = false
 
     /// 当前按下的鼠标键掩码。拖动时要用它。
     private var buttons: UInt8 = 0
@@ -202,7 +258,11 @@ final class VNCScreenView: NSView {
     private func placeholder() {
         let s: String
         if let client, !client.connected {
-            s = "连不上虚拟机"
+            // 原来这里一律写「连不上虚拟机」，而「正在取画面」（TCP 通了、在等
+            // ServerInit）同样是 connected == false——那一刻并不是连不上。
+            // 头部状态栏、footer、画面中央三处各说各话，用户不知道该信哪个。
+            s = client.statusText.contains("正在")
+                ? "正在连，等一下…" : "连不上虚拟机"
         } else if let client, client.guestWidth == 0 {
             s = "等虚拟机给出画面尺寸…"
         } else {
@@ -357,11 +417,15 @@ final class VNCScreenView: NSView {
         accumulatedX += event.scrollingDeltaX
         let stepY = event.hasPreciseScrollingDeltas ? 4 : 1
         let stepX = event.hasPreciseScrollingDeltas ? 4 : 1
+        // **垂直方向原来是反的。** RFB 的 button 4 是往上滚（掩码 8）、button 5
+        // 是往下滚（掩码 16），而 macOS 的 scrollingDeltaY > 0 就是往上滚。
+        // 原来把正的发给 16，于是手指往上推、内容往下跑，每次都得反向操作。
+        // 水平方向本来是对的（+64 右、+32 左），不要一起动。
         while accumulatedY >= CGFloat(stepY) {
-            client.wheel(16); accumulatedY -= CGFloat(stepY)
+            client.wheel(8); accumulatedY -= CGFloat(stepY)
         }
         while accumulatedY <= -CGFloat(stepY) {
-            client.wheel(8); accumulatedY += CGFloat(stepY)
+            client.wheel(16); accumulatedY += CGFloat(stepY)
         }
         while accumulatedX >= CGFloat(stepX) {
             client.wheel(64); accumulatedX -= CGFloat(stepX)
@@ -376,10 +440,28 @@ final class VNCScreenView: NSView {
     // ------------------------------------------------------------ 键盘 --
 
     override func keyDown(with event: NSEvent) {
-        // Esc 释放鼠标。锁定模式没有真实光标，不给一个逃出口等于把用户关在里面。
+        // Esc 归谁，看锁不锁鼠标：
+        //   锁着 -> 释放鼠标。锁定模式没有真实光标，不给一个逃出口等于把用户
+        //           关在里面。
+        //   没锁 -> 关窗口。这个画面视图是 first responder，事件到不了 SwiftUI
+        //           的 .cancelAction，而 sheet 的 × 在全屏画面上也不一定点得到——
+        //           2026-11-10 实测「窗口只能打开，无法关闭」。装向导和详情页的
+        //           控制台都嵌着这一个视图，两边同时中。
+        //           要给客人机发 Esc，用标题栏那个「Esc 键」按钮。
         if event.keyCode == 0x35 {
-            locked = false
-            onLock?(false)
+            if locked {
+                locked = false
+                onLock?(false)
+            } else if !embedded {
+                // 独立控制台才关窗口。嵌在向导里时最外层 sheet 是整个新建流程，
+                // 关它就白装一半——那时 Esc 什么都不做，只让客人机收不到它。
+                window?.performClose(nil)
+            } else {
+                // 嵌着：客人机该收到这个 Esc（安装器里取消对话框常用），
+                // 但窗口不能关。
+                client?.key(0xFF1B, down: true)
+                client?.key(0xFF1B, down: false)
+            }
             return
         }
         guard let ks = keysym(for: event) else { return }
@@ -387,6 +469,9 @@ final class VNCScreenView: NSView {
     }
 
     override func keyUp(with event: NSEvent) {
+        // Esc 的按下被 keyDown 提前消费掉了（关窗口 / 释放鼠标 / 嵌入时补发），
+        // 这里不能再发一次释放——客人机会收到一个没有按下的 Esc key-up。
+        if event.keyCode == 0x35 { return }
         guard let ks = keysym(for: event) else { return }
         client?.key(ks, down: false)
     }
@@ -403,10 +488,47 @@ final class VNCScreenView: NSView {
         prevFlags = f
     }
 
+    /// 把还按着的修饰键全部补发释放。
+    ///
+    /// 只在视图内部维护 prevFlags 是不够的：按住 Shift 去点标题栏的「重连」，
+    /// 或者 Cmd+Tab 切到别的 app 再松开——这两种情况视图都收不到 flagsChanged，
+    /// 而客人机那边的 Shift 一直按着。切回来打字全是 Shift+a。
+    private func releaseModifiers() {
+        let f = prevFlags
+        prevFlags = []
+        for (mask, ks) in Self.modifierKeys where f.contains(mask) {
+            client?.key(ks, down: false)
+        }
+    }
+
+    override func resignFirstResponder() -> Bool {
+        releaseModifiers()
+        return super.resignFirstResponder()
+    }
+
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        newWindow?.makeFirstResponder(self)
+        // **mouseMoved 要窗口这个标志才分发，而它是 NSWindow 的属性。**
+        // 原来只在 acquireLock() 里置，于是从没锁过鼠标的用户在画面上滑动，
+        // 客人机光标一动不动——只有点下去那一下才跳过去。上面 mouseMoved 里
+        // 「不锁也要把移动发下去」那段修复，在这条路上从来没生效过。
+        // releaseLock() 故意不复位它：解锁之后照样该收到移动。
+        newWindow?.acceptsMouseMovedEvents = true
+        // 原来这里还会 makeFirstResponder(self)。那会让键盘焦点从向导的按钮上
+        // 被抢走：新建向导的安装页嵌着这块画面，Tab / Enter / Space 全部失灵，
+        // 用户没法用键盘走到「下一步」。改成点了画面才抢焦点（mouseDown 里
+        // 已经这么做了）。
+        //
+        // 切 app 时补发修饰键释放，见 releaseModifiers()。
+        if let w = newWindow {
+            keyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification, object: w, queue: nil)
+            { [weak self] _ in self?.releaseModifiers() }
+        }
     }
+
+    /// 观察窗口失焦的 token，换窗口时要先摘掉，否则老窗口的事件还会打过来。
+    private var keyObserver: Any?
 
     /// NSEvent 的虚拟键码 → X11 keysym。
     private func keysym(for e: NSEvent) -> UInt32? {
@@ -481,6 +603,9 @@ final class VNCScreenView: NSView {
     }
 
     deinit {
+        if let keyObserver {
+            NotificationCenter.default.removeObserver(keyObserver)
+        }
         if let monitor { NSEvent.removeMonitor(monitor) }
         // 隐藏过光标就必须配对取消，否则光标会一直留着不见
         if locked { NSCursor.unhide() }
