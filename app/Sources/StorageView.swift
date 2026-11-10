@@ -19,12 +19,19 @@ struct StorageView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    disks
-                    Divider()
+                    // 附加盘和共享目录对 macOS 客人机不开放，原因写在
+                    // macUnsupported 里。藏起来比摆一个点了报错的按钮好。
+                    if !vm.isMacOS {
+                        disks
+                        Divider()
+                    }
                     snapshots
                     Divider()
-                    shares
-                    Divider()
+                    if !vm.isMacOS {
+                        shares
+                        Divider()
+                    }
+                    if vm.isMacOS { macUnsupported }
                     cloneSection
                     if let e = err {
                         Text(e).font(.caption).foregroundStyle(.red)
@@ -42,6 +49,29 @@ struct StorageView: View {
         }
         .frame(width: 660, height: 700)
         .onAppear { state.snapshotList(name: vm.name) }
+    }
+
+    /// macOS 客人机上用不了的两样，以及为什么。
+    ///
+    /// 不说「暂不支持」就完事：用户需要知道是框架层面没有，还是我们没写。
+    /// 附加盘：VZ 支持多个 block device，但 macOS 客人机的磁盘热插拔路径
+    /// 没验证过，写一个不生效的按钮比不给按钮更糟。共享目录：virtiofs 需要
+    /// 客人机里有驱动，macOS 的 virtio-fs 支持情况没实测。
+    /// 快照和克隆是能用的（APFS clonefile），所以那两个区段照常显示。
+    private var macUnsupported: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("macOS 虚拟机上这两样用不了").font(.headline)
+            Text("· 附加盘：VZ 支持多块磁盘，但 macOS 客人机的热插拔没有可用的"
+                 + "公开路径，重启挂载也没验证过。要存数据用克隆一份更稳。")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("· 共享目录：virtiofs 要客人机里有驱动，macOS 这边没有实测过"
+                 + "能用的组合。")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("快照和克隆是能用的：走 APFS 的 clonefile，秒级、不占额外空间。")
+                .font(.caption).foregroundStyle(.green)
+        }
+        .padding(12)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var header: some View {

@@ -155,6 +155,12 @@ struct ContentView: View {
             StorageView(vm: vm)
                 .environmentObject(state)
         }
+        // macOS 虚拟机单独一个 sheet：它的画面是 VZVirtualMachineView 而不是
+        // VNC，所以不能用 ConsoleView。见 MacVMWindow 的注释。
+        .sheet(item: $state.macVM) { vm in
+            MacVMWindow(vm: vm)
+                .environmentObject(state)
+        }
         .onChange(of: state.vms.count) {
             // 装完之后 selection 还指向旧名字就什么都看不到，自动选中新的
             if let new = state.installedVM, selection != new.name {
@@ -254,11 +260,16 @@ struct VMDetailView: View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
             GridRow { Text("进程").foregroundStyle(.secondary); Text(pidText) }
             GridRow { Text("磁盘已用").foregroundStyle(.secondary); Text(vm.diskUsedText) }
-            GridRow { Text("SSH 端口").foregroundStyle(.secondary); Text("127.0.0.1:\(vm.sshPort)") }
+            // macOS 客人机一个端口都没有：VZ 的 NAT 不对外监听，VNC 不存在。
+            // 后端给的是 0，直接显示「127.0.0.1:0」是自相矛盾——
+            // 同一个文件的 loginInfo 里已经说明了 macOS 没有端口。
+            if !vm.isMacOS {
+                GridRow { Text("SSH 端口").foregroundStyle(.secondary); Text("127.0.0.1:\(vm.sshPort)") }
+                GridRow { Text("VNC").foregroundStyle(.secondary); Text("127.0.0.1:\(vm.vncPort)") }
+            }
             if let rdp = vm.rdpPort {
                 GridRow { Text("远程桌面").foregroundStyle(.secondary); Text("127.0.0.1:\(rdp)") }
             }
-            GridRow { Text("VNC").foregroundStyle(.secondary); Text("127.0.0.1:\(vm.vncPort)") }
                 GridRow { Text("登录账号").foregroundStyle(.secondary); Text("\(vm.user)") }
                 if let web = vm.webPort {
                     GridRow { Text("Web 界面").foregroundStyle(.secondary)
@@ -279,23 +290,37 @@ struct VMDetailView: View {
             if vm.running {
                 Button("关机") { state.action("stop", name: vm.name) }
                     .disabled(state.backend.busy)
-                // 控制台是日常操作虚拟机的主入口：装系统、看启动、进桌面，
-                // 都在这个内嵌的 VNC 画面里。不依赖原生窗口是否存在。
-                Button("控制台") { state.consoleVM = vm }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(state.backend.busy)
+                if vm.isMacOS {
+                    // macOS 客人机没有 VNC，「控制台」这个概念不适用：
+                    // 画面是 app 里的 VZVirtualMachineView。所以主入口就是
+                    // 这个窗口按钮，点它等于启动 + 显示。
+                    Button("打开窗口") { state.startMacVM(vm) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(state.backend.busy)
+                } else {
+                    // 控制台是日常操作虚拟机的主入口：装系统、看启动、进桌面，
+                    // 都在这个内嵌的 VNC 画面里。不依赖原生窗口是否存在。
+                    Button("控制台") { state.consoleVM = vm }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(state.backend.busy)
+                }
                 Button("显示窗口") { state.action("open", name: vm.name) }
                     .disabled(state.backend.busy)
             } else {
                 Button("启动") { state.action("start", name: vm.name) }
                     .disabled(state.backend.busy)
             }
-            // 无窗口跑的 VM 没有窗口可切，只能重启才能有一个——按钮上要说清楚，
-            // 不然用户点了发现虚拟机重启了，会以为出了故障。
-            Button(vm.headless ? "用系统窗口打开（会重启）" : "用系统窗口打开") {
-                state.nativeWindow(vm)
+            // macOS 客人机没有「原生窗口模式」这个开关：它的窗口就是 app
+            // 里的那个 VZVirtualMachineView，不存在第二个显示方式。
+            // 摆一个按钮上去点了只会重启，说清楚比不给好。
+            if !vm.isMacOS {
+                // 无窗口跑的 VM 没有窗口可切，只能重启才能有一个——按钮上要说清楚，
+                // 不然用户点了发现虚拟机重启了，会以为出了故障。
+                Button(vm.headless ? "用系统窗口打开（会重启）" : "用系统窗口打开") {
+                    state.nativeWindow(vm)
+                }
+                .disabled(state.backend.busy)
             }
-            .disabled(state.backend.busy)
 
             // 配置。装完之后改 CPU、内存、磁盘都在这儿，不用删了重装。
             Button("配置") { state.settingsVM = vm }
@@ -338,6 +363,13 @@ struct VMDetailView: View {
                     NSPasteboard.general.setString("127.0.0.1:\(vm.rdpPort ?? 0)",
                                                    forType: .string)
                 }
+            } else if vm.isMacOS {
+                // macOS 客人机的 SSH 在 NAT 内部（192.168.64.x），宿主机上
+                // 没有转发端口——VZNATNetworkDeviceAttachment 不对外监听。
+                // 所以「怎么连上去」的答案就是：用那个窗口。不写一句
+                // 「SSH 端口」之类的假信息。
+                row("远程登录", "第一次启动时已自动打开远程登录，账号 \(vm.user)。"
+                    + "SSH 只能从同一 NAT 里的机器连，宿主机上不转发端口。") {}
             } else if vm.webPort == nil {
                 // 原文写「打开终端窗口」，实际按钮叫「控制台」。
                 row("控制台", "点「控制台」，用 \(vm.user) 和安装时设的密码登录") {}

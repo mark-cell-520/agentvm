@@ -676,3 +676,127 @@ wrapper 就在被删掉的 VM 目录里。之后每次登录 launchd 执行一�
 - Windows 侧（`backends/hyperv.py`）整体未在真实 Windows on ARM 设备上跑过，
   见 `docs/WINDOWS-PORT.md` 第 10 节。
 - QEMU Guest Agent、USB 直通（Quickemu 有）按这个沙箱的定位没做。
+
+---
+
+## macOS 客人机（2026-11-10 新增）
+
+### 为什么 macOS 走 VZ，另外两种走 QEMU
+
+三条路都试过，只有一条通：
+
+1. **QEMU 的 `vmapple` 机型**是专为 macOS 客人机设计的（模拟 Apple 硬件、从
+   IPSW 恢复系统）。Homebrew 的 QEMU 11.1.3 **没有注册它**：`strings` 能看到
+   `VMAppleVirtioBlkVariant` 之类的符号，而 `-machine vmapple` 报
+   `unsupported machine type`。代码在，机型没开。自己打补丁编一份要连带
+   Reims vGPU、OpenAVB ROM、idevicerestore 补丁一整套——参考
+   `Lakr233/vmapple-cli` 的 `Patches/` 目录，光 QEMU 补丁就 17 个，而且那是
+   给 arm64 Linux + KVM 用的，macOS 宿主的 HVF 路径更不完整。
+2. **裸 `virt` 机型 + OpenCore**：arm64 的 OpenCore 没有成熟发行物，
+   `KVM-Opencore` 那些 release 全是 x86 的。
+3. **VZ 官方 API**：`VZMacOSRestoreImage` / `VZMacOSInstaller` /
+   `VZMacOSBootLoader` / `VZMacPlatformConfiguration` / `VZMacGuestProvisioningOptions`
+   全套公开。宿主机上 `fetchLatestSupported` 直接拿到 macOS 27.2.1 (26B131) 的
+   IPSW 地址，`mostFeaturefulSupportedConfiguration` 给出最少 2 核 / 4 GB。
+
+所以 `app/Sources/MacVMEngine.swift` + `scripts/vmz/main.swift` 是一份 Swift
+代码、两个入口（app 内嵌与 CLI），和 `vzrun.swift` 那条实验线是同一条思路的成品。
+
+### 架构：VZ 的虚拟机不能跨进程
+
+这是整条设计的地基，也是三条限制的来源：
+
+- `VZVirtualMachineView` 必须和 `VZVirtualMachine` 在同一个进程里，没有公开的
+  跨进程共享路径。所以 macOS 客人机的寿命跟持有它的进程绑定：app 里启动的随
+  app 退出而停，`vmz start` 起的随那个终端。Windows/Linux 那套「安装甩后台、
+  app 可以关」的做法在这儿做不到。
+- 没有 VNC server，所以 app 的自研 RFB 客户端对 macOS 客人机用不上，画面是
+  `VZVirtualMachineView`（原生 NSView，比 VNC 清楚也快）。
+- 宿主机不转发端口：`VZNATNetworkDeviceAttachment` 不对外监听，SSH 在 NAT
+  内部的 192.168.64.x。
+
+### 安装流程
+
+1. `VZMacOSRestoreImage.fetchLatestSupported` 拿 IPSW 地址（**要 entitlement**）
+2. 6 连接并发下载 25.6 GB（单连接 1 MB/s → 聚合 18.8 MB/s，7 小时变 23 分钟）
+3. `VZMacOSRestoreImage.load(from:)` 从本地读回，取 `hardwareModel`
+4. 建 `VZMacMachineIdentifier`（每个 VM 唯一）和 `VZMacAuxiliaryStorage`
+5. truncate 一块 raw 系统盘（VZ 只认 raw，qcow2 会 validate 失败）
+6. `VZMacOSInstaller` 恢复安装（约 10 到 20 分钟）
+7. 第一次启动带 `VZMacGuestProvisioningOptions`（macOS 27+）：建账号、
+   自动登录、打开远程登录——不用进 Setup Assistant 手动点
+
+### 踩过的坑
+
+**1. entitlement 缺失是一句看不懂的话。** 没有
+`com.apple.security.virtualization` 时，`fetchLatestSupported` 返回
+「The restore image catalog failed to load」——完全看不出是权限问题。实测对比过：
+签名前后同一份二进制，一个报错一个正常。所以 `app/Resources/entitlements.plist`
+必须同时给 app 主二进制**和嵌套的 `Resources/backend/vmz`**：`codesign --deep`
+不会把 entitlement 传给嵌套二进制，实测签完 bundle 之后查那个文件只有一行
+`Executable=`，没有 entitlement 字典。而 VZ 在缺 entitlement 时抛的是
+`NSInvalidArgumentException`（未捕获的 ObjC 异常，进程直接 abort），
+vmkit 只会看到 vmz 非零退出、拿不到任何 JSON。
+
+**2. 「断点续传」整个是坏的（第一版）。** 下载器把 dest 预 truncate 成完整大小，
+而 `attributesOfItem[.size]` 返回的是逻辑大小：稀疏文件 truncate 到 25.6 GB 之后
+`st_size` 就是 25600000000 而 `st_blocks` 是 0，一个字节都没落盘。于是下载中断后
+重跑判定「已下完」，直接拿一个全是零洞的 25.6 GB 去装，报一句「读不了这个 IPSW」，
+而用户按提示重跑多少次都一样。现在下载写 `.part`、完成才 rename 成正式名，
+「正式名存在且大小对」才等于下完；`.part` 旁边一个 checkpoint 文件记录已落盘字节
+（每 64 MB 更新一次，25 GB / 8 MB = 3200 段，每段写一次元数据太碎）。
+
+**3. 不带 queue 的 VZVirtualMachine 用主队列，同步等它的 completion 会自死锁。**
+Apple 的头文件写明 "uses the main queue ... The completion handlers from the
+asynchronous functions are also invoked on that queue"。所以 VZ 必须传一条自己的
+串行队列，并且等待的那一方不能占着它（`vzWait` 就是干这个的）。
+
+**4. 服务端忽略 Range 时 dataTask 会把 25 GB 读进内存。** 第一版在 completion 里
+才判断状态码——那时候伤害已经发生了，进程被 jetsam 杀而日志里一个字都没有。
+现在先用一次 1 KB 的 Range 探测，确认返回 206 才排全部分段；并且改用
+`URLSessionDataDelegate` 边收边写，内存峰值只有一段（8 MB）。
+
+**5. pid 文件写的是「承载 VM 的进程」。** app 里启动时那是 AgentVM.app 自己的
+pid，而 `vmz stop` 读到它就 `kill(SIGTERM)`——app 当场终止，用户看到「已停」，
+实际整个 app 没了，VM 属于非优雅停机。现在 pid 文件写成 `app:<pid>` /
+`vmz:<pid>`，`vmz stop` 只对 vmz 宿主发信号。
+
+**6. 快照 tag 没校验白名单。** `snapshot create --tag ../../etc` 被接受，
+`URL.appendingPathComponent` 把 `..` 规一路上消解掉，clonefile 把 1 GB 写到了
+`~/.agentvm/vms/etc.img`——不在快照列表里，用户看不见，而磁盘少了一个 G。
+三个入口（create/apply/delete）现在共用一个 `validateTag`，另外加一道
+`assertInside` 纵深防御。
+
+**7. 密码进了命令行参数。** macOS 那条路一开始把 `--password xxx` 直接拼进 argv，
+而 `ps` 对所有本地用户可见完整命令行，安装要跑几十分钟。现在走 VM 目录里一个
+0600 文件（`--password-file`），vmz 读完即删。
+
+**8. `provisioned` 被无条件置 true。** macOS 26 及以下没有
+`VZMacGuestProvisioningOptions`，走的是 warn 分支、根本没建账号，而调用方照样把
+`spec.provisioned` 置成 true——于是以后每次启动都不再带，用户每次都看到
+Setup Assistant，而「需要自己建账号」这句话只在第一次启动的日志里出现过一次。
+现在 `MacVMRuntime` 暴露 `didProvision`，只有真带上了才置位。
+
+### 单元级验证过什么
+
+- `vmz check` / `catalog` / `list` / `status` / `snapshot` / `clone` / `delete`
+  全命令冒烟通过；签名前后的 `catalog` 对比证实了 entitlement 是那个错的根因。
+- 快照 tag 白名单：`../../etc`、`..`、`.hidden`、`a/b`、空串全部拒绝，
+  合法 tag 通过，`vms` 根目录没有游离 img。
+- `vmkit install --distro macos-27` 三条路径（前台 / `--detach` / `--source` 本地
+  IPSW）用一个假 vmz 脚本验证参数拼装正确，不触发真实下载。
+- `vmkit install --detach --distro debian-13` 复现并修好了 UnboundLocalError
+  （第一版把通用 argv 分支整段替换掉了，app 装 Windows/Linux 100% 崩）。
+- VM 名白名单在 `spawn_detached_install` 入口生效（原来只有 cmd_install 有，
+  detach 路径根本不执行）。
+
+### 没验证的
+
+- **完整安装没有端到端跑过**：这台机器磁盘只剩 48 GB，而 macOS 虚拟机峰值需要
+  60 GB 以上（IPSW 25.6 GB + 系统盘实际写入三十多 GB）。下载器、安装器、
+  provisioning 的代码路径只做了单元级验证。
+- `VZMacGuestProvisioningOptions` 真的能建出账号并打开远程登录——API 是公开的，
+  行为按头文件写的用，但没有实测。
+- app 里 macOS VM 的画面（`VZVirtualMachineView`）没有视觉验证过：没跑到那一步。
+- 共享目录（virtiofs）在 macOS 客人机上没有可用的驱动，已在 app 的「存储」面板
+  里说明，没有实现。

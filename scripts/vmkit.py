@@ -65,6 +65,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -212,6 +213,35 @@ def find_tool(name: str) -> str:
         f"设 HOMEBREW_PREFIX 指过去，或先装它（brew install qemu）。")
 
 
+def find_vmz() -> Path | None:
+    """vmz 在哪儿。找不到返回 None，由调用方决定这是不是致命错误。
+
+    为什么不像 find_tool 那样直接 die：vmz 只有 macOS 客人机用得到，
+    Windows / Linux 两条路完全不碰它。为一个用不到的工具把整条命令
+    毙掉，用户会看到「找不到 vmz」而他根本不想装 macOS。
+    """
+    env = os.environ.get("AGENTVM_VMZ")
+    cands: list[Path] = []
+    if env:
+        cands.append(Path(env))
+    # app 自带的那份。install.sh 会把它编进 Resources/backend/，
+    # app 是自包含的，不依赖用户机器上有没有这个仓库。
+    res = Path(sys.argv[0]).resolve().parent / "vmz"
+    if res.name == "vmkit.py":
+        cands.append(res.parent / "vmz")
+    cands += [
+        HERE / "scripts" / "vmz" / "vmz",
+        HERE / "bin" / "vmz",
+        HOME / ".agentvm" / "bin" / "vmz",
+        Path("/usr/local/bin/vmz"),
+        Path("/opt/homebrew/bin/vmz"),
+    ]
+    for c in cands:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    return which("vmz") and Path(which("vmz"))
+
+
 def human(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:
@@ -283,6 +313,20 @@ def load_vm(name: str) -> dict:
 
 
 def save_vm(vm: dict) -> None:
+    """写 vm.json，权限 0600。
+
+    里面有明文 password。项目规约是「密钥落地 0600」，而这里原来用默认
+    umask 落成 0644——同机上任何本地用户都能读到每一台虚拟机的密码。
+    旁边 pubkey_text 写私钥时是 0600，说明这是漏的不是取舍。
+    """
+    _save_vm_impl(vm)
+    try:
+        os.chmod(str(vm_file(vm.get("name", ""))), 0o600)
+    except OSError:
+        pass
+
+
+def _save_vm_impl(vm: dict) -> None:
     vm["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     p = vm_file(vm["name"])
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -469,14 +513,33 @@ def cmd_check() -> int:
     if not p:
         info["ok"] = False
 
+    # macOS 客人机要的东西和另外两种不一样：不碰 QEMU，要的是一个带
+    # com.apple.security.virtualization entitlement 的 Swift 小程序。
+    # 找不到 vmz 的时候不能把整个 check 判失败——那会让 Windows/Linux
+    # 用户看到一片红，而他们压根不需要这个。
+    vz = find_vmz()
+    info["vmz"] = str(vz) if vz else None
+    info["items"].append({
+        "name": "vmz（macOS 客人机）", "ok": vz is not None,
+        "detail": str(vz) if vz else "未安装。macOS 虚拟机需要它，另外两种不受影响"})
+
     df = shutil.disk_usage(HOME)
     free = df.free
     info["free_bytes"] = free
+    # macOS 的恢复镜像 25.6 GB，加上装完之后系统盘实际写的三十多 GB，
+    # 峰值要 60 GB 以上。按 12 GB 判的话 Windows 用户够用，而 macOS
+    # 用户会下到一半磁盘满——那时候 25 GB 已经白下了。
+    macos_need = 60 << 30
     info["items"].append({
         "name": "磁盘剩余", "ok": free > (12 << 30),
-        "detail": f"{human(free)}（Windows 需要 10 GB 以上）"})
+        "detail": f"{human(free)}（Windows 需要 12 GB 以上，"
+                  f"macOS 虚拟机需要 {human(macos_need)}）"})
     if free <= (12 << 30):
         info["ok"] = False
+    if free <= macos_need:
+        info["macos_free_ok"] = False
+    else:
+        info.setdefault("macos_free_ok", True)
 
     Emit._w({"t": "check", **info})
     return 0 if info["ok"] else 1
@@ -978,10 +1041,15 @@ def local_qemu_args(vm: dict, with_iso: bool) -> list[str]:
         "-rtc", "base=localtime",
         # 端口只绑 127.0.0.1。web_port 转 NAS 的 Web UI（fnOS 是 5666），
         # ssh_port 备用——有些安装器装完会起 sshd
-        "-netdev", (f"user,id=net0,"
-                    f"hostfwd=tcp:127.0.0.1:{vm['ssh_port']}-:22,"
-                    f"hostfwd=tcp:127.0.0.1:{vm.get('web_port', 0)}"
-                    f"-:{WEB_GUEST_PORT}"),
+        #
+        # web_port 是 None 时整条 hostfwd 不拼。原来用 .get('web_port', 0)：
+        # 键存在而值是 None（23000-23999 全占满、或者从别的 VM 克隆来的）
+        # 时它返回 None，拼出 hostfwd=tcp:127.0.0.1:None-:5666，
+        # QEMU 起不来而报错说的是端口格式，看不出根因在这儿。
+        "-netdev", ("user,id=net0,"
+                    f"hostfwd=tcp:127.0.0.1:{vm.get('ssh_port', 0)}-:22"
+                    + (f",hostfwd=tcp:127.0.0.1:{vm['web_port']}"
+                       f"-:{WEB_GUEST_PORT}" if vm.get("web_port") else "")),
         "-device", "virtio-net-pci,netdev=net0",
         "-monitor", f"unix:{d / 'monitor.sock'},server,nowait",
         "-pidfile", str(d / "qemu.pid"),
@@ -1094,6 +1162,11 @@ def qemu_pid(vm: dict) -> int | None:
     ps 一次调用同时回答「在不在」「是不是僵尸」「是不是 QEMU」，比发信号可靠，
     代价是每次多起一个进程（几毫秒），status 这类轮询接口完全可以接受。
     """
+    # macOS 客人机没有 QEMU：跑它的是 vmz（Swift + VZ），pid 写在
+    # macvm.pid 里。这里一起认了，否则 status 对 macOS VM 永远报「已关机」，
+    # 而用户明明开着窗口——界面和实际相反是最难查的一类 bug。
+    if vm.get("kind") == "macos":
+        return macos_pid(vm)
     p = vm_dir(vm["name"]) / "qemu.pid"
     if not p.is_file():
         return None
@@ -1112,6 +1185,25 @@ def qemu_pid(vm: dict) -> int | None:
     if parts[0].startswith("Z"):
         return None
     if len(parts) < 2 or "qemu" not in parts[1]:
+        return None
+    return pid
+
+
+def macos_pid(vm: dict) -> int | None:
+    """macOS 客人机的进程号（vmz 的），没在跑就 None。
+
+    判活同样要排除僵尸：vmz 被强杀之后最常见的就是僵尸状态，而
+    `kill(pid, 0)` 对僵尸照样成功——照那个写会永远认为 VM 在跑，
+    界面停在「运行中」，而机器早没了。
+    """
+    p = vm_dir(vm["name"]) / "macvm.pid"
+    if not p.is_file():
+        return None
+    try:
+        pid = int(p.read_text().strip())
+    except ValueError:
+        return None
+    if pid <= 0 or not _pid_alive(pid):
         return None
     return pid
 
@@ -1384,6 +1476,128 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
 
 # ------------------------------------------------------------ 生命周期 --
 
+_VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+
+
+def check_vm_name(name: str) -> None:
+    """VM 名白名单。所有入口共用，包括 detach 那条以前漏掉的路。
+
+    这个名字会拼进文件路径（~/.agentvm/vms/<name>）、plist 标签、以及
+    PowerShell 单引号字符串。挡在入口处比在每个使用点各自判断可靠——
+    漏一个使用点就是一次路径穿越或命令注入。
+    """
+    if not _VM_NAME_RE.match(name or ""):
+        die(f"虚拟机名字只能以字母数字开头，含字母数字和 . _ -，"
+            f"最长 63 个字符：{name!r}")
+
+
+def _macos_vm_stub(name: str, args) -> dict:
+    """macOS VM 的最小 vm.json。
+
+    vmkit 的 list/status/start/configure 全认 vm.json，而 macOS 的运行时
+    配置在 vmz 写的 macvm.json 里。两边各写各的，字段不重叠。
+    """
+    return {
+        "name": name,
+        "distro": args.distro or "macos",
+        "kind": "macos",
+        "cpus": args.cpu or 4,
+        "ram": args.mem or "8G",
+        "disk": args.disk or "80G",
+        "user": args.user or "agent",
+        # macOS VM 没有这三个端口：VZ 的 NAT 不对外监听，也没有 VNC。
+        # 给 0 而不是省略——app 那侧这些字段不是可选的，缺了整条条目会被
+        # 静默丢掉，界面表现为「没有虚拟机」。
+        "ssh_port": 0,
+        "rdp_port": None,
+        "vnc_display": 0,
+        "ssh_key": str(args.ssh_key or (HOME / ".agentvm" / "id_ed25519")),
+        # headless 恒真：VZ 的画面只能在 app 进程里显示，没有第二种模式。
+        "headless": True,
+        "wait_minutes": args.wait,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "ready": False,
+    }
+
+
+def _vmz_password_args(name: str, password: str | None) -> list[str]:
+    """把密码写进 0600 文件，返回 --password-file 参数。
+
+    为什么不拼进 argv：`ps` 对所有本地用户可见完整命令行，而 macOS 安装要
+    跑几十分钟。项目规约写的是「密钥一律从文件读取，落地 0600，用完即删，
+    全程不经过命令行参数」——这条路径一开始没照着做。
+
+    文件放在 VM 目录里而不是 /tmp：同一个 VM 的安装只可能有一个（install.pid
+    互斥），不会串；而 /tmp 里留一个明文密码文件更容易被扫到。
+    vmz 读完即删。
+    """
+    if not password:
+        return []
+    d = vm_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "vmz.pass"
+    # O_EXCL：已存在就说明有另一个安装在跑，别覆盖。
+    try:
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            os.unlink(str(f))
+        except OSError:
+            pass
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(password)
+    os.chmod(str(f), 0o600)
+    return ["--password-file", str(f)]
+
+
+def _vmz_install_env() -> dict:
+    """给 vmz 的环境。PATH 要补全，因为 launchd 拉起的 app 不带 shell PATH。"""
+    env = dict(os.environ)
+    home = str(HOME)
+    env["PATH"] = f"{home}/hb/bin:/opt/homebrew/bin:/usr/local/bin:" \
+        f"/usr/bin:/bin:/usr/sbin:/sbin"
+    env["HOME"] = home
+    return env
+
+
+def _install_signal_guard() -> None:
+    """安装期间收到 SIGTERM/SIGINT 时，把客人机进程一起带走。
+
+    为什么必须要有：app 的「停止」按钮杀的是 install.pid，而非 macOS 路径下
+    那个 pid 就是 vmkit 自己。vmkit 原来没有信号处理器，收到 SIGTERM 当场
+    死掉——而 QEMU 是 start_new_session 出去的另一个进程组，它还在继续往
+    data.img 写。用户看到「已取消」，实际上安装还在跑：此时同名重装，
+    winarm 看到磁盘已存在就复用、看到 qemu_running 就报「VM 已在运行」，
+    新安装顺着旧 VM 走到「SSH 就绪」，状态完全对不上。
+
+    杀的办法是读每个 VM 的 qemu.pid 文件，不是 killpg：QEMU 主动脱离了
+    我们的进程组，pgid 对不上。
+    """
+    def handler(signum, frame):
+        for p in sorted(VMS.glob("*/qemu.pid")):
+            try:
+                pid = int(p.read_text().strip())
+            except (OSError, ValueError):
+                continue
+            if pid > 0 and _pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        # 自己也退。用 os._exit 而不是 sys.exit：信号处理器里抛异常会被
+        # Python 转成 traceback，而这时候用户已经点了「停止」，不想看栈。
+        os._exit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # 不在主线程时装不了（后台安装那条路是 setsid 出去的新进程，
+            # 那里面就是主线程，能装上）。装不上不致命。
+            pass
+
+
 def spawn_detached_install(args) -> int:
     """把安装甩到后台跑，父进程立刻返回。
 
@@ -1421,12 +1635,72 @@ def spawn_detached_install(args) -> int:
     d.mkdir(parents=True, exist_ok=True)
     logf = d / "install.log"
 
-    argv = [sys.executable, str(Path(__file__).resolve())]
-    # 把原始参数原样传过去，只去掉 --detach
-    for a in sys.argv[1:]:
-        if a == "--detach":
-            continue
-        argv.append(a)
+    # 名字必须先校验，而且要在建目录之前。
+    #
+    # 为什么不在 cmd_install 里验完就算：main() 先按 --detach 分叉到这儿，
+    # cmd_install 那道校验在 detach 路径上根本不执行。vm_dir() 直接把名字
+    # 拼进路径，`--name /tmp/x` 会在任意绝对路径建目录、写 install.log 和
+    # install.pid；`--name ../../foo` 直接跳出 ~/.agentvm/vms。vmz 随后会拒
+    # 这个名字，但目录和文件已经留下了。
+    check_vm_name(name)
+
+    # macOS 这一种的后端是另一个程序（vmz，Swift 写的，因为 VZ 只有
+    # Swift/ObjC API）。这里必须起它而不是再跑一遍 vmkit.py：VZMacOSInstaller
+    # 需要一个活的 VZVirtualMachine，而那个对象只在 vmz 进程里。
+    # 甩后台的机制照旧（setsid + 日志重定向），所以 app 关掉安装照样跑完。
+    distro = None
+    if args.distro:
+        try:
+            distro = find_distro(load_catalog(), args.distro)
+        except SystemExit:
+            distro = None
+
+    if distro is not None and distro.get("kind") == "macos":
+        vmz = find_vmz()
+        if not vmz:
+            die("找不到 vmz。macOS 虚拟机需要它：\n"
+                "  ./install.sh 会把它编出来并装到 ~/.agentvm/bin/vmz\n"
+                "或者自己编：swiftc -O -sdk $(xcrun --sdk macosx --show-sdk-path) "
+                "-target arm64-apple-macos14.0 -o ~/.agentvm/bin/vmz "
+                "app/Sources/MacVMEngine.swift scripts/vmz/main.swift\n"
+                "（编完要签名：codesign -s - --entitlements "
+                "app/Resources/entitlements.plist ~/.agentvm/bin/vmz）")
+        argv = [str(vmz), "install", "--name", name]
+        for flag, attr in (("--cpu", "cpu"), ("--mem", "mem"),
+                           ("--disk", "disk"), ("--user", "user")):
+            v = getattr(args, attr, None)
+            if v is not None:
+                argv += [flag, str(v)]
+        if args.force:
+            argv.append("--force")
+        if args.source:
+            # vmz 认的是 --ipsw，vmkit 这边叫 --source（跟另外两种安装包
+            # 共用一个参数名）。两套名字在边界上换一次，别让用户记两套。
+            argv += ["--ipsw", args.source]
+        # 密码走文件，不走命令行参数。项目自己的规约是「密钥一律从文件读取，
+        # 经 base64 传输，落地 0600，用完即删，全程不经过命令行参数」，
+        # 而 macOS 这条路径一开始是把密码直接拼进 argv 的：ps 对所有本地
+        # 用户可见完整 argv，安装要跑几十分钟，等于把密码挂在外面那么久。
+        argv += _vmz_password_args(name, args.password)
+        env = _vmz_install_env()
+        # vm.json 现在就得写。原来只由「真正干活的那个子进程」写，而 macOS
+        # 的子进程是 vmz，它只写自己的 macvm.json、永远不写 vmkit 的 vm.json：
+        # 装完之后 vmkit list 是空的、status/start/configure 全部报「没有这个
+        # 虚拟机」，app 里也看不到这台机器。这不是「以后再补」的小疏漏，
+        # 是装完就不可见。
+        d.mkdir(parents=True, exist_ok=True)
+        save_vm(_macos_vm_stub(name, args))
+    else:
+        # 另外两种：再跑一遍 vmkit 自己，把 --detach 去掉。
+        # 这一段必须在——原来它被 macOS 分支整段替换掉了，结果 app
+        # （永远拼 --detach）装 Windows/Linux 100% UnboundLocalError，
+        # 父进程连 install.log 都没交出去。
+        argv = [sys.executable, str(Path(__file__).resolve())]
+        for a in sys.argv[1:]:
+            if a == "--detach":
+                continue
+            argv.append(a)
+        env = None
 
     # 追加而不是覆盖：重跑一次不会把上次的日志冲掉，出问题时能回看
     with logf.open("a") as f:
@@ -1434,7 +1708,7 @@ def spawn_detached_install(args) -> int:
         f.flush()
         proc = subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL,
-                                start_new_session=True, cwd=str(HERE))
+                                start_new_session=True, cwd=str(HERE), env=env)
     # pid 落盘。GUI 靠它判断「这个安装还在跑吗、要不要接着显示进度」。
     # 不用 pgrep 匹配命令行：命令行里参数顺序不固定，写出来的模式很容易对不上，
     # 而且会误匹配到别的进程。
@@ -1445,6 +1719,7 @@ def spawn_detached_install(args) -> int:
 
 
 def cmd_install(args) -> int:
+    _install_signal_guard()
     if platform.machine() != "arm64" or platform.system() != "Darwin":
         die("只在 Apple Silicon 的 macOS 上有效。")
     name = args.name
@@ -1455,7 +1730,21 @@ def cmd_install(args) -> int:
 
     # 本地安装包这条路不走 catalog：没有下载地址、没有校验和、没有推荐配置，
     # 全靠用户给的一个路径。所以先把它分叉出来，别让后面的 catalog 查找绊倒。
-    if args.source or args.source_url:
+    #
+    # 唯一的例外是 macOS + --source：那个 source 是本地 IPSW，而 macOS 的
+    # 安装本来就要从恢复镜像来，catalog 条目只是个「默认从 Apple 下」的标记。
+    # 不在这儿放行的话，用户手上已经有一个 IPSW 时会被塞进 local 那条路，
+    # 拿它当一个普通 ISO 装——而那整套（cloud-init 种子盘、QEMU 参数）对
+    # macOS 完全不适用，失败信息还会很难懂。
+    macos_ipsw = None
+    if args.source and args.distro:
+        try:
+            if find_distro(load_catalog(), args.distro).get("kind") == "macos":
+                macos_ipsw = args.source
+        except SystemExit:
+            macos_ipsw = None
+
+    if (args.source or args.source_url) and not macos_ipsw:
         if args.source and args.source_url:
             die("--source 和 --source-url 只能给一个")
         if args.source_url:
@@ -1472,10 +1761,13 @@ def cmd_install(args) -> int:
                 die(f"读不了这个文件：{src}（检查权限）")
             if src.stat().st_size < 32 * 1024 * 1024:
                 die(f"这个文件只有 {human(src.stat().st_size)}，不像个安装镜像")
-        taken = {v["ssh_port"] for v in all_vms() if v["name"] != name}
-        taken_rdp = {v.get("rdp_port", 0) for v in all_vms() if v["name"] != name}
-        taken_vnc = {v.get("vnc_display", 0) for v in all_vms() if v["name"] != name}
-        taken_web = {v.get("web_port", 0) for v in all_vms() if v["name"] != name}
+        # 一律 .get()：一个写了一半的 vm.json 缺 ssh_port 时，这里 KeyError
+        # 会让整条 install 崩掉，而用户只是想装一个跟那个坏字段无关的新 VM。
+        # （vm_record 那边早就踩过并修好了同一个坑，这两处是漏的。）
+        taken = {v.get("ssh_port", 0) for v in all_vms() if v.get("name") != name}
+        taken_rdp = {v.get("rdp_port", 0) or 0 for v in all_vms() if v.get("name") != name}
+        taken_vnc = {v.get("vnc_display", 0) or 0 for v in all_vms() if v.get("name") != name}
+        taken_web = {v.get("web_port", 0) or 0 for v in all_vms() if v.get("name") != name}
         vm = {
             "name": name,
             # distro 记文件名，界面好显示「装的是哪个包」
@@ -1490,7 +1782,11 @@ def cmd_install(args) -> int:
             "password": args.password or "agentvm",
             "ssh_port": alloc_port(PORT_BASE_SSH, taken),
             "rdp_port": None,
-            "web_port": alloc_port(PORT_BASE_WEB, taken_web),
+            # alloc_port 在 23000-23999 全占满时返回 0。存成 0 而不是 None：
+            # local_qemu_args 那里 `vm.get('web_port', 0)` 对「键存在但值是
+            # None」返回 None，会拼出 hostfwd=tcp:127.0.0.1:None-:5666，
+            # QEMU 直接起不来。
+            "web_port": alloc_port(PORT_BASE_WEB, taken_web) or None,
             "vnc_display": alloc_vnc_display(taken_vnc),
             "ssh_key": str(args.ssh_key or (HOME / ".agentvm" / "id_ed25519")),
             # 装的时候就是无窗口的：画面走 VNC，用户在 app 内嵌控制台里点完
@@ -1520,7 +1816,10 @@ def cmd_install(args) -> int:
         # 和旧数据原样留着：用户以为得到一台干净机器，实际上一轮的脏数据全在，
         # 而 --help 写的是「覆盖重装」。这种事比不给 --force 更糟——至少那个
         # 会明确报错。
-        if qemu_pid({"name": name}):
+        # macOS 的进程号在 macvm.pid 里，qemu_pid 收的字典没 kind 就永远
+        # 返回 None——那会对一个正在跑的 macOS VM 说「没在运行」然后删盘。
+        old = load_vm(name) if vm_file(name).exists() else {}
+        if qemu_pid(old if old else {"name": name}):
             die(f"{name} 正在运行。先 stop 再 --force 重装，不然会删掉正在用的盘。")
         warn(f"--force：清掉 {vm_dir(name)} 重新装（里面的数据一起没）")
         _rmtree(vm_dir(name))
@@ -1528,8 +1827,8 @@ def cmd_install(args) -> int:
     # 一律 .get()：一个写了一半的 vm.json 缺 ssh_port 时，这里 KeyError 崩掉，
     # 而用户只是想装一个跟那个坏字段无关的新虚拟机。
     taken = {v.get("ssh_port", 0) for v in all_vms() if v.get("name") != name}
-    taken_rdp = {v.get("rdp_port", 0) for v in all_vms() if v["name"] != name}
-    taken_vnc = {v.get("vnc_display", 0) for v in all_vms() if v["name"] != name}
+    taken_rdp = {v.get("rdp_port", 0) or 0 for v in all_vms() if v.get("name") != name}
+    taken_vnc = {v.get("vnc_display", 0) or 0 for v in all_vms() if v.get("name") != name}
     ssh_port = alloc_port(PORT_BASE_SSH, taken)
     rdp_port = alloc_port(PORT_BASE_RDP, taken_rdp)
     vnc_display = alloc_vnc_display(taken_vnc)
@@ -1557,10 +1856,90 @@ def cmd_install(args) -> int:
 
     if distro["kind"] == "windows":
         vm = cmd_install_windows(vm, distro)
+    elif distro["kind"] == "macos":
+        vm = cmd_install_macos(vm, distro, ipsw=macos_ipsw)
     else:
         vm = cmd_install_linux(vm, distro)
     Emit.done(vm_record(vm))
     return 0
+
+
+def cmd_install_macos(vm: dict, distro: dict, ipsw: str | None = None) -> dict:
+    """macOS 客人机的安装：委托给 vmz，然后等它跑完。
+
+    为什么是「等它跑完」而不是起完就返回：VZMacOSInstaller 需要一个活的
+    VZVirtualMachine，而那个对象只在 vmz 进程里活着。vmkit 这边起一个
+    `vmz install` 前台跑，把它的 JSON 事件原样转出去——下载进度、安装阶段
+    都这么到界面上。和 Windows 那条路一样，安装期间界面不能是死的。
+
+    这条路上 vmkit 只做三件事：建目录、写 vm.json、当中继。
+    """
+    vmz = find_vmz()
+    if not vmz:
+        die("找不到 vmz。macOS 虚拟机需要它：\n"
+            "  ./install.sh 会把它编出来并装到 ~/.agentvm/bin/vmz\n"
+            "或者自己编（见 scripts/vmz/main.swift 顶部注释）。")
+
+    # 磁盘要先看一眼。25.6 GB 镜像 + 装完三十多 GB，峰值 60 GB 以上；
+    # 不够的话在下到一半时才失败，那时候 25 GB 已经白下了。
+    free = shutil.disk_usage(HOME).free
+    need = 60 << 30
+    if free < need:
+        warn(f"磁盘只剩 {human(free)}，装 macOS 虚拟机峰值需要约 {human(need)}。"
+             f"可能会在下载或安装中途失败。")
+
+    argv = [str(vmz), "install", "--name", vm["name"],
+            "--cpu", str(vm["cpus"]), "--mem", vm["ram"],
+            "--disk", vm["disk"], "--user", vm["user"]]
+    # 密码走 0600 文件，不进命令行参数。见 _vmz_password_args 的注释。
+    argv += _vmz_password_args(vm["name"], vm.get("password"))
+    # 自己手上有一个 IPSW 就走本地那份，不去 Apple 下 25.6 GB。
+    # install --source /path/to.ipsw 就是干这个用的。
+    #
+    # 注意 ipsw 是参数传进来的，不是函数里读 args：cmd_install_macos 也被
+    # 后台安装那条路调到（spawn_detached_install 里另起了一份进程），
+    # 那边没有 args 对象——实测踩过，NameError 裸栈到用户脸上。
+    if ipsw:
+        argv += ["--ipsw", str(Path(ipsw).expanduser())]
+
+    # 事件原样转出去。vmz 输出的是和 vmkit 同一套协议（一行一个 JSON），
+    # 所以这里只要把 stdout 的行喂给 StreamParser 的同类逻辑就行。
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            cwd=str(HERE), env=_vmz_install_env())
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            # vmz 里有几处直接 print（跟 winarm-vm.py 一样），宽容一点
+            Emit.log(line)
+            continue
+        Emit._w(ev)
+    rc = proc.wait()
+    if rc != 0:
+        die(f"vmz 安装失败（退出码 {rc}）。完整日志："
+            f"{vm_dir(vm['name']) / 'install.log'}")
+
+    # vmz 那边把配置写在 <vm>/macvm.json，vmkit 的 vm.json 也补一份，
+    # 两边各自管各自的字段，不互相覆盖（见 MacVMSpec 的注释）。
+    try:
+        spec = json.loads((vm_dir(vm["name"]) / "macvm.json").read_text())
+        if isinstance(spec, dict):
+            vm["build"] = spec.get("build", "")
+    except (OSError, ValueError):
+        # 装完了但 macvm.json 读不了。不致命——build 只是界面显示用，
+        # 但要说一声，不然用户看到一台没有版本号的虚拟机不知道装的是什么。
+        warn("装完了，但读不到 macvm.json，界面上不会显示 macOS 版本号")
+    vm["ready"] = True
+    save_vm(vm)
+    ok(f"虚拟机 {vm['name']} 已就绪。"
+       f"macOS 装好后用「启动」打开，第一次启动会自动建账号 {vm['user']} "
+       f"并打开远程登录。")
+    return vm
 
 
 def resolve_headless(vm: dict, args) -> bool:
@@ -1635,6 +2014,56 @@ def _sync_windows_vnc(vm: dict) -> None:
     warn(f"VNC 端口被占用，实际改用 {5900 + real}（已写回 vm.json）")
 
 
+def _relay(proc: subprocess.Popen, what: str) -> int:
+    """把一个子进程的 JSON 事件原样转出去，返回它的退出码。
+
+    vmz 输出的是和 vmkit 同一套协议（stdout 一行一个 JSON），所以只要按行
+    解析再交给 Emit 就行。不是 JSON 的行当普通日志——vmz 和 winarm 一样
+    有几处直接 print，客户端宽容一点比去改那条已经跑通的路径安全。
+    """
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            Emit.log(line)
+            continue
+        Emit._w(ev)
+    return proc.wait()
+
+
+def start_macos(vm: dict) -> None:
+    """前台跑起一个 macOS 客人机，直到它停。
+
+    VZVirtualMachine 不能跨进程传递，所以 VM 跟 vmz 进程同生共死：
+    这个函数会一直占着终端，Ctrl-C 或客人机自己选了关机才返回。
+    """
+    vmz = find_vmz()
+    if not vmz:
+        die("找不到 vmz。macOS 虚拟机需要它（./install.sh 会装好）。")
+    spec = vm_dir(vm["name"]) / "macvm.json"
+    if not spec.is_file():
+        die(f"没有 {spec}。这个虚拟机可能不是 macOS 类型的。")
+    try:
+        loaded = json.loads(spec.read_text())
+        if not isinstance(loaded, dict) or not loaded.get("installed"):
+            die("macOS 还没装完。没有系统的盘启动只会卡在黑屏，先跑 install。")
+    except ValueError:
+        die(f"{spec} 不是合法 JSON，可能是写坏了。删掉这个虚拟机重装。")
+    except OSError as e:
+        die(f"读不了 {spec}：{e}")
+    Emit.stage("start", f"启动 {vm['name']}")
+    proc = subprocess.Popen([str(vmz), "start", "--name", vm["name"]],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, cwd=str(HERE), env=_vmz_install_env())
+    rc = _relay(proc, "start")
+    if rc != 0:
+        die(f"{vm['name']} 退出了（退出码 {rc}）")
+
+
 def cmd_start(args) -> int:
     vm = load_vm(args.name)
     headless = resolve_headless(vm, args)
@@ -1650,6 +2079,15 @@ def cmd_start(args) -> int:
         except w._Die as e:
             die(str(e))
         _sync_windows_vnc(vm)
+    elif vm["kind"] == "macos":
+        # macOS 客人机是前台跑的，不是起了就返回。
+        #
+        # 原因写在 MacVMEngine 顶部：VZVirtualMachine 不能跨进程传递，
+        # VM 的生命周期跟持有它的进程绑定。所以 `vmkit start` 对一个 macOS
+        # VM 来说等于「这个终端就是虚拟机的寿命」——Ctrl-C 优雅关机，
+        # 关终端客人机跟着停。这不是设计选择，是框架限制。
+        # app 里不走这条路，它在自己进程里跑 VZ，所以有关闭按钮和画面。
+        start_macos(vm)
     elif vm["kind"] == "local":
         # 从盘启动意味着用户已经在安装器里点完了。原来这里不会置 ready，
         # 于是界面一直显示「未就绪」、登录信息也不给——用户明明已经装好。
@@ -1674,6 +2112,10 @@ def cmd_window(args) -> int:
     如果本来就有窗口（headless 为假），什么都不做，只带到前台。
     """
     vm = load_vm(args.name)
+    if vm["kind"] == "macos":
+        die("macOS 虚拟机没有「原生窗口模式」这个开关：它的窗口就是 app 里那个"
+            "VZVirtualMachineView，不存在第二种显示方式。\n"
+            "在 app 里点「打开窗口」即可。")
     if not qemu_pid(vm):
         die("VM 没在运行，先 start")
     if vm.get("headless"):
@@ -1701,6 +2143,31 @@ def cmd_window(args) -> int:
 
 def cmd_stop(args) -> int:
     vm = load_vm(args.name)
+    if vm["kind"] == "macos":
+        # macOS 客人机的进程是 vmz，停它要发 SIGTERM——vmz 内部有个
+        # signal handler，收到就走 VZ 的优雅停机（machine.stop），
+        # 让 macOS 正常 flush 磁盘。直接 kill -9 会在 APFS 里留下
+        # 未干净的日志，下次启动跑好几分钟 fsck。
+        vmz = find_vmz()
+        if not vmz:
+            die("找不到 vmz，停不了 macOS 虚拟机。")
+        pidf = vm_dir(vm["name"]) / "macvm.pid"
+        try:
+            pid = int(pidf.read_text().strip())
+        except (OSError, ValueError):
+            ok("VM 没在运行")
+            return 0
+        if not _pid_alive(pid):
+            ok("VM 没在运行")
+            return 0
+        Emit.stage("stop", f"停止 {vm['name']}")
+        proc = subprocess.Popen([str(vmz), "stop", "--name", vm["name"]],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, cwd=str(HERE), env=_vmz_install_env())
+        rc = _relay(proc, "stop")
+        if rc != 0:
+            die(f"没停下来。可以 kill {pid}，但会丢客人机里没落盘的数据。")
+        return 0
     pid = qemu_pid(vm)
     if not pid:
         ok("VM 没在运行")
@@ -1772,8 +2239,12 @@ def vm_record(vm: dict) -> dict:
     d = vm_dir(name) if name else VMS
     # raw 盘的是 data.img，qcow2 overlay 的是 disk.qcow2。本地 ISO 装的
     # 也是 raw 盘，漏了它会去 stat 一个不存在的文件，占用显示成 0。
+    # macOS 客人机的盘是 raw 的 disk.img（VZ 只认 raw），跟本地 ISO 那条路
+    # 一样；另外两种是 qcow2 overlay。
     disk = d / ("data.img" if vm.get("kind") in ("windows", "local")
                 else "disk.qcow2")
+    if vm.get("kind") == "macos":
+        disk = d / "disk.img"
     rec = {
         "name": name, "distro": vm.get("distro", ""), "kind": vm.get("kind", ""),
         "running": bool(pid), "pid": pid, "ready": vm.get("ready", False),
@@ -1781,7 +2252,11 @@ def vm_record(vm: dict) -> dict:
         "disk": vm.get("disk", "32G"),
         "user": vm.get("user", "agent"), "ssh_port": vm.get("ssh_port", 0),
         "rdp_port": vm.get("rdp_port"),
-        "vnc_port": 5900 + vm.get("vnc_display", 0),
+        # macOS 客人机没有 VNC：VZ 不提供 VNC server，画面走 app 里的
+        # VZVirtualMachineView。给 0 而不是 null——app 那侧 vncPort 是 Int，
+        # 解不出 null 整条条目会被静默丢掉。
+        "vnc_port": 0 if vm.get("kind") == "macos" else 5900 + vm.get("vnc_display", 0),
+        "ssh_port": 0 if vm.get("kind") == "macos" else vm.get("ssh_port", 0),
         # 有没有原生窗口。app 据此决定显不显示「用系统窗口打开」——无窗口
         # 跑的 VM 点它是重启一次客人机，得先跟用户说清楚。
         "headless": bool(vm.get("headless", False)),
@@ -1806,6 +2281,21 @@ def vm_record(vm: dict) -> dict:
     }
     if pid and vm.get("kind") == "linux":
         rec["ssh_ok"] = linux_ssh_ready(vm, timeout=4)
+    if vm.get("kind") == "macos":
+        # 界面要靠这几个字段区分 macOS VM：有没有装完、装的哪个 build、
+        # 分辨率是多少。缺一个 app 那边就解不出来，而 Swift 的解码失败
+        # 是静默的——表现为列表里少一台，终端里看却在。
+        try:
+            spec = json.loads((d / "macvm.json").read_text())
+        except (OSError, ValueError):
+            # 装到一半 vm.json 有了而 macvm.json 还没有（vmz 还没跑到写它
+            # 那一步）。这时候别显示「0x0」——给安装时的默认值，
+            # 跟用户刚在向导里填的一致。
+            spec = {"width": 1440, "height": 900, "build": "", "installed": False}
+        rec["ready"] = bool(spec.get("installed"))
+        rec["mac_build"] = spec.get("build", "")
+        rec["mac_resolution"] = f"{spec.get('width', 1440)}x{spec.get('height', 900)}"
+        rec["mac_installed"] = bool(spec.get("installed"))
     return rec
 
 
@@ -1971,6 +2461,22 @@ def cmd_snapshot(args) -> int:
     vm = load_vm(args.name)
     name = vm["name"]
 
+    # macOS 客人机没有 qcow2，快照是整盘 clonefile（APFS 原生能力），
+    # 所以整套动作都在 vmz 里。这里只做转发和事件转播。
+    if vm["kind"] == "macos":
+        vmz = find_vmz()
+        if not vmz:
+            die("找不到 vmz，管理不了 macOS 虚拟机的快照。")
+        proc = subprocess.Popen(
+            [str(vmz), "snapshot", args.action, "--name", name]
+            + (["--tag", args.tag] if args.tag else []),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            cwd=str(HERE), env=_vmz_install_env())
+        rc = _relay(proc, "snapshot")
+        if rc != 0:
+            die(f"快照操作失败（退出码 {rc}）")
+        return 0
+
     if args.action == "list":
         f = _vm_qcow2(vm)
         if not f:
@@ -2051,6 +2557,21 @@ def cmd_clone(args) -> int:
         die(f"名字只能含字母数字和 - _：{new}")
     if vm_file(new).exists() and not args.force:
         die(f"{new} 已存在。换个名字，或加 --force 覆盖。")
+    # macOS 客人机的克隆在 vmz 里：系统盘走 clonefile，而机器标识和 NVRAM
+    # 必须重新生成（同一个 machineIdentifier 跑两台是未定义行为，
+    # 实际表现是 iCloud 互相顶、Handoff 串台）。
+    if src["kind"] == "macos":
+        vmz = find_vmz()
+        if not vmz:
+            die("找不到 vmz，克隆不了 macOS 虚拟机。")
+        proc = subprocess.Popen(
+            [str(vmz), "clone", "--name", src["name"], "--new-name", new],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            cwd=str(HERE), env=_vmz_install_env())
+        rc = _relay(proc, "clone")
+        if rc != 0:
+            die(f"克隆失败（退出码 {rc}）")
+        return 0
     if qemu_pid(src):
         die("源虚拟机正在运行，先 stop 再克隆——运行中复制出来的状态不一致。")
 
@@ -2126,7 +2647,7 @@ def cmd_clone(args) -> int:
     taken_ssh = {v.get("ssh_port", 0) for v in all_vms()}
     taken_rdp = {v.get("rdp_port", 0) for v in all_vms()}
     taken_vnc = {v.get("vnc_display", 0) for v in all_vms()}
-    taken_web = {v.get("web_port", 0) for v in all_vms()}
+    taken_web = {v.get("web_port") or 0 for v in all_vms()}
 
     vm = dict(src)
     vm["name"] = new
@@ -2134,7 +2655,7 @@ def cmd_clone(args) -> int:
     vm["rdp_port"] = (alloc_port(PORT_BASE_RDP, taken_rdp)
                       if src.get("rdp_port") else None)
     vm["vnc_display"] = alloc_vnc_display(taken_vnc)
-    vm["web_port"] = (alloc_port(PORT_BASE_WEB, taken_web)
+    vm["web_port"] = (alloc_port(PORT_BASE_WEB, taken_web) or None
                       if src.get("web_port") else None)
     vm["disks"] = moved
     vm["shares"] = [dict(x) for x in src.get("shares", [])]
@@ -2164,6 +2685,16 @@ def cmd_clone(args) -> int:
 
 
 def cmd_share(args) -> int:
+    """共享目录（virtio-9p）。
+
+    只有 Linux 那条路真的有 -virtfs 参数。Windows 的 winarm 参数表里没有，
+    macOS 走 VZ 也没有——原来两种都不挡，共享被静默记进 vm.json 而从不生效，
+    界面显示「已共享」，用户在客人机里怎么也找不到那个目录。
+    """
+    vm = load_vm(args.name)
+    if vm["kind"] != "linux":
+        die(f"共享目录只在 Linux 虚拟机上有效（virtio-9p）。"
+            f"{vm['kind']} 这条路的磁盘/共享参数表里没有它，记了也不会挂上。")
     """共享目录：把宿主机上的一个文件夹挂进虚拟机（virtio-9p）。
 
     为什么需要它：虚拟机里装了东西，想把文件取出来或者放进去，原来只能走 SSH
@@ -2249,6 +2780,20 @@ def cmd_delete(args) -> int:
         if qemu_pid(vm):
             warn("VM 还在跑，先关机再删")
             cmd_stop(args)
+    elif (d / "macvm.json").is_file():
+        # macOS 虚拟机没有 vm.json（它的配置在 macvm.json 里），
+        # 但删的时候照样要先停机、照样要卸自启 plist。漏了这一段，
+        # 删一个正在跑的 macOS VM 会把盘从 VZ 脚下抽走。
+        if macos_pid({"name": name}):
+            warn("VM 还在跑，先关机再删")
+            cmd_stop(args)
+        plist = HOME / "Library" / "LaunchAgents" / f"com.agentvm.{name}.plist"
+        if plist.exists():
+            run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                check=False)
+            run(["launchctl", "unload", str(plist)], check=False)
+            plist.unlink(missing_ok=True)
+            ok(f"已卸掉开机自启 {plist}")
         # 开机自启的 plist 必须一起卸掉。原来只 _rmtree(d)：plist 还留在
         # ~/Library/LaunchAgents/，而它指向的 wrapper 就在被删掉的 VM 目录里。
         # 之后每次登录 launchd 执行一个不存在的脚本 → 非零退出 → KeepAlive 加
@@ -2267,6 +2812,11 @@ def cmd_delete(args) -> int:
 
 
 def cmd_open(args) -> int:
+    if load_vm(args.name)["kind"] == "macos":
+        die("macOS 虚拟机的画面在 AgentVM app 里（VZVirtualMachineView），"
+            "命令行没有窗口可切。\n"
+            "打开 app，选中它，点「打开窗口」。")
+
     """把虚拟机窗口带到前台。
 
     launchd 或 GUI 拉起的 Cocoa 窗口不会自动抢焦点，用户经常以为窗口没开。
@@ -2296,6 +2846,13 @@ def cmd_open(args) -> int:
 
 
 def cmd_screenshot(args) -> int:
+    # --out 会原样插进 QEMU monitor 的 HMP 命令。HMP 是换行分隔的，
+    # 路径里带一个换行就能接任意 monitor 命令——包括 quit，而这个文件
+    # 里好几处注释刚强调过「绝对不能发 quit」。默认路径和 app 都不碰它
+    # （app 用 VNC，不截图），所以这是命令行自伤面，但仍然要挡。
+    out = args.out or ""
+    if any(c in out for c in "\n\r"):
+        die("截图路径里不能有换行")
     vm = load_vm(args.name)
     d = vm_dir(vm["name"])
     # 默认输出不落在 /tmp。那里是全局可写的，另一个用户可以先建一个指向某
@@ -2384,6 +2941,13 @@ def cmd_configure(args) -> int:
     """
     vm = load_vm(args.name)
     name = vm["name"]
+
+    # macOS 客人机的配置不在 vm.json 里，在 macvm.json（vmz 的格式）。
+    # 两边各管各的文件：vmkit 的 save_vm 是整体重写，混在一个文件里
+    # 迟早互相冲掉。这里单独走一条路，改完照样说清楚要重启才生效。
+    if vm["kind"] == "macos":
+        return configure_macos(args)
+
     changed: list[str] = []
 
     if args.cpu is not None:
@@ -2556,6 +3120,94 @@ def cmd_configure(args) -> int:
     return 0
 
 
+def configure_macos(args) -> int:
+    """改 macOS 虚拟机的配置：CPU、内存、账号密码、分辨率。
+
+    磁盘不给改：VZ 的盘是 raw，truncate 大一点虽然不会像 qcow2 那样
+    立刻报错，但 APFS 容器大小是记在盘里的，改大之后客人机看不到新空间，
+    改小直接破坏文件系统。要更大就删了重装，或者用「存储」里加附加盘。
+
+    全部改完都要重启才生效——它们是创建 VZVirtualMachine 时的参数。
+    """
+    name = args.name
+    spec_path = vm_dir(name) / "macvm.json"
+    try:
+        spec = json.loads(spec_path.read_text())
+    except (OSError, ValueError) as e:
+        die(f"读不了 {spec_path}：{e}")
+    if not isinstance(spec, dict):
+        die(f"{spec_path} 内容不是一份配置（是 "
+            f"{type(spec).__name__}），读不了。")
+    # 磁盘不给改，而且要说出来。原来 --disk 被静默忽略，而 app 的硬件区
+    # 照样显示磁盘选择器：用户选了个更大的值，后端回一句「没有要改的」，
+    # app 却显示已保存——界面和实际不一致。
+    if args.disk:
+        die("macOS 虚拟机的磁盘不能改。VZ 的盘是 raw，改大会让 APFS 容器大小"
+            "和文件系统对不上（客人机看不到新空间），改小直接破坏文件系统。\n"
+            "要更大的盘：删掉重装，或者用「存储」面板加一块数据盘。")
+    # VM 在跑时改配置：cpu/内存/分辨率都是创建 VZVirtualMachine 时的参数，
+    # 改了也要重启才生效，这跟另外几种一样，说清楚就行。
+    if macos_pid({"name": name}):
+        warn(f"{name} 正在运行。这些改动要重启之后才生效。")
+    changed: list[str] = []
+
+    if args.cpu is not None:
+        top = host_cpus()
+        if not 1 <= args.cpu <= top:
+            die(f"CPU 核心要给 1 到 {top} 之间，你给了 {args.cpu}")
+        if args.cpu != spec.get("cpus"):
+            spec["cpus"] = args.cpu
+            changed.append(f"CPU {args.cpu} 核")
+    if args.mem:
+        want = parse_size(args.mem)
+        if want < 4 << 30:
+            # macOS 客人机的下限比 Linux 高：低于 4 GB 连安装器都起不来，
+            # 而 VZMacOSConfigurationRequirements 里写的最低值是 4 GB。
+            die(f"内存至少 4G（macOS 客人机的最低要求），你给了 {args.mem}")
+        if args.mem != spec.get("ram"):
+            spec["ram"] = args.mem
+            changed.append(f"内存 {args.mem}")
+    if args.user:
+        if not args.user.replace("-", "").replace("_", "").isalnum():
+            die(f"登录名只能含字母数字和 - _：{args.user}")
+        if args.user != spec.get("user"):
+            spec["user"] = args.user
+            changed.append(f"登录名 {args.user}")
+    if args.password:
+        if len(args.password) < 4:
+            die("密码至少 4 个字符（客人机建账号时的最低要求）")
+        spec["password"] = args.password
+        # 改密码要重新 provisioning，否则新密码在客人机里不生效——
+        # 账号已经在第一次启动时建好了，再建一次会撞。
+        spec["provisioned"] = False
+        changed.append("密码（下次启动会重新建账号）")
+    if getattr(args, "width", None) or getattr(args, "height", None):
+        w = args.width or spec.get("width", 1440)
+        h = args.height or spec.get("height", 900)
+        if not 800 <= w <= 5120 or not 600 <= h <= 3200:
+            die(f"分辨率要给 800x600 到 5120x3200 之间，你给了 {w}x{h}")
+        spec["width"], spec["height"] = w, h
+        changed.append(f"分辨率 {w}x{h}")
+
+    if not changed:
+        ok("没有要改的")
+        return 0
+    # 原子写：先写临时文件再 replace。原来直接 write_text 覆写，而 VM 在跑时
+    # vmz 自己也会写同一个文件（它启动末尾把 provisioned 置 true 后存盘），
+    # 两边同时写一个文件，谁后写谁赢，而中间态可能是一半的 JSON——
+    # 下一次读就是「不是合法 JSON」，虚拟机直接不可用。
+    tmp = spec_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(spec, ensure_ascii=False, indent=2))
+    # 0600：里面有明文密码。先设权限再 replace，消掉「临时文件是 0644」
+    # 的那个窗口。
+    os.chmod(str(tmp), 0o600)
+    tmp.replace(spec_path)
+    for c in changed:
+        ok(f"已改 {c}")
+    ok("重启之后生效。")
+    return 0
+
+
 def cmd_autostart(args) -> int:
     vm = load_vm(args.name)
     d = vm_dir(vm["name"])
@@ -2576,10 +3228,23 @@ def cmd_autostart(args) -> int:
 
     if vm["kind"] == "windows":
         inner = (f'exec "{py}" "{WINARM}" start --foreground < /dev/null')
+    elif vm["kind"] == "macos":
+        # macOS 客人机的 wrapper 调 vmz。它前台跑（VZ 的 VM 跟进程同生共死），
+        # 所以 launchd 的 KeepAlive 正好合用：进程一退就再拉起来。
+        vmz = find_vmz()
+        if not vmz:
+            die("找不到 vmz，配不了 macOS 虚拟机的开机自启。")
+        inner = f'exec "{vmz}" start --name {vm["name"]} < /dev/null'
     else:
         inner = f'exec "{py}" "{script}" start --name {vm["name"]} --headless < /dev/null'
 
-    hb = find_tool("qemu-system-aarch64").rsplit("/bin/", 1)[0]
+    # QEMU 的路径只有另外三种需要。原来这行在 if/elif 链外面无条件执行，
+    # 而 find_tool 找不到就 die——只跑 macOS 虚拟机、没装 QEMU 的机器上，
+    # autostart 直接报「找不到 qemu-system-aarch64」，而这个 VM 压根不碰它。
+    if vm["kind"] == "macos":
+        hb = str(Path(vmz).parent.parent) if vmz else "/usr"
+    else:
+        hb = find_tool("qemu-system-aarch64").rsplit("/bin/", 1)[0]
     wrapper.write_text(f"""#!/bin/sh
 # 由 vmkit 生成。launchd 不继承交互 shell 的 PATH，而 QEMU 在 {hb}/bin。
 export PATH="{hb}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -2587,6 +3252,7 @@ export HOMEBREW_PREFIX="{hb}"
 export VM_DIR="{d}"
 # 开机自启走无窗口模式，否则每次登录 Mac 都弹一个虚拟机窗口。要看窗口就
 # 用 vmkit start（不带 --headless）或 open。
+# macOS 客人机没有窗口模式（VZ 的画面只能在 app 进程里显示），这个变量对它无效。
 export HEADLESS="1"
 {inner}
 """)
@@ -2710,6 +3376,12 @@ def main() -> int:
                             help="VNC 端口，实际端口，不是显示编号")
             sp.add_argument("--rdp-port", type=int, help="远程桌面端口")
             sp.add_argument("--web-port", type=int, help="Web 界面端口")
+            # 分辨率只有 macOS 客人机有：VZ 的显示尺寸在建 VM 时定死，
+            # 跑起来改不了（见 MacVMSpec.width 的注释）。
+            sp.add_argument("--width", type=int,
+                            help="显示宽度（macOS 虚拟机）")
+            sp.add_argument("--height", type=int,
+                            help="显示高度（macOS 虚拟机）")
 
     # 这三个命令的第一个参数是动作，用 choices 限死，省得各自判一遍
     p = sub.add_parser("disk", help="管理附加数据盘")

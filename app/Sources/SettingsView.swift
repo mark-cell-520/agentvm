@@ -452,17 +452,28 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("显示与启动").font(.headline)
 
-            Picker("显示模式", selection: $s.headless) {
-                Text("原生 macOS 窗口").tag(false)
-                Text("app 内嵌控制台（无窗口）").tag(true)
+            if vm.isMacOS {
+                // macOS 客人机没有「显示模式」这个开关：它的画面就是 app 里那个
+                // VZVirtualMachineView，不存在第二种方式。原来这组单选钮照样显示，
+                // 用户切到「原生窗口」点保存，后端拿到 --window 而 configure_macos
+                // 不认这个参数——界面说「已保存」，实际什么都没发生。
+                Text("macOS 虚拟机只有一种显示方式：app 里那个窗口。"
+                     + "它没有 VNC，也没有原生窗口模式可切。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Picker("显示模式", selection: $s.headless) {
+                    Text("原生 macOS 窗口").tag(false)
+                    Text("app 内嵌控制台（无窗口）").tag(true)
+                }
+                .pickerStyle(.radioGroup)
+                Text(s.headless
+                     ? "画面只从 VNC 出，在 app 的「控制台」里操作。安装期间必须用这种——"
+                       + "这个版本的 QEMU 没有 -no-quit，点窗口红按钮会把整个虚拟机干掉。"
+                     : "会多一个原生窗口。鼠标点进去会被虚拟机捕获，按 Control+Option+G 释放。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .pickerStyle(.radioGroup)
-            Text(s.headless
-                 ? "画面只从 VNC 出，在 app 的「控制台」里操作。安装期间必须用这种——"
-                   + "这个版本的 QEMU 没有 -no-quit，点窗口红按钮会把整个虚拟机干掉。"
-                 : "会多一个原生窗口。鼠标点进去会被虚拟机捕获，按 Control+Option+G 释放。")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
 
             if vm.isLocalWithISO {
                 Toggle("启动时挂上安装光盘", isOn: $s.attachISO)
@@ -481,6 +492,17 @@ struct SettingsView: View {
 
     private var ports: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if vm.isMacOS {
+                // macOS 客人机一个端口都没有：VZ 的 NAT 附件不对外监听，
+                // VNC 不存在，SSH 在 NAT 内部。摆三个端口框在这儿只会让用户
+                // 填一堆永远不生效的数字。
+                Text("端口").font(.headline)
+                Text("macOS 虚拟机没有可改的端口。它的网络是 VZ 的 NAT"
+                     + "（内部 192.168.64.x），宿主机上不转发任何端口，"
+                     + "也没有 VNC——画面直接显示在 app 的窗口里。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
             Text("端口").font(.headline)
             Text("全都只绑在 127.0.0.1 上，外面连不进来。改完要重启才生效，"
                  + "而且不能和别的虚拟机或宿主机上的程序撞。")
@@ -494,6 +516,7 @@ struct SettingsView: View {
             }
             if vm.webPort != nil {
                 portRow("Web 界面", $s.webPort, range: 1024...65535)
+            }
             }
         }
     }

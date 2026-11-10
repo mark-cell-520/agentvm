@@ -3,7 +3,10 @@ import Foundation
 /// 一个可安装的系统。字段与 scripts/catalog.json 一一对应。
 struct Distro: Identifiable, Codable, Hashable {
     let id: String
-    let kind: String          // "windows" | "linux" | "local"
+    // "windows" | "linux" | "macos" | "local"
+    // macos 是 Apple Silicon 上用 Virtualization.framework 跑的 macOS 客人机，
+    // 安装源是 Apple 的恢复镜像（IPSW），跟另外三种完全不同，见 MacVMEngine。
+    let kind: String
     let name: String
     let subtitle: String
     let url: String
@@ -162,6 +165,12 @@ struct VMInfo: Identifiable, Codable, Hashable {
     let disks: [VMDisk]
     /// 共享目录（virtio-9p）。
     let shares: [VMShare]
+    /// macOS 客人机的 build 号，如 26B131。只有 kind=macos 有。
+    let macBuild: String?
+    /// macOS 客人机的显示分辨率，如 "1440x900"。
+    let macResolution: String?
+    /// macOS 客人机装完了没有。
+    let macInstalled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case name, distro, kind, running, pid, ready, cpus, ram, disk, user
@@ -177,11 +186,17 @@ struct VMInfo: Identifiable, Codable, Hashable {
         case attachISO = "attach_iso"
         case disks = "disks"
         case shares = "shares"
+        case macBuild = "mac_build"
+        case macResolution = "mac_resolution"
+        case macInstalled = "mac_installed"
     }
 
     var id: String { name }
     var isWindows: Bool { kind == "windows" }
     var isLocal: Bool { kind == "local" }
+    /// macOS 客人机。它的画面不走 VNC，走 app 里的 VZVirtualMachineView，
+    /// 所以「控制台」按钮对它做的事情完全不同，见 AppState.openConsole。
+    var isMacOS: Bool { kind == "macos" }
 
     /// 本地包装的、并且安装包还在的虚拟机。只有这种能挂/不挂安装光盘——
     /// catalog 里那些系统没有本地 ISO 可挂。
@@ -191,6 +206,7 @@ struct VMInfo: Identifiable, Codable, Hashable {
     }
 
     var stateText: String {
+        if isMacOS && !(macInstalled ?? false) { return "未装完" }
         if running && (sshOk ?? false) { return "运行中" }
         if running { return "已启动" }
         return "已关机"

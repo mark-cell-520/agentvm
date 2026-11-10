@@ -1,12 +1,26 @@
 {
-  "version": 1,
-  "updated": "2026-11-09",
+  "version": 2,
+  "updated": "2026-11-10",
   "virtio": {
     "url": "https://github.com/qemus/virtiso-arm/releases/download/v0.1.285-1/virtio-win-0.1.285.tar.xz",
     "sha256": "c6712f8d5730c09c1212be9fc3baa18b78534f3c8c136cf02b2cca46515ca310",
     "note": "Windows 安装时必须的 virtio 驱动包，来自 GitHub release asset。解开后根下直接是 ARM64/、Balloon/ 等，没有额外一层。"
   },
   "distros": [
+    {
+      "id": "macos-27",
+      "kind": "macos",
+      "name": "macOS 27.2",
+      "subtitle": "Tahoe 之后的一代 · Apple Silicon 原生",
+      "url": "",
+      "size": 25595954706,
+      "default_cpus": 4,
+      "default_ram": "8G",
+      "default_disk": "80G",
+      "default_user": "agent",
+      "install_minutes": [30, 60],
+      "note": "从 Apple 官方恢复镜像（IPSW）安装，全自动。第一次启动自动建账号并打开远程登录（SSH）。装在 app 里，窗口是 VZ 原生画面。"
+    },
     {
       "id": "win11-24h2-eval",
       "kind": "windows",

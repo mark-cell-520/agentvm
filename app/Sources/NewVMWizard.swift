@@ -108,7 +108,11 @@ struct NewVMWizard: View {
         guard !name.isEmpty else { return false }
         // 名字会当目录名和主机名用，只放字母数字和 - _
         let allowed = name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-        return allowed && !state.backend.busy && !d.id.isEmpty
+        // 密码下限。VZMacGuestProvisioningOptions 会校验，太短的话第一次启动
+        // 静默不建账号——界面看不出问题，用户登不进去也不知道为什么。
+        // 在这儿就挡住，比装完 40 分钟才发现强。
+        let pwOK = state.vmPassword.count >= 4
+        return allowed && pwOK && !state.backend.busy && !d.id.isEmpty
     }
 }
 
@@ -122,7 +126,8 @@ private struct DistroPicker: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("Windows 是完整安装，要跑一遍安装程序；Linux 用的是装好的云镜像，下载完就能登。")
+                Text("Windows 是完整安装，要跑一遍安装程序；Linux 用的是装好的云镜像，下载完就能登；"
+                     + "macOS 从 Apple 官方恢复镜像装，全程自动但要下一大会儿。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
@@ -233,9 +238,10 @@ private struct DistroCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Image(systemName: d.isWindows ? "desktopcomputer" : "terminal")
+                Image(systemName: d.isWindows || d.kind == "macos" ? "desktopcomputer" : "terminal")
                     .font(.title2)
-                    .foregroundStyle(d.isWindows ? .blue : .orange)
+                    .foregroundStyle(d.isWindows ? .blue
+                                   : (d.kind == "macos" ? .purple : .orange))
                 Spacer()
                 if picked {
                     Image(systemName: "checkmark.circle.fill")
@@ -320,7 +326,25 @@ private struct InstallProgress: View {
     /// 也拿不到，这时先显示一句在等什么，别画一个永远连不上的控制台。
     @ViewBuilder
     private var screenRow: some View {
-        if let name = state.watchingInstall, let port = vncPort(for: name) {
+        // macOS 客人机没有 VNC：VZMacOSInstaller 是恢复镜像安装，全程自动，
+        // 没有要人在画面上点的步骤（这正是它和 Windows Setup 的区别）。
+        // 摆一个 VNC 客户端在这儿只会永远转圈。
+        if state.watchingInstall != nil,
+           let vm = state.vms.first(where: { $0.name == state.watchingInstall }),
+           vm.isMacOS {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("macOS 安装是全自动的，不需要人在画面上点", systemImage: "checkmark.shield")
+                    .font(.callout)
+                Text("正在从 Apple 服务器下载恢复镜像并写入磁盘。这一步要 40 到 60 分钟，"
+                     + "进度看上面的进度条和下面的日志。可以关掉这个窗口，安装不受影响。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        } else if let name = state.watchingInstall, let port = vncPort(for: name) {
             ConsoleView(name: name, port: port)
                 // 端口从无到有只会变一次，但每次变都必须重建客户端：
                 // 旧的那个连的是不存在的端口。
@@ -340,6 +364,8 @@ private struct InstallProgress: View {
 
     private func vncPort(for name: String) -> Int? {
         guard let vm = state.vms.first(where: { $0.name == name }) else { return nil }
+        // macOS 客人机的 vnc_port 是 0（没有 VNC），给 nil 让调用方走
+        // 「等它起来」那条路，而不是拿 0 去连一个不存在的端口。
         return vm.vncPort > 0 ? vm.vncPort : nil
     }
 }

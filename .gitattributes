@@ -2,6 +2,12 @@
 # Windows 上经 Git Bash 运行 CRLF 的脚本会报 "bad interpreter"，
 # 且报错完全不提换行，所以在这里强制，不靠用户记得配。
 *.sh text eol=lf
+# 这两个没有 .sh 扩展名，上面的通配符覆盖不到。而 Windows 上
+# core.autocrlf=true 默认也会把无扩展名文件转成 CRLF，跑起来就是
+# "bad interpreter: No such file or directory"——报错完全不提换行，
+# 正是这个文件开头要防的那个症状。
+/scripts/agentvm-fetch text eol=lf
+/scripts/agentvm-serve text eol=lf
 
 # Python 与配置统一 LF，避免 Windows 上出现 CRLF 引发的解析差异
 *.py text eol=lf

@@ -100,8 +100,15 @@ if [ -d /opt/homebrew ] || [ -w /opt ]; then
     # 只拉 Homebrew 本体，不跑官方安装脚本——那个脚本要 sudo 且会改 shell 配置。
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
+    # 先下到文件再解，不能 `curl | tar`。脚本是 /bin/sh 且没有 pipefail，
+    # 管道退出码是 tar 的：curl 下不动时 tar 解个空目录、返回 0，脚本继续
+    # cp、brew tap、brew install，最后报「装 Homebrew 成功但 QEMU 装失败」——
+    # 而 Homebrew 一个字节都没下来。开头承诺的「明确告诉用户卡在哪一条」
+    # 在这条路上是假的。
     curl -fsSL https://github.com/Homebrew/brew/tarball/master \
-        | tar -xz -C "$tmp" --strip-components=1
+        -o "$tmp/brew.tgz" || die "下载 Homebrew 失败（网络问题）"
+    tar -xzf "$tmp/brew.tgz" -C "$tmp" --strip-components=1 \
+        || die "解包 Homebrew 失败"
     mkdir -p /opt/homebrew
     # 不覆盖已有内容：原来 `cp -R "$tmp"/. /opt/homebrew/`，重跑会把原来的
     # Homebrew 配置和已装的 formula 链接搅乱。
@@ -139,8 +146,9 @@ cat >&2 <<'MSG'
   办法二（不要 sudo）
     把 Homebrew 装到 ~/hb。注意前缀必须不超过 13 个字符，否则 bottle
     无法重定位、会被迫源码编译：
-      mkdir -p ~/hb && curl -L https://github.com/Homebrew/brew/tarball/master \
-        | tar -xz -C ~/hb --strip-components=1
+      mkdir -p ~/hb
+      curl -L https://github.com/Homebrew/brew/tarball/master -o /tmp/brew.tgz
+      tar -xzf /tmp/brew.tgz -C ~/hb --strip-components=1
     然后重跑本脚本（它会找到 ~/hb/bin/brew）。
 
     这条路的坑和完整可复用做法见 docs/WINDOWS-ARM-ON-MACOS.md 的

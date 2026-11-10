@@ -24,6 +24,11 @@ final class AppState: ObservableObject {
     @Published var settingsVM: VMInfo?
     /// 正在管理存储的虚拟机（附加盘、快照、共享目录）。
     @Published var storageVM: VMInfo?
+    /// 正在看的 macOS 虚拟机。它的画面是 VZVirtualMachineView 而不是 VNC，
+    /// 所以走一个独立的 sheet——见 MacVMWindow。
+    @Published var macVM: VMInfo?
+    /// macOS 虚拟机最近一次启动失败的原因。空字符串表示没失败。
+    @Published var macVMLastError = ""
     /// 快照列表。storageVM 打开时由后端拉。
     @Published var snapshots: [VMSnapshot] = []
 
@@ -326,7 +331,100 @@ final class AppState: ObservableObject {
 
     // ------------------------------------------------------------ 操作 --
 
+    // ------------------------------------------- macOS 客人机（Virtualization.framework） --
+
+    /// 每个 macOS 虚拟机一个运行态。
+    ///
+    /// 为什么不用单个：用户可以同时开多个虚拟机，而 VZVirtualMachine 是
+    /// 一一对应一台机器的，混用一个会把画面接到错误的机器上。
+    private var macRuntimes: [String: MacVMRuntime] = [:]
+
+    func macRuntime(for vm: VMInfo) -> MacVMRuntime? {
+        macRuntimes[vm.name]
+    }
+
+    /// 启动一个 macOS 虚拟机，并打开它的窗口。
+    ///
+    /// 和另外两种的区别：另外两种是 `vmkit start` 起完就返回（QEMU 自己跑），
+    /// 这一种必须由 app 进程持有 VZVirtualMachine——画面要显示在 app 里，
+    /// 而 VZVirtualMachineView 不能跨进程。所以 start 之后 app 就是这个
+    /// 虚拟机的宿主，app 退出它就停。
+    func startMacVM(_ vm: VMInfo) {
+        macVMLastError = ""
+        guard vm.macInstalled ?? false else {
+            macVMLastError = "这个虚拟机还没装完。先在列表里选中它，点「开始安装」。"
+            return
+        }
+        if macRuntimes[vm.name]?.vm != nil {
+            macVM = vm
+            return
+        }
+        guard let spec = MacVMSpec.load(name: vm.name) else {
+            macVMLastError = "读不到 macOS 虚拟机的配置（~/.agentvm/vms/"
+                + vm.name + "/macvm.json）。"
+            return
+        }
+        let rt = MacVMRuntime()
+        macRuntimes[vm.name] = rt
+        // 客人机自己关机时把窗口也关掉：画面已经没了，留一个空窗口只会让人
+        // 以为它还在跑。
+        rt.onGuestStop = { [weak self] in
+            DispatchQueue.main.async {
+                self?.macRuntimes.removeValue(forKey: vm.name)
+                if self?.macVM?.name == vm.name { self?.macVM = nil }
+                self?.revision += 1
+            }
+        }
+        rt.onFailed = { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.macVMLastError = msg
+                self?.macRuntimes.removeValue(forKey: vm.name)
+                self?.revision += 1
+            }
+        }
+        do {
+            try rt.start(spec: spec, provision: !spec.provisioned)
+            // 同 vmz 侧：只有 didProvision 才写 provisioned。否则 macOS 26
+            // 及以下的机器会被标成「已建过账号」，以后再也不会建。
+            if rt.didProvision, !spec.provisioned {
+                var s = spec
+                s.provisioned = true
+                try? MacVMSpec.save(s)
+            }
+            macVM = vm
+            revision += 1
+        } catch {
+            macRuntimes.removeValue(forKey: vm.name)
+            macVMLastError = error.localizedDescription
+            revision += 1
+        }
+    }
+
+    /// 停掉一个 macOS 虚拟机。走 VZ 的优雅停机，不是杀进程。
+    func stopMacVM(_ vm: VMInfo) {
+        guard let rt = macRuntimes[vm.name] else { return }
+        rt.stop()
+        macRuntimes.removeValue(forKey: vm.name)
+        macVM = nil
+        revision += 1
+        refreshStatus()
+    }
+
     func action(_ cmd: String, name: String) {
+        // macOS 客人机不走 vmkit 的运行时命令：它的进程在 app 里（VZ 的 VM
+        // 跟进程绑定），vmkit start 那种「起了就返回」的语义在这儿不成立。
+        if let vm = vms.first(where: { $0.name == name }), vm.isMacOS {
+            switch cmd {
+            case "start":
+                startMacVM(vm)
+                return
+            case "stop":
+                stopMacVM(vm)
+                return
+            default:
+                break
+            }
+        }
         backend.run([cmd, "--name", name], onEvent: handleCommandEvent) { [weak self] in
             self?.refreshStatus()
         }

@@ -114,10 +114,18 @@ def main() -> int:
             print("warn  no model: section in config.yaml; skipping")
         else:
             block = m.group(0)
+            # 替换串必须是函数，不能是拼出来的模板。上面 set_env 的注释
+            # 刚说过这件事：re.sub 的替换串里 `\1`、`g<0>`、`\\` 都是模板
+            # 语法，model / base_url 里出现它们时值会被静默改写，含无法识别
+            # 的转义还会抛 re.error。用 lambda 让匹配结果原样进入字符串。
             if model:
-                block = re.sub(r'(?m)^(\s*default:\s*)"[^"]*"', r'\1"%s"' % model, block, count=1)
+                block = re.sub(r'(?m)^(\s*default:\s*)"[^"]*"',
+                               lambda m, v=model: m.group(1) + '"' + v + '"',
+                               block, count=1)
             if base_url:
-                block = re.sub(r'(?m)^(\s*base_url:\s*)"[^"]*"', r'\1"%s"' % base_url, block, count=1)
+                block = re.sub(r'(?m)^(\s*base_url:\s*)"[^"]*"',
+                               lambda m, v=base_url: m.group(1) + '"' + v + '"',
+                               block, count=1)
             text = text[: m.start()] + block + text[m.end():]
             print("ok  patched model section")
 

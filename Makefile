@@ -56,12 +56,16 @@ configure: ## Push LLM/Feishu config into the guest (secrets via files)
 	  echo "错误：请设置 LLM_BASE_URL=https://..."; exit 1; }
 	@test -n "$(LLM_MODEL)" || { \
 	  echo "错误：请设置 LLM_MODEL=..."; exit 1; }
-	@scripts/50-configure.sh --vm $(VM_NAME) \
-		--llm-key-file $(LLM_KEY_FILE) \
-		--llm-base-url $(LLM_BASE_URL) \
-		--llm-model $(LLM_MODEL) \
-		--feishu-app-id $(FEISHU_APP_ID) \
-		--feishu-app-secret-file $(FEISHU_APP_SECRET_FILE)
+	@test -n "$(FEISHU_APP_ID)" || { \
+	  echo "错误：请设置 FEISHU_APP_ID=cli_..."; exit 1; }
+	@test -n "$(FEISHU_APP_SECRET_FILE)" || { \
+	  echo "错误：请设置 FEISHU_APP_SECRET_FILE=/path/to/secret"; exit 1; }
+	@scripts/50-configure.sh --vm "$(VM_NAME)" \
+		--llm-key-file "$(LLM_KEY_FILE)" \
+		--llm-base-url "$(LLM_BASE_URL)" \
+		--llm-model "$(LLM_MODEL)" \
+		--feishu-app-id "$(FEISHU_APP_ID)" \
+		--feishu-app-secret-file "$(FEISHU_APP_SECRET_FILE)"
 
 autostart: ## launchd (host) + systemd (guest) so a reboot brings it all back
 	@scripts/60-autostart.sh
@@ -91,6 +95,12 @@ lint: ## Syntax-check every script
 	@for f in agentvm.py backends/*.py scripts/*.py scripts/lib/*.py; do \
 		python3 -I -c "import ast,sys;ast.parse(open(sys.argv[1],encoding='utf-8').read(),sys.argv[1])" "$$f" \
 			&& echo "  ok $$f" || exit 1; done
+	@if command -v swiftc >/dev/null 2>&1; then \
+		swiftc -parse -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
+			-target arm64-apple-macos14.0 \
+			app/Sources/MacVMEngine.swift scripts/vmz/main.swift \
+			&& echo "  ok swift (MacVMEngine + vmz)"; \
+	 else echo "  ok swift (没有 swiftc，跳过)"; fi
 	@if ls config/launchd/*.plist >/dev/null 2>&1; then \
 		for p in config/launchd/*.plist; do plutil -lint "$$p" || exit 1; done; \
 	 else echo "  ok plutil (config/launchd/ 下没有 plist，跳过)"; fi

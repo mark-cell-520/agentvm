@@ -340,12 +340,15 @@ def cmd_configure(args, cfg, backend) -> int:
         ok("飞书密钥已传输并校验长度")
 
     info("在客人机内应用配置")
+    # 每一行都要 export。原来写成 `AGENTVM_X=value` 而不带 export：
+    # 那是 sh 的 shell 变量，不是环境变量，子进程（patch 脚本里的 python3）
+    # 的 os.environ 根本读不到——配置看着应用了，实际一个值都没进去。
     env_lines = [
-        f"AGENTVM_LLM_BASE_URL={args.llm_base_url or ''}",
-        f"AGENTVM_LLM_MODEL={args.llm_model or ''}",
-        f"AGENTVM_FEISHU_APP_ID={args.feishu_app_id or ''}",
-        f"AGENTVM_FEISHU_DOMAIN={args.feishu_domain}",
-        f"AGENTVM_YOLO={'1' if args.yolo else '0'}",
+        f"export AGENTVM_LLM_BASE_URL={_sh_quote(args.llm_base_url or '')}",
+        f"export AGENTVM_LLM_MODEL={_sh_quote(args.llm_model or '')}",
+        f"export AGENTVM_FEISHU_APP_ID={_sh_quote(args.feishu_app_id or '')}",
+        f"export AGENTVM_FEISHU_DOMAIN={_sh_quote(args.feishu_domain)}",
+        f"export AGENTVM_YOLO={'1' if args.yolo else '0'}",
     ]
     script = Path(patch).read_text(encoding="utf-8")
     combined = "\n".join(env_lines) + "\n" + script
@@ -359,6 +362,16 @@ def cmd_configure(args, cfg, backend) -> int:
     print(f"  2. 重启客人机服务：agentvm.py exec-vm --name {name} -- sudo systemctl restart hermes-gateway")
     print(f"  3. 看日志：agentvm.py logs --name {name}")
     return 0
+
+
+def _sh_quote(v: str) -> str:
+    """把一个任意字符串变成安全的 sh 单引号字面量。
+
+    这些值来自命令行参数或配置文件，会被拼进一段喂给 sh -s 的脚本。
+    一个单引号就能闭合字符串接任意命令——和 hyperv 那边 PowerShell
+    单引号插值是同一类面，所以在拼之前就挡掉。
+    """
+    return "'" + str(v).replace("'", "'\\''") + "'"
 
 
 def _stdin_run(backend, name: str, script: str) -> str:
@@ -399,6 +412,14 @@ def cmd_autostart(args, cfg, backend) -> int:
     name = args.name or cfg["vm_name"]
 
     if backend.name == "hyperv":
+        # 名字必须过白名单再拼 PowerShell。hyperv.py 里专门写了
+        # check_vm_name，因为每一条 PowerShell 语句都是单引号插值——
+        # 一个单引号就能闭合字符串接任意代码。而这条路（autostart）
+        # 原来没走那道校验，名字可以来自 .agentvmrc 的 vm_name 或环境变量，
+        # 用户自己写的配置就能以当前用户权限执行任意命令。
+        # check_vm_name 是 hyperv 模块上的函数，不是 backend 的方法。
+        from backends.hyperv import check_vm_name as _cvm
+        _cvm(name)
         # Hyper-V 的 VM 由宿主的工作进程托管，不需要保活进程，
         # 任务计划程序只负责开机把 VM 拉起来。
         info(f"创建开机任务 agentvm-{name}")

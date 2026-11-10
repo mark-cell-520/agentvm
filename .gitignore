@@ -23,6 +23,10 @@ venv/
 # 的问题，而重新编一次只要十几秒。
 AgentVM.app/
 
+# vmz 是 macOS 客人机的后端（Swift 编的），同样现编现用。它比 app 还小，
+# 但在 git 里同样看不出改了什么，而编一次只要几秒。
+scripts/vmz/vmz
+
 # editors
 *.swp
 *~

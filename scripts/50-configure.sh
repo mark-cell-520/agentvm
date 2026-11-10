@@ -26,7 +26,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ENV_TEMPLATE 原来在这儿赋值之后再没被引用过——死代码。真正在用的是
 # scripts/lib/patch-agent-config.py。
-CONFIG_PATCH="$HERE/../lib/patch-agent-config.py"
+# 路径是 $HERE/lib/，不是 $HERE/../lib/。$HERE 已经是 scripts/，
+# 写成 ../lib 会解析到仓库根的 lib/——那儿什么都没有。而下面
+# `$(cat "$CONFIG_PATCH")` 在未加引号的 heredoc 里，cat 失败只往 stderr
+# 打一句，命令替换失败不会让 set -e 触发：脚本继续跑完、退出 0，
+# 客人机只收到几行 export 和一个空的补丁段，宿主机打印
+# 「ok configuration applied」。密钥已经推进 guest 而 patch 从未执行。
+CONFIG_PATCH="$HERE/lib/patch-agent-config.py"
+[ -f "$CONFIG_PATCH" ] || die "找不到补丁脚本：$CONFIG_PATCH"
 
 # usage 由 lib/common.sh 提供（打到第一个非注释行为止），这里不重复定义。
 

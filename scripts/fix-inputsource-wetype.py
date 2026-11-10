@@ -75,6 +75,7 @@ def main() -> int:
     h["AppleCurrentKeyboardLayoutInputSourceID"] = "com.apple.keylayout.ABC"
     # 不关 TextInputGlobalPropertyPerContextInput。WeType 清干净后它没有
     # 东西可切，关掉反而改变用户既有习惯。
+    backup(HITOOLBOX)
     save(HITOOLBOX, h)
     print(f"HIToolbox 已收敛到 ABC：{HITOOLBOX}")
 
@@ -85,9 +86,16 @@ def main() -> int:
     # 只能靠 cfprefsd 在下次扫描 /Library/Input Methods 时自己重建，所以这里
     # 只报告不改。真正的清理是把 WeType.app 从 /Library/Input Methods 移走，
     # 那一步要 sudo，交给用户决定。
-    save(INPUTSOURCES, s)
-    print(f"inputsources 第三方输入源仍有 {len(before)} 条（文件受 macl 保护写不进，"
-          f"需 sudo 移走 WeType.app 才能彻底清）")
+    # 上一段注释刚说这个文件写不进，原来却无条件 save()——改完 HIToolbox
+    # 之后在这儿抛 PermissionError，后面的 pkill WeType 和 killall cfprefsd
+    # 全都不执行，而用户看到的是一个栈而不是一句说明。已在本机验证：
+    # com.apple.inputsources.plist 确实 Operation not permitted。
+    try:
+        save(INPUTSOURCES, s)
+        print(f"inputsources 第三方输入源仍有 {len(before)} 条")
+    except PermissionError:
+        print(f"inputsources 第三方输入源仍有 {len(before)} 条"
+              f"（文件受 macl 保护写不进，需 sudo 移走 WeType.app 才能彻底清）")
 
     r = subprocess.run(["pkill", "-f", "Input Methods/WeType"],
                        capture_output=True, text=True)

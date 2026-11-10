@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      macOS 客人机（Virtualization.framework）必需。
+
+      没有这一条，VZMacOSRestoreImage.fetchLatestSupported 返回
+      「restore image catalog failed to load」，VZMacOSInstaller 起不来，
+      而这两句错误都看不出是权限问题——实测踩过，一条 silent failure
+      浪费了半小时才定位到 entitlement 上。
+
+      只给 Virtualization.framework 用，不放大到 com.apple.security.cs.
+      那一类宽泛权利：这个 app 不碰网络服务器、不读用户其他数据。
+    -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

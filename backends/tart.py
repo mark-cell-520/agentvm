@@ -106,7 +106,26 @@ class TartBackend(Backend):
         self._tart("set", name, "--cpu", str(cpu), "--memory", str(memory_mb))
 
     def run_vm(self, name: str) -> None:
-        self._tart("run", name, "--no-graphics", check=False)
+        # tart run 是前台阻塞的，而且不能加 timeout：agentvm.py 的 start 会
+        # 在这一行等到天荒地老，后面的 wait_ready 和「已就绪」永远到不了，
+        # 用户只能 Ctrl-C。所以改成后台起，把 tart 的 pid 交给调用方。
+        # check=False 是刻意的：起不来由 wait_ready 那步去报告，这里抢跑
+        # 报错只会给出一个和实际状态脱节的退出码。
+        import subprocess
+        from pathlib import Path
+
+        proc = subprocess.Popen(
+            [self.tart, "run", name, "--no-graphics"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        pidfile = self.vms_dir / name / "tart.pid"
+        try:
+            pidfile.parent.mkdir(parents=True, exist_ok=True)
+            pidfile.write_text(str(proc.pid))
+        except OSError:
+            # 写不了 pid 文件不影响 VM 本身在跑，只是以后 stop 要多问一次
+            pass
 
     def stop_vm(self, name: str) -> None:
         self._tart("stop", name, check=False)

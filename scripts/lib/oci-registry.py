@@ -138,10 +138,15 @@ class RegistryHandler(BaseHTTPRequestHandler):
                 start = int(start_s)
                 end = int(end_s) if end_s else size - 1
             else:
-                start = size - int(end_s)
+                # 后缀 Range：`bytes=-N` 表示「最后 N 个字节」。N 大于文件
+                # 大小时 start 会变成负数，而下面 `start >= size` 拦不住它，
+                # fh.seek(负数) 直接抛 OSError——socketserver 打一串 traceback，
+                # 而这个请求本该得到一个干净的 416。max(0, ...) 之外还要判
+                # end < 0（N 为 0 或负数时整个区间是空的）。
+                start = max(0, size - int(end_s))
                 end = size - 1
             end = min(end, size - 1)
-            if start > end or start >= size:
+            if start > end or start >= size or end < 0:
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0")
