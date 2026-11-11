@@ -49,6 +49,10 @@ log "编译 vmz（macOS 虚拟机后端）"
 # 有人预建的符号链接劫持，或两遍并发互相覆盖，swiftc 输出（含源码绝对路径）就
 # 追加到攻击者指定的文件里。
 VMZ_LOG="$(mktemp "${TMPDIR:-/tmp}/agentvm-vmz-build.XXXXXX")"
+# 这两个 mktemp 原来在任何路径下都不删，包括全部成功的路径——swiftc 与
+# codesign 的日志（含源码绝对路径）长期堆在 TMPDIR 里，成功时留着纯属垃圾。
+# 现在：有 warn 指向它才留（用户要排查），一路顺到底就删。2026-11-11 审计补上。
+KEEP_LOGS=0
 if command -v swiftc >/dev/null 2>&1; then
     VMBIN="$HOME/.agentvm/bin"
     mkdir -p "$VMBIN"
@@ -80,10 +84,11 @@ if command -v swiftc >/dev/null 2>&1; then
             else
                 printf '%s\n' "$vmz_out" | sed 's/^/    /' >&2
                 warn "vmz 装好了但 check 跑不通，macOS 虚拟机可能用不了"
-                warn "详见 $VMZ_LOG"
+                KEEP_LOGS=1; warn "详见 $VMZ_LOG"
                 rm -f "$VMBIN/vmz"
             fi
         else
+            KEEP_LOGS=1
             warn "vmz 编出来了但签名失败，macOS 虚拟机可能用不了（详见 ${VMZ_LOG}）"
             # 不能用的东西不留。macOS 上签错的 Mach-O 常见表现是进程能起但被
             # SIGKILL（137），而它在 PATH 能找到的位置上，vmkit 会认为装好了、
@@ -94,7 +99,7 @@ if command -v swiftc >/dev/null 2>&1; then
         fi
     else
         warn "vmz 编译失败，macOS 虚拟机用不了。Windows 和 Linux 不受影响。"
-        warn "详见 $VMZ_LOG"
+        KEEP_LOGS=1; warn "详见 $VMZ_LOG"
         rm -f "$VMBIN/vmz"
     fi
 else
@@ -111,7 +116,13 @@ if [ -d "$APP_DST" ]; then
     # pkill 兜底；两者在 app 没运行时都会返回非零，用 || true 挡住 set -e。
     osascript -e 'quit app "AgentVM"' 2>/dev/null || true
     pkill -x AgentVM 2>/dev/null || true
-    sleep 1
+    # 原来是固定 sleep 1。app 退出慢于 1 秒时删掉的还是正在运行的 bundle：
+    # macOS 上一般不炸，但这是个没有判据的固定等待。改成轮询到真的消失，
+    # 带 5 秒上限——正常情况下几十毫秒就退完了，几乎不花时间。
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -x AgentVM >/dev/null 2>&1 || break
+        sleep 0.5
+    done
     rm -rf "$APP_DST"
 fi
 
@@ -169,6 +180,12 @@ app_backend_complete() {
     # lib/ 是目录：vmkit.py import 这里的 qga.py。少拷贝一个目录，从 app 里起的
     # Linux 虚拟机全都用不上 guest agent，症状是「关机不优雅」。
     [ -f "$b/lib/qga.py" ] || return 1
+    # vmz 是 macOS 客人机的后端，build.sh 会把它编进 Resources。少了它，
+    # 从 app 里建的 macOS 虚拟机直接起不来——而 find_vmz() 会按 mtime 回落到
+    # ~/.agentvm/bin/vmz 抵掉一部分，所以症状是「有时能用有时不能」，比
+    # 「明确缺一个文件」难查得多。清单必须和 build.sh 的拷贝动作逐项对齐，
+    # 漏掉这一项就是漏了一个整类客人机。2026-11-11 审计补上。
+    [ -x "$b/vmz" ] || return 1
     return 0
 }
 
@@ -204,6 +221,7 @@ xattr -dr com.apple.quarantine "$APP_DST" 2>/dev/null || true
 APP_SIGN_LOG="$(mktemp "${TMPDIR:-/tmp}/agentvm-app-sign.XXXXXX")"
 if ! codesign --force --deep --entitlements "$ROOT/app/Resources/entitlements.plist" \
         -s - "$APP_DST" 2>"$APP_SIGN_LOG"; then
+    KEEP_LOGS=1
     warn "签名失败，app 可能被 Gatekeeper 拦（详见 ${APP_SIGN_LOG}）"
 fi
 
@@ -221,6 +239,13 @@ if [ -f "$APP_DST/Contents/Resources/backend/vmz" ]; then
 fi
 
 [ -x "$APP_DST/Contents/MacOS/AgentVM" ] || die "装完了但二进制不在 $APP_DST"
+
+# 构建日志：有 warn 指向它才留着，一路顺到底就删（见 KEEP_LOGS 的说明）。
+if [ "$KEEP_LOGS" = "1" ]; then
+    printf '构建日志留在：\n  %s\n  %s\n' "$VMZ_LOG" "$APP_SIGN_LOG" >&2
+else
+    rm -f "$VMZ_LOG" "$APP_SIGN_LOG"
+fi
 
 # ------------------------------------------------------------ 4. 打开 --
 

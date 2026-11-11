@@ -1111,5 +1111,217 @@ class TestDriveEarlyExit(unittest.TestCase):
                 t.join(timeout=2)
 
 
+# ------------------------------------------- 2026-11-11 第三轮：稳定性与节奏 --
+
+class AlwaysChangingRFB(FakeRFB):
+    """每服务一帧就把一条横条挪个位置——模拟带闪烁光标/滚动日志的屏幕。
+
+    这种屏幕上 same_screen 恒为假（横条占 800x20 = 3.3% 的画面，超过 1% 的
+    FP_DIFF_FRAC 门槛），于是「等画面稳」那道门永远 continue，而后面的动作熔断器
+    排在它后面——一个动作都不做、一行日志都不打，一路转到 budget 用完。
+    """
+
+    def __init__(self):
+        super().__init__(frame=button_screen())
+        self.n = 0
+        self.requests = 0
+
+    def on_request(self, *a):
+        self.requests += 1
+        # 覆盖上半屏，且两种颜色来回跳。
+        # 两个坑都踩过：
+        #   · 原来只涂顶部一条 800x20 的横条（占 3.3%），而 fingerprint 是隔点
+        #     采样的，采样点压根没落在横条上，same_screen 照样判「没变」。
+        #   · 后来改成上半屏逐轮 +1，可 FP_TOL=40——单个采样点差 40 以上才算
+        #     「变了」，差 1 不算，于是又判成没变、驱动器照样动作。
+        # 现在占一半画面，且 R 通道在 20 和 190 之间跳（差 170 > FP_TOL）。
+        r = 20 if self.n % 2 == 0 else 190
+        # rect() 是纯函数、返回新帧——原来写 `fr = bytearray(self.frame)` 再
+        # `rect(fr, ...)` 把返回值丢掉，画面压根没改，于是 same_screen 一直判
+        # 「没变」、驱动器照旧动作，断言「一个键都没按」永远失败。
+        self.frame = rect(self.frame, 0, 0, W, H // 2, (r, 90, 90))
+        self.n += 1
+
+
+class TestUnstableScreen(unittest.TestCase):
+    """画面一直稳不下来时，驱动器原来会静默空转到 budget 用完。
+
+    后果：一个动作都不做、一行日志都不打，用户无法区分「安装器在转」和
+    「驱动器死了」，而 budget 是唯一的刹车。2026-11-11 审计补上熔断。
+    """
+
+    def vm(self, port):
+        return {"name": "t", "vnc_display": port - 5900,
+                "web_port": None, "ssh_port": None}
+
+    def test_a_perpetually_changing_screen_gives_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_warn = ai.UNSTABLE_WARN_ROUNDS
+            old_give = ai.UNSTABLE_GIVE_UP
+            ai.UNSTABLE_WARN_ROUNDS, ai.UNSTABLE_GIVE_UP = 5, 20
+            logs = []
+            try:
+                srv = AlwaysChangingRFB()
+                srv.start()
+                try:
+                    res = ai.drive(self.vm(srv.port), Path(d),
+                                   budget_minutes=5,
+                                   emit=lambda m, lvl="info": logs.append((lvl, m)))
+                finally:
+                    srv.stop = True
+            finally:
+                ai.UNSTABLE_WARN_ROUNDS, ai.UNSTABLE_GIVE_UP = old_warn, old_give
+
+            self.assertEqual(res, "manual",
+                             "画面一直稳不下来该退成 manual，不是空转到 timeout")
+            # 一个键都没按：按了就可能打到空气上
+            self.assertIsNone(srv.got.get("keys"))
+            # 而且不能一句日志都没有——那正是原来的症状
+            self.assertTrue(logs, "全程一行日志都没打，用户看不出它还在跑")
+            self.assertTrue(any("连续" in m and "轮" in m for _, m in logs),
+                            f"没有说明「画面连续多少轮在变」的心跳：{logs[-3:]}")
+
+    def test_a_stable_screen_is_not_tripped_by_the_new_limit(self):
+        """画面稳下来的正常路径不能被新熔断误伤。"""
+        with tempfile.TemporaryDirectory() as d:
+            disk = Path(d) / "data.img"
+            disk.write_bytes(b"\xff" * (2 << 20))
+            srv = FakeRFB(frame=button_screen())
+            srv.start()
+            try:
+                res = ai.drive(self.vm(srv.port), Path(d),
+                               budget_minutes=0.2, emit=None)
+            finally:
+                srv.stop = True
+            # 画面一直不变，走的是「试满三次交还用户」那条老路，不是新熔断
+            self.assertIn(res, ("timeout", "manual"))
+            keys = srv.got.get("keys", [])
+            self.assertGreaterEqual(len(keys), 1, "画面稳了就该动作")
+
+
+class StillRFB(FakeRFB):
+    """第一帧全屏发出去，之后的增量请求一律不回——画面没变时 QEMU 就是这样。
+
+    为什么必须有这一个：FakeRFB 默认每次请求都回一帧，客户端于是每轮都拿到一个
+    新的 bytes 对象，连「这是同一帧」都判不出来。原来 drive() 的三条动作分支各存
+    一次帧、存出来是三张，就是被这个假服务端掩盖的——用真 QEMU 的规矩（增量且
+    画面没变就不发）才测得出来。
+    """
+
+    def __init__(self, frame=None):
+        super().__init__(frame=frame)
+        self.requests = 0
+
+    def on_request(self, *a):
+        self.requests += 1
+
+    def _send_update(self, conn, x, y, rw, rh):
+        inc = self.got.get("request", (0, 0, 0, 0, 0))[0]
+        if inc:
+            return                      # 画面没变，一条更新都不回
+        super()._send_update(conn, x, y, rw, rh)
+
+
+class TestProbeRateLimit(unittest.TestCase):
+    """服务就绪探测原来是每轮一次，而慢档下它一次要 2.005 秒。"""
+
+    def vm(self, port):
+        return {"name": "t", "vnc_display": port - 5900,
+                "web_port": None, "ssh_port": None}
+
+    def test_the_probe_is_rate_limited_not_per_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "data.img").write_bytes(b"\xff" * (2 << 20))
+            times = []
+            orig = ai.service_ready
+            ai.service_ready = (lambda vm, timeout=3.0:
+                                (times.append(time.time()), False)[1])
+            try:
+                srv = StillRFB(frame=button_screen())
+                srv.start()
+                try:
+                    ai.drive(self.vm(srv.port), Path(d),
+                             budget_minutes=0.5, emit=None)
+                finally:
+                    srv.stop = True
+            finally:
+                ai.service_ready = orig
+
+            # 断言相邻两次探测之间真的隔了 PROBE_EVERY_SECONDS。
+            # 不用「取帧次数」当分母：StillRFB 画面不变，客户端每轮要等满
+            # INCR_TIMEOUT(5 秒) 才返回 None，一轮就是 5 秒——那时每 2 轮探一次，
+            # 比例 1:2，拿次数比根本区分不出「降频了」和「每轮都探」。
+            self.assertGreaterEqual(len(times), 2,
+                                    "一次以上探测都没有，测不到间隔")
+            for a, b in zip(times, times[1:]):
+                gap = b - a
+                self.assertGreaterEqual(
+                    gap, ai.PROBE_EVERY_SECONDS * 0.8,
+                    f"两次探测只隔了 {gap:.2f} 秒，看着还是每轮一次")
+
+
+class TestNextFrameNo(unittest.TestCase):
+    """新一轮的帧编号必须接在现有帧后面，否则剪枝会把刚写的删掉。"""
+
+    def test_empty_dir_starts_at_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ai._next_frame_no(Path(d)), 0)
+
+    def test_continues_after_the_highest_existing_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in (3, 17, 9):
+                Path(d, f"auto-{n}.png").write_bytes(b"x")
+            self.assertEqual(ai._next_frame_no(Path(d)), 18)
+
+    def test_old_ppm_frames_count_too(self):
+        """只认 .png 会让老目录里那批 .ppm 逃过编号，接着撞同一个坑。"""
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "auto-140.ppm").write_bytes(b"x")
+            Path(d, "auto-2.png").write_bytes(b"x")
+            self.assertEqual(ai._next_frame_no(Path(d)), 141)
+
+    def test_unparseable_names_are_ignored(self):
+        """读不出编号的那些不能把起点推到天上去（_frame_no 给它们 1<<30）。"""
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "auto-.png").write_bytes(b"x")
+            Path(d, "auto-x.png").write_bytes(b"x")
+            Path(d, "auto-4.png").write_bytes(b"x")
+            self.assertEqual(ai._next_frame_no(Path(d)), 5)
+
+
+class TestStashSavesEachFrameOnce(unittest.TestCase):
+    """同一屏原来会被连存三张（tried 0/1/else 三个分支各存一次）。"""
+
+    def vm(self, port):
+        return {"name": "t", "vnc_display": port - 5900,
+                "web_port": None, "ssh_port": None}
+
+    def test_one_screen_is_saved_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "data.img").write_bytes(b"\xff" * (2 << 20))
+            # 增量模式下画面没变，客户端每轮要等满 INCR_TIMEOUT(5 秒) 才返回 None。
+            # 不把它压短的话，budget 只够跑一两轮，压根走不到「试满三次」，
+            # 于是这条断言在修复被退回之后居然还是绿的（反向验证逮到的）。
+            old_to = ai.INCR_TIMEOUT
+            ai.INCR_TIMEOUT = 0.3
+            try:
+                srv = StillRFB(frame=button_screen())
+                srv.start()
+                try:
+                    res = ai.drive(self.vm(srv.port), Path(d),
+                                   budget_minutes=0.5, emit=None)
+                finally:
+                    srv.stop = True
+            finally:
+                ai.INCR_TIMEOUT = old_to
+
+            # 先确认真的试满了三次，否则这条断言没测到东西
+            self.assertEqual(res, "manual",
+                             "画面一直不变该试满三次交还用户")
+            pngs = sorted(Path(d).glob("auto-*.png"))
+            self.assertEqual(len(pngs), 1,
+                             f"同一屏存了 {len(pngs)} 张：{[p.name for p in pngs]}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

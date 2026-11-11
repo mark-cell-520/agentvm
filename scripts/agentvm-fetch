@@ -25,6 +25,9 @@ REPO="${IMAGE_REPO}"
 TAG="${IMAGE_TAG}"
 DEST="$AGENTVM_HOME/image"
 VERIFY=0
+# 下载并发数。这个值现在真的会传给 xargs -P（2026-11-11 之前它是个死参数：
+# 定义了、解析了、usage 里也宣传了，但下载循环严格串行）。
+# 4 是保守值：再高对限速网络没有额外收益，却更容易撞 registry 的 429。
 CONCURRENCY=4
 
 while [ $# -gt 0 ]; do
@@ -33,7 +36,17 @@ while [ $# -gt 0 ]; do
     --tag) [ $# -ge 2 ] || die "--tag 需要一个值"; TAG="$2"; shift 2 ;;
     --dest) [ $# -ge 2 ] || die "--dest 需要一个值"; DEST="$2"; shift 2 ;;
     --verify) VERIFY=1; shift ;;
-    --concurrency) [ $# -ge 2 ] || die "--concurrency 需要一个值"; CONCURRENCY="$2"; shift 2 ;;
+    --concurrency)
+      [ $# -ge 2 ] || die "--concurrency 需要一个值"
+      # 校验是正整数。原来是 `CONCURRENCY="$2"` 照单全收：给个 abc 或 0，
+      # 要等到下面 xargs -P 才报一句 "invalid number"，而且那时 manifest 已经
+      # 拉完、token 已经取完，用户以为是后面的步骤坏了。
+      case "$2" in
+        ''|*[!0-9]*) die "--concurrency 要一个正整数，得到：$2" ;;
+      esac
+      [ "$2" -ge 1 ] || die "--concurrency 至少是 1，得到：$2"
+      [ "$2" -le 64 ] || die "--concurrency 至多 64（再多 registry 会开始返回 429），得到：$2"
+      CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -161,13 +174,14 @@ file_size() {
 }
 
 fetch_one() {
-  local digest="$1" want="$2" out="$BLOBS/$1"
+  local digest="$1" want="$2"
   # digest 未校验就拼进路径：hexdigest() 只剥 sha256: 前缀，不校验 64 位十六进制，
   # 而 out="$BLOBS/$1" 直接拼接。--repo 支持任意第三方 registry，一个带 ../ 或
   # shell 特殊字符的 digest 会写到预期之外的路径。python 侧已校验，bash 侧再挡一道。
   case "$digest" in
-    *[!0-9a-f]*|"") die "非法 digest：$digest" ;;
+    *[!0-9a-f]*|"") printf 'illegal digest: %s\n' "$digest" >>"$FAIL_FILE"; return 1 ;;
   esac
+  local out="$BLOBS/$digest"
   local have=0
   [ -f "$out" ] && have="$(file_size "$out")"
 
@@ -191,73 +205,132 @@ fetch_one() {
     rm -f "$out"; have=0
   fi
 
-  local code
-  code="$(curl -sL -C - \
-      -H "Authorization: Bearer $TOKEN" \
-      --connect-timeout 20 --max-time 86400 \
-      --retry 5 --retry-delay 3 --retry-all-errors \
-      -o "$out" -w '%{http_code}' \
-      "https://$REG_HOST/v2/$REPO_PATH/blobs/sha256:$digest" || echo 000)"
+  # token 现读不用父进程的那个变量：并发下载时 worker 是独立进程，父 shell 里
+  # 刷新过的 TOKEN 传不进来。token 放文件里，每次用时现读（见上面的说明）。
+  local tok code attempt
+  for attempt in 1 2; do
+    tok="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+    # curl 失败时 -w 仍然写出了 000，所以不能再 `|| echo 000`——那会把码接成
+    # "000000"，用户看到一个根本不存在的 HTTP 码。原来正是这么写的，本机实测
+    # （连一个没人听的端口）捕获到 '000000'。现在只在 curl 一个字都没输出时兜底。
+    if ! code="$(curl -sL -C - \
+        -H "Authorization: Bearer $tok" \
+        --connect-timeout 20 --max-time 86400 \
+        --retry 5 --retry-delay 3 --retry-all-errors \
+        -o "$out" -w '%{http_code}' \
+        "https://$REG_HOST/v2/$REPO_PATH/blobs/sha256:$digest" 2>/dev/null)"; then
+      [ -n "$code" ] || code=000
+    fi
 
-  case "$code" in
-    200|206|416) ;;
-    401|403) return 2 ;;
-    # 404/403 之外，curl 的 33 是「服务器不接受 Range」——重跑还是一样，因为
-    # .part 里已经有内容、还是会带 -C -。原来笼统提示 rerun，用户会无限重跑
-    # 同一个必然失败的尝试。
-    33) warn "server refuses Range for $digest (curl 33)"
-        rm -f "$out"
-        die "删掉了 ${out}，重跑本脚本重新下（不带续传）" ;;
-    *) warn "download of $digest failed (HTTP $code); rerun to resume"; return 1 ;;
-  esac
+    case "$code" in
+      200|206|416) break ;;
+      401|403)
+        # 匿名 token 几十秒就过期，并发下多个 worker 会先后撞上。各自刷一个、
+        # 用 mv 原子替换 token 文件即可——mv 在同一文件系统上是原子的，读者不会
+        # 看到写了一半的内容。没有用 flock：macOS 没有这个命令，而项目本来就
+        # need_cmd python3，不为一把锁多引一个依赖。代价是最坏多刷几次 token
+        # （一次很快的 curl），换来无锁。
+        if [ "$attempt" -eq 1 ]; then
+          local fresh
+          fresh="$(get_token)"
+          if [ -n "$fresh" ]; then
+            printf '%s' "$fresh" >"$TOKEN_FILE.$$"
+            mv -f "$TOKEN_FILE.$$" "$TOKEN_FILE"
+          fi
+          continue
+        fi
+        printf 'auth still failing on %s after token refresh (HTTP %s)\n' \
+          "$digest" "$code" >>"$FAIL_FILE"
+        return 1 ;;
+      # 404/403 之外，curl 的 33 是「服务器不接受 Range」——重跑还是一样，因为
+      # .part 里已经有内容、还是会带 -C -。原来笼统提示 rerun，用户会无限重跑
+      # 同一个必然失败的尝试。
+      33) warn "server refuses Range for $digest (curl 33)"
+          rm -f "$out"
+          printf 'server refuses Range for %s (curl 33); removed %s\n' \
+            "$digest" "$out" >>"$FAIL_FILE"
+          return 1 ;;
+      *) printf 'download of %s failed (HTTP %s); rerun to resume\n' \
+           "$digest" "$code" >>"$FAIL_FILE"
+         return 1 ;;
+    esac
+  done
 
   have="$(file_size "$out")"
-  [ "$have" -eq "$want" ] || { warn "size mismatch for $digest: $have != $want"; return 1; }
+  [ "$have" -eq "$want" ] || { printf 'size mismatch for %s: %s != %s\n' \
+      "$digest" "$have" "$want" >>"$FAIL_FILE"; return 1; }
 
   if [ "$VERIFY" -eq 1 ]; then
     local got
     got="$(shasum -a 256 "$out" | cut -d' ' -f1)"
-    [ "$got" = "$digest" ] || { warn "hash mismatch for $digest"; return 1; }
+    [ "$got" = "$digest" ] || { printf 'hash mismatch for %s\n' "$digest" >>"$FAIL_FILE"; return 1; }
   fi
   return 0
 }
 
-done_count=0
-while read -r kind digest size; do
-  [ -n "${digest:-}" ] || continue
-  if fetch_one "$digest" "$size"; then
-    done_count=$((done_count + 1))
-  else
-    rc=$?
-    if [ "$rc" -eq 2 ]; then
-      info "token expired; refreshing"
-      TOKEN="$(get_token)"
-      fetch_one "$digest" "$size" || die "still failing on $digest after token refresh"
-      done_count=$((done_count + 1))
-    else
-      die "fetch failed on $digest — rerun this script to resume"
-    fi
-  fi
-done < "$DEST/blobs.txt"
+# --------------------------------------------------------------------- 下载 --
+#
+# CONCURRENCY 原来是死参数：28 行定义、36 行解析、usage 里也向用户宣传，但下载
+# 循环是 `while read ...; do fetch_one ...; done`，严格一个接一个。而这个项目
+# 存在的理由就是网络慢——Windows 11 的 4.3 GB、macOS 恢复镜像的 25.6 GB 在限速
+# 网络下，串行和 4 路的差距按小时计。隔壁 scripts/30-create-vm.sh:60 给
+# tart clone 传的是 --concurrency 16，tart 自己是实打实并行的。
+# 2026-11-11 审计补上。
+#
+# 并发的难点只在 token（见 fetch_one 里 401 分支的说明）：token 放文件里、每次
+# 用时现读，刷新用 mv 原子替换。没有用 flock 串行化刷新——macOS 没有 flock 这个
+# 命令，而项目本来就 need_cmd python3，不为一把锁多引一个依赖；代价是最坏多刷
+# 几次 token（一次很快的 curl），换来无锁。
+TOKEN_FILE="$DEST/.token"
+FAIL_FILE="$DEST/.fetch-failures"
+umask 077
+printf '%s' "$TOKEN" >"$TOKEN_FILE"
+: >"$FAIL_FILE"
+# worker 是 xargs 起的独立 bash，函数和它引用的变量都要显式送过去。
+export TOKEN_FILE FAIL_FILE BLOBS VERIFY REG_HOST REPO_PATH
+export C_RST C_RED C_GRN C_YEL C_BLU C_DIM
+export -f fetch_one file_size get_token token_endpoint warn info ok die
 
+info "downloading $UNIQ objects ($(bytes_human "$TOTAL_BYTES")) ${CONCURRENCY}-way parallel"
+
+# 每个 worker 拿一个 digest 加一个 size。失败由 worker 写进 FAIL_FILE：父进程
+# 看不到子 shell 的 stderr 全貌，而 xargs 只告诉你「有非零退出」，不告诉你哪个、
+# 为什么——原来的串行版是 `die "fetch failed on $digest"`，指名道姓。
+#
+# xargs 有 worker 失败时退出 123，而脚本是 set -euo pipefail——不接住的话脚本
+# 在这一行就退了，后面「哪个 digest、为什么」一个字都打不出来。`|| xargs_rc=$?`
+# 既挡住 set -e 又留下码（后面其实不用它，失败一律以 FAIL_FILE 为准）。
+xargs_rc=0
+awk 'NF>=3 && $2 != "" {print $2, $3}' "$DEST/blobs.txt" \
+  | xargs -P "$CONCURRENCY" -n 2 bash -c 'fetch_one "$1" "$2"' _ || xargs_rc=$?
+
+FAILS=0
+[ -s "$FAIL_FILE" ] && FAILS="$(grep -c . "$FAIL_FILE")"
+if [ "$FAILS" -gt 0 ]; then
+  warn "$FAILS 个对象没下成："
+  sed 's/^/    /' "$FAIL_FILE" >&2
+  die "重跑本脚本接着下（已下完的按大小跳过，不用从头再来）"
+fi
+done_count="$UNIQ"
+rm -f "$FAIL_FILE"
 ok "fetched $done_count/$UNIQ objects into $DEST"
 
 if [ "$VERIFY" -eq 1 ]; then
-  bad=0
-  while read -r _ digest _; do
-    [ -n "${digest:-}" ] || continue
-    # 先看文件在不在。原来直接 shasum，文件缺失时在 pipefail 下会让脚本提前退出，
-    # 打出来的不是预期的 MISMATCH 清单。
-    if [ ! -f "$BLOBS/$digest" ]; then
-      echo "  MISSING $digest"
-      bad=$((bad + 1))
-      continue
-    fi
-    got="$(shasum -a 256 "$BLOBS/$digest" | cut -d' ' -f1)"
-    [ "$got" = "$digest" ] || { echo "  MISMATCH $digest"; bad=$((bad + 1)); }
-  done < "$DEST/blobs.txt"
-  [ "$bad" -eq 0 ] && ok "all $(bytes_human "$TOTAL_BYTES") verified against their digests" \
-                    || die "$bad object(s) failed verification"
+  info "verifying $UNIQ objects against their digests (${CONCURRENCY}-way parallel)"
+  # 逐个 shasum 也并行。单线程 shasum 本机实测约 560 MB/s，CPU 从来不是瓶颈；
+  # 真正的代价是 24 GB 镜像在写入只有 14.5 MB/s 的外接盘上的第二遍全量读盘。
+  # 原来这里是 `while read ...; do shasum ...; done`，同样一个接一个。
+  if awk 'NF>=3 && $2 != "" {print $2}' "$DEST/blobs.txt" \
+      | xargs -P "$CONCURRENCY" -n 1 bash -c '
+          d="$1"; f="$BLOBS/$d"
+          if [ ! -f "$f" ]; then printf "  MISSING %s\n" "$d"; exit 1; fi
+          got="$(shasum -a 256 "$f" | cut -d" " -f1)"
+          if [ "$got" != "$d" ]; then printf "  MISMATCH %s\n" "$d"; exit 1; fi
+        ' _; then
+    ok "all $(bytes_human "$TOTAL_BYTES") verified against their digests"
+  else
+    die "上面列出的对象校验没过"
+  fi
 else
   info "skipping content verification (pass --verify to hash every blob)"
 fi

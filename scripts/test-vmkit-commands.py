@@ -761,5 +761,231 @@ class TestPruneCLI(Sandbox):
         self.assertTrue((d / "data9.img").exists(), "没加 --apply 就删了")
 
 
+class TestSshBannerProbe(Sandbox):
+    """vm_record 的 ssh_ok 原来每轮跑一次完整 SSH。
+
+    list（5346）和 status（3859）都走 vm_record，于是 app 每次拉列表、每次刷新
+    状态，都会对每一台运行中的 Linux 客人机做一次完整 SSH（ConnectTimeout 上限
+    4 秒）。客人机 sshd 忙时单次 status 可阻塞到 4 秒，多台叠加。
+    现在换成一个只读 banner 的轻量探测。
+    """
+
+    def _serve_banner(self, banner=b"SSH-2.0-OpenSSH_9.2\r\n"):
+        import socket
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+
+        def acceptor():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    c.sendall(banner)
+                    time.sleep(0.3)      # 握住，别立刻关
+                except OSError:
+                    pass
+        threading.Thread(target=acceptor, daemon=True).start()
+        self.addCleanup(srv.close)
+        return port
+
+    def test_a_real_banner_counts_as_ready(self):
+        port = self._serve_banner()
+        self.assertTrue(vm.linux_ssh_banner_ok(
+            {"ssh_port": port, "user": "u", "ssh_key": "/dev/null"}),
+            "真的 SSH banner 应该判成就绪")
+
+    def test_a_silent_peer_is_not_ready(self):
+        # QEMU 的 hostfwd 就是这个形状：连接被接住，但客人机没监听，于是一个
+        # 字节都不回。读 banner 必须能判出「没就绪」，否则又回到只探端口的坑。
+        import socket
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        held = []
+
+        def acceptor():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                    held.append(c)
+                except OSError:
+                    return
+        threading.Thread(target=acceptor, daemon=True).start()
+        self.addCleanup(srv.close)
+        self.assertFalse(vm.linux_ssh_banner_ok(
+            {"ssh_port": port, "user": "u", "ssh_key": "/dev/null"}, timeout=0.4))
+
+    def test_a_closed_port_is_not_ready(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        self.assertFalse(vm.linux_ssh_banner_ok(
+            {"ssh_port": port, "user": "u", "ssh_key": "/dev/null"}))
+
+    def test_it_does_not_shell_out_to_ssh(self):
+        """轻量探测的意义就在这儿：不真发一条 SSH 命令。
+
+        find_tool("ssh") 找不到 ssh 时 linux_ssh_ready 会抛 SystemExit，
+        而 banner 探测只用标准库 socket——所以把 find_tool 整个挡坏，
+        banner 探测照样该工作。
+        """
+        port = self._serve_banner()
+        orig = vm.find_tool
+        vm.find_tool = lambda name: (_ for _ in ()).throw(
+            AssertionError(f"不该去调 {name}"))
+        try:
+            self.assertTrue(vm.linux_ssh_banner_ok(
+                {"ssh_port": port, "user": "u", "ssh_key": "/dev/null"}))
+        finally:
+            vm.find_tool = orig
+
+
+    def test_vm_record_uses_the_light_probe(self):
+        """这条走产品路径：vm_record → ssh_ok。
+
+        上面几条直接调 linux_ssh_banner_ok，证明的是那个函数本身对；这条证明
+        vm_record 真的用它。原来 vm_record 里写的是 linux_ssh_ready(vm,
+        timeout=4)——一次完整 SSH，而 vm_record 被 list 和 status 共用，于是
+        app 每次拉列表、每次刷新状态都会对每台运行中的 Linux VM 做一次完整
+        SSH。反向验证第一轮就是在这儿绿的：只改 vm_record 不影响上面几条。
+        """
+        rec = self.write_vm("vr", kind="linux")
+        v = vm.load_vm(rec["name"])
+
+        # VM「在跑」：给一个 pid，并且别真去 ps（沙箱里没有这个进程）。
+        orig_pid, orig_tool = vm.qemu_pid, vm.find_tool
+        vm.qemu_pid = lambda x: 4242
+        # 真去调 ssh 就会炸——那正是我们要断言的「没有走完整 SSH」。
+        vm.find_tool = lambda name: (_ for _ in ()).throw(
+            AssertionError(f"轮询接口不该去调 {name}"))
+        try:
+            out = vm.vm_record(v)
+        finally:
+            vm.qemu_pid, vm.find_tool = orig_pid, orig_tool
+
+        self.assertIn("ssh_ok", out, "vm_record 没给 ssh_ok 这一项")
+        self.assertFalse(out["ssh_ok"],
+                         "没人监听那个端口，轻量探测该判未就绪")
+
+
+class TestStartLinuxReturnContract(Sandbox):
+    """start_linux 签名写着 -> bool，「已在运行」那条路却裸 return（给 None）。
+
+    唯一的消费方是 `if not start_linux(...): die("没装完")`——None 会被当成
+    失败。今天被上游挡着，但是个随调用方增加就引爆的契约违背。
+    """
+
+    def test_already_running_returns_true(self):
+        rec = self.write_vm("sl")
+        v = vm.load_vm(rec["name"])
+        orig = vm.qemu_pid
+        vm.qemu_pid = lambda x: 4242
+        try:
+            out = []
+            orig_ok = vm.ok
+            vm.ok = lambda m: out.append(m)
+            try:
+                r = vm.start_linux(v, wait_ssh=False)
+            finally:
+                vm.ok = orig_ok
+        finally:
+            vm.qemu_pid = orig
+        self.assertIs(r, True, f"应在运行时返回 True，实际返回 {r!r}")
+        self.assertTrue(any("已在运行" in m for m in out))
+
+
+class TestWinarmStopWaitsForDeath(Sandbox):
+    """winarm 的 cmd_stop 发完 -9 就返回，不等进程真的退干净。
+
+    kill 是异步的：信号出去到进程变成僵尸/被回收之间有一段窗口，这时候 ps 还
+    看得见它。紧接着任何「起虚拟机」都会走 qemu_running → 看到「VM 已在运行」
+    → 什么都不做就返回。用户改的 CPU/内存/显示模式一个都没生效，而日志说停过了。
+
+    vmkit.py 的 Windows 分支早就给这条路包了一层轮询兜底（3547 行起的注释写的
+    就是这件事），但那是外层：winarm 作为独立子命令、launchd 自启、以及
+    snapshot save --clean --restart 这条不经过 vmkit 的路都不被覆盖。
+    现在从 winarm 自己这边对齐。
+    """
+
+    def _cfg(self, **env):
+        base = dict(VM_DIR=str(self.tmp / "vm"), ISO_PATH="/tmp/x.iso",
+                    VIRTIO_PATH="/tmp/virtio")
+        base.update(env)
+        old = {k: os.environ.get(k) for k in base}
+        os.environ.update(base)
+        try:
+            return wa.Cfg()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_stop_returns_only_after_the_process_is_gone(self):
+        cfg = self._cfg()
+        cfg.vm_dir.mkdir(parents=True, exist_ok=True)
+
+        # 一个真的子进程当 QEMU。-9 之后它不会立刻消失，正好是要等的那一段。
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        cfg.pidfile.write_text(str(child.pid))
+
+        # qemu_running 的 comm 检查只认名字里带 qemu 的进程，而沙箱里不方便起
+        # 一个真叫那个名的东西（本机把 /bin/sleep 的副本起不来，SIGKILL）。
+        # 所以绕过名字检查、保留它真正的语义——「进程不在了就返回 None」。
+        polls = []
+        killed = {"on": False}
+        orig_running = wa.qemu_running
+        orig_run = wa.run
+
+        def fake_running(c):
+            # 只数 kill 发出去之后的那些。cmd_stop 一开头也会调一次 qemu_running
+            # 拿 pid——把那次算进来的话，「强杀后有没有等」就永远大于 0，
+            # 这个断言会恒真（反向验证第一次跑就逮到了这条是假的）。
+            if killed["on"]:
+                polls.append(1)
+            # 僵尸也要算「不在跑」。os.kill(pid, 0) 对僵尸一样成功——那正是
+            # winarm 的 qemu_running 要用 ps 查 state=Z 去排除的同一件事。
+            # poll() 会把僵尸回收掉，是这里的正确判据。
+            if child.poll() is not None:
+                return None
+            return child.pid
+
+        def fake_run(cmd, **kw):
+            if cmd and cmd[0] == "kill":
+                killed["on"] = True
+            return orig_run(cmd, **kw)
+
+        # 三条优雅关机的路全挡掉，直奔强杀。qga 对 Windows ARM64 默认不存在，
+        # ssh 在沙箱里必然不通——挡掉只是为了不白等那 8 秒。
+        orig_qga, orig_ssh = wa.qga_shutdown_wait, wa.ssh_ready
+        wa.qemu_running = fake_running
+        wa.run = fake_run
+        wa.qga_shutdown_wait = lambda c: False
+        wa.ssh_ready = lambda c, timeout=12: False
+        try:
+            wa.cmd_stop(cfg)
+        finally:
+            wa.qemu_running = orig_running
+            wa.run = orig_run
+            wa.qga_shutdown_wait, wa.ssh_ready = orig_qga, orig_ssh
+
+        # 主断言：函数返回时进程必须真的不在了（僵尸也算不在跑）。
+        self.assertIsNotNone(child.poll(),
+                             "cmd_stop 返回时 QEMU 进程还在跑")
+        # 附带断言：强杀之后确实轮询过，不是撞上的。
+        self.assertGreaterEqual(len(polls), 1,
+                                "强杀之后一次都没查进程在不在，等于没等")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

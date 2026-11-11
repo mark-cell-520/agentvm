@@ -7,7 +7,7 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 
 .DEFAULT_GOAL := help
 .PHONY: help check install-tart fetch serve create-vm provision configure autostart \
-        status logs stop clean lint test
+        status logs stop clean purge-image lint test
 
 # 这些变量原来一个都没定义，而 provision/status/logs/stop/configure 五个目标
 # 都在用。展开出来是 `tart stop `（VM 名是空的）、`--llm-key-file  --llm-base-url`
@@ -101,10 +101,19 @@ stop: ## Stop the VM (autostart 装过的话重启后会再起来，见 autostar
 #  - bash -n 查不出「全角标点紧跟变量名」。那不是语法错，是 bash 的变量名
 #    解析把高位字节并进了名字：`"$X，y"` 里的名字是 X<U+FF0C>，set -u 下
 #    直接 unbound variable。见 docs/PITFALLS.md M20。
-test: ## Unit-test the auto-install driver and the vmkit audit fixes (offline, no VM)
+# 五套离线测试，全不起虚拟机、不连网、不碰 ~/.agentvm：
+#   test-autoinstall      无人值守安装驱动器（含画面判据、熔断、帧剪枝）
+#   test-vmkit-audit      vmkit 快照/上传下载那批
+#   test-vmkit-commands   vmkit / winarm 命令层
+#   test-agentvm-fetch    镜像下载的并发、token 文件、HTTP 码捕获
+#                          （本地 HTTPS 改 http 的 curl shim + 假 registry）
+#   test-tart-backend     tart 后端的退避等待、日志留存、clone 进度
+test: ## Unit-test every layer (offline, no VM, no network)
 	@python3 -I scripts/test-autoinstall.py
 	@python3 -I scripts/test-vmkit-audit.py
 	@python3 -I scripts/test-vmkit-commands.py
+	@python3 -I scripts/test-agentvm-fetch.py
+	@python3 -I scripts/test-tart-backend.py
 
 lint: ## Syntax-check every script
 	@bash scripts/lint-wide-punct.sh
@@ -140,6 +149,29 @@ lint: ## Syntax-check every script
 		for p in config/launchd/*.plist; do plutil -lint "$$p" || exit 1; done; \
 	 else echo "  skip plutil (config/launchd/ 下没有 plist，未检查)"; fi
 
-clean: ## Remove local state (keeps scripts and config)
-	@test -n "$$HOME" || { echo "HOME 未设置，拒绝 rm -rf 一个根路径"; exit 1; }; rm -rf "$$HOME/.agentvm/image"
-	@echo "removed $$HOME/.agentvm/image"
+# clean 原来直接 rm -rf ~/.agentvm/image。删掉的正是 agentvm-fetch 那份按 digest
+# 命名、可断点续传的 blob 池：镜像现在在外接盘上，写入实测只有 14.5 MB/s，一次
+# make clean 意味着几小时的重下，而脚本一句确认都不问，目标名还叫 clean。
+# 现在拆开：
+#   clean       只清构建产物和缓存（安全，随时能再生成）
+#   purge-image 删镜像池（贵，交互确认，或 AGENTVM_PURGE_IMAGE=1 显式放行）
+clean: ## Remove build artifacts and caches (safe; keeps the image pool)
+	@rm -rf __pycache__ scripts/__pycache__ scripts/lib/__pycache__ backends/__pycache__
+	@find "$(HOME)/.agentvm/vms" -maxdepth 2 -name '*.log' -delete 2>/dev/null || true
+	@echo "cleaned build artifacts（镜像池没动）"
+
+purge-image: ## Delete the resumable image pool (costly: hours to re-download)
+	@test -n "$$HOME" || { echo "HOME 未设置，拒绝 rm -rf 一个根路径"; exit 1; }; \
+	 if [ ! -d "$$HOME/.agentvm/image" ]; then echo "没有镜像池可删（$$HOME/.agentvm/image 不存在）"; exit 0; fi; \
+	 if [ "$${AGENTVM_PURGE_IMAGE:-0}" != "1" ]; then \
+	   if [ -t 0 ]; then \
+	     printf '这会删掉 %s（%s）。镜像在外接盘上，重下要按小时计。确定？[y/N] ' \
+	       "$$HOME/.agentvm/image" "$$(du -sh "$$HOME/.agentvm/image" 2>/dev/null | cut -f1)"; \
+	     read -r ans; \
+	     case "$$ans" in y|Y|yes) ;; *) echo "已取消"; exit 1 ;; esac; \
+	   else \
+	     echo "非交互环境，拒绝删镜像池。要删就设 AGENTVM_PURGE_IMAGE=1。"; exit 1; \
+	   fi; \
+	 fi; \
+	 rm -rf "$$HOME/.agentvm/image"; \
+	 echo "removed $$HOME/.agentvm/image"

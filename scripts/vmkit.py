@@ -1929,11 +1929,43 @@ def linux_ssh_ready(vm: dict, timeout: float = 8) -> bool:
     return r.returncode == 0
 
 
+def linux_ssh_banner_ok(vm: dict, timeout: float = 1.5) -> bool:
+    """只读 SSH 的 banner，不登录、不执行命令。
+
+    用来喂 vm_record 的 ssh_ok——那是个「轮询接口」：app 每次拉列表、每次
+    刷新状态都会对每一台运行中的 Linux VM 求一次值。原来用的是上面那个
+    linux_ssh_ready，一次完整 SSH（握手 + 认证 + 执行 true）：顺利时一两百
+    毫秒，客人机 sshd 忙时单次能阻塞到 ConnectTimeout（4 秒），多台运行中的
+    Linux VM 会叠加。2026-11-11 审计补上这个轻量版。
+
+    读 banner 和「真登录成功」在这件事上判据相同：QEMU 的 hostfwd 接受连接后，
+    客人机没监听就把它关掉，readline 立刻拿到 EOF；只有客人机的 sshd 真的起来了
+    才会送来 "SSH-2.0-..."。autoinstall.py 的 ssh_ready 用的就是这个判据
+    （见那儿注释）。
+
+    需要真执行命令的场景（关机、装完探测）继续用 linux_ssh_ready。
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", int(_vm_field(vm, "ssh_port"))),
+                                      timeout=timeout) as sk:
+            sk.settimeout(timeout)
+            return sk.recv(64).startswith(b"SSH-")
+    except OSError:
+        return False
+
+
 def start_linux(vm: dict, wait_ssh: bool = False) -> bool:
     """起一台 Linux 虚拟机。返回 SSH 到底等没等到（不等时恒为真）。"""
     if qemu_pid(vm):
         ok(f"VM 已在运行（pid {qemu_pid(vm)}）")
-        return
+        # 必须是 True 不是裸 return。函数签名写着 -> bool、docstring 写着
+        # 「不等时恒为真」，而唯一的消费方 cmd_install_linux 是
+        # `if not start_linux(...): die("没装完")`——裸 return 给的是 None，
+        # `not None` 为真，一条「已经在跑」的正常路径会被当成失败。
+        # 今天被上游挡着（install 要么拒绝已存在、要么 --force 前检查到在跑就
+        # die），所以不是现网 bug；但这是个会随调用方增加而引爆的契约违背。
+        # 2026-11-11 审计补上。
+        return True
     d = vm_dir(vm["name"])
     for f in ("disk.qcow2", "seed.iso"):
         if not (d / f).is_file():
@@ -2032,7 +2064,16 @@ def _wait_guest_agent(vm: dict, timeout: float = 180.0) -> bool:
     t0 = time.time()
     last = -1.0
     while time.time() - t0 < timeout:
-        if qa.qga_ping(sock, timeout=5):
+        # ping 的超时压到 2 秒而不是默认的 5 秒。
+        #
+        # agent 还没上线时，QEMU 的 chardev 是 server=on,wait=off——socket 一定
+        # 在、connect 成功，可 guest 那头没有 agent，于是 qga_request 死等满超时
+        # 才抛 QGAError。配上下面那个 sleep(3)，一次迭代实际是 5 + 3 = 8 秒，
+        # 而代码的意图（和 2047 行那个 sleep）是「每 3 秒探一次」。慢档下「agent
+        # 刚好上线」最多要晚 8 秒才察觉。
+        # 压到 2 秒：agent 真上线时响应是毫秒级，2 秒足够；没上线时 2 秒就放弃，
+        # 迭代变成 2 + 3 = 5 秒。180 秒的上限不变。2026-11-11 审计补上。
+        if qa.qga_ping(sock, timeout=2.0):
             ok(f"guest agent 已就绪，又用了 {int(time.time() - t0)} 秒")
             return True
         if not qemu_pid(vm):
@@ -2348,7 +2389,15 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
                     "确认后可以重跑 install 接着装")
             # 滚动留一帧。安装要十几分钟，中途死了总得知道它停在哪一步；
             # 而且这也是 headless 期间用户唯一能看画面的入口。
-            if time.time() - last_shot >= 20:
+            #
+            # 间隔从 20 秒放到 60 秒。ramfb 这条路分辨率锁死 800x600（见
+            # docs/WINDOWS-ARM-ON-MACOS.md），所以每张 PPM 恒是 800x600x3 =
+            # 1.44 MB，而它往同一个路径覆盖写——20 秒一次的话，40 分钟预算下
+            # 一共约 120 次、写出去约 173 MB，盘上只留下最后那 1.44 MB，写放大
+            # 120 倍。另外 screendump 是握着监控套接字 sleep(1.5) 的，120 次就是
+            # 180 秒的套接字占用（每次都正常关，没有泄漏）。Setup 的进度条动得
+            # 很慢，60 秒足够看清它停在哪一步。2026-11-11 审计补上。
+            if time.time() - last_shot >= 60:
                 last_shot = time.time()
                 screendump(d / "monitor.sock", d / "last-screen.ppm")
             Emit.progress("ssh", (time.time() - t0) /
@@ -3829,7 +3878,8 @@ def vm_record(vm: dict) -> dict:
                             if disk.exists() else 0),
     }
     if pid and vm.get("kind") == "linux":
-        rec["ssh_ok"] = linux_ssh_ready(vm, timeout=4)
+        # 轮询接口上的轻量探测，不跑完整 SSH（见 linux_ssh_banner_ok 的说明）。
+        rec["ssh_ok"] = linux_ssh_banner_ok(vm)
     if vm.get("kind") == "macos":
         # 界面要靠这几个字段区分 macOS VM：有没有装完、装的哪个 build、
         # 分辨率是多少。缺一个 app 那边就解不出来，而 Swift 的解码失败

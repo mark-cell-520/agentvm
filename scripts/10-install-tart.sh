@@ -34,6 +34,28 @@ done
 need_cmd curl
 need_cmd tar
 
+# 已经装好了就退出。
+#
+# 原来全文没有这道判断：每次 make install-tart / backend.install() 都
+# resolve_release + 下载整个 tart.tar.gz（几十 MB，在项目要解决的限速网络下是
+# 分钟级），然后 116 行 rm -rf 掉旧 tart.app 再装。代价不只是慢——它还无谓
+# 摧毁一次完好的安装：万一这次下载或解压坏了，用户手上就连一个能用的 tart 都
+# 没有了。而 Makefile 第 3 行写着 Every step is idempotent，
+# scripts/install-qemu.sh:48 的 have_qemu 正是这个写法。
+#
+# 判断用 `tart --version` 而不是 `[ -x ... ]`：布局变了会让符号链接悬空，
+# 那时二进制「在」但跑不起来（125 行的注释就是讲这个）。
+#
+# 想强制重装：rm -rf 掉 APPDIR/tart.app 和 PREFIX/bin/tart 再跑，或加
+# AGENTVM_TART_FORCE=1。
+if [ "${AGENTVM_TART_FORCE:-0}" != "1" ] \
+        && [ -L "$PREFIX/bin/tart" ] \
+        && "$PREFIX/bin/tart" --version >/dev/null 2>&1; then
+    ok "tart 已装好（$("$PREFIX/bin/tart" --version 2>&1 | head -1)），跳过下载和重装"
+    ok "  想强制重装：AGENTVM_TART_FORCE=1 $0，或 rm -rf '$APPDIR/tart.app' '$PREFIX/bin/tart'"
+    exit 0
+fi
+
 mkdir -p "$PREFIX/bin" "$APPDIR"
 
 # Resolve the release via api.github.com, which is reachable on networks where
@@ -41,6 +63,12 @@ mkdir -p "$PREFIX/bin" "$APPDIR"
 resolve_release() {
   local api="https://api.github.com/repos/openai/tart/releases"
   [ -n "$VERSION" ] && api="$api/tags/$VERSION" || api="$api/latest"
+  # 一次响应里同时取 tart.tar.gz 和 checksums 两个 asset id。
+  #
+  # 原来是拉两遍：这里拉一次 releases/latest 只为拿 tarball 的 id，105 行再拉
+  # 一次 releases/tags/$TAG 只为拿 checksums 的 id。同一个 release 的 JSON 走了
+  # 两趟 api.github.com——而这正是本项目环境里唯一能通、但很慢的那个通道，多一
+  # 趟就多一次失败重试的风险。2026-11-11 审计合并。
   curl -fsSL "$api" 2>/dev/null | python3 -c '
 import sys, json
 try:
@@ -48,10 +76,17 @@ try:
 except Exception:
     sys.exit(1)
 tag = d.get("tag_name")
+targz = None
+sums = None
 for a in d.get("assets", []):
-    if a["name"] == "tart.tar.gz":
-        print(tag, a["id"], a["size"])
-        break
+    n = a.get("name", "")
+    if n == "tart.tar.gz":
+        targz = a
+    elif n.endswith("checksums.txt"):
+        sums = a
+if targz is None:
+    sys.exit(1)
+print(tag, targz["id"], targz.get("size", 0), sums["id"] if sums else "")
 ' || true
 }
 
@@ -69,7 +104,7 @@ if [ -n "$TARBALL" ]; then
     cp "$TARBALL" "$WORK/tart.tar.gz"
     ok "用本地压缩包 ${TARBALL}（跳过联网）"
 else
-    read -r TAG ASSET_ID ASSET_SIZE < <(resolve_release) || true
+    read -r TAG ASSET_ID ASSET_SIZE SUM_ASSET < <(resolve_release) || true
 
     if [ -z "${TAG:-}" ]; then
       die "could not resolve a Tart release via api.github.com.
@@ -84,14 +119,7 @@ else
       -o "$WORK/tart.tar.gz"
 
     # The release publishes a checksums file; verify before extracting anything.
-    SUM_ASSET="$(curl -fsSL "https://api.github.com/repos/openai/tart/releases/tags/$TAG" 2>/dev/null \
-      | python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-for a in d.get("assets", []):
-    if a["name"].endswith("checksums.txt"):
-        print(a["id"]); break
-' || true)"
+    # SUM_ASSET 是 resolve_release 顺带带回来的，不再单独拉一次 release JSON。
 
     if [ -n "$SUM_ASSET" ]; then
       curl -fsSL -H "Accept: application/octet-stream" \

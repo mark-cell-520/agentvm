@@ -1171,6 +1171,20 @@ def cmd_stop(cfg: Cfg) -> None:
 
     warn("优雅关机超时，强杀。raw 盘可能留下脏数据，下次启动 Windows 会自愈")
     run(["kill", "-9", str(pid)], check=False, capture=True)
+    # 发完 -9 必须等它真的退干净。
+    #
+    # kill 是异步的：信号出去到进程变成僵尸/被回收之间有一段窗口，这时候 ps 还
+    # 看得见它。紧接着任何「起虚拟机」都会走 qemu_running → 看到「VM 已在运行」
+    # → 什么都不做就返回。用户改的 CPU/内存/显示模式一个都没生效，而日志说停过了。
+    #
+    # vmkit.py 的 Windows 分支早就给这条路包了一层轮询兜底（3547 行起，注释写的
+    # 就是这件事），但那是外层：winarm 作为独立子命令被调用、launchd 自启、以及
+    # snapshot save --clean --restart 这条不经过 vmkit 的路，都不被覆盖。
+    # 2026-11-11 审计从根上对齐两边语义，而不是只在外层包。
+    for _ in range(50):
+        if not qemu_running(cfg):
+            break
+        time.sleep(0.2)
     ok("已强杀")
 
 
@@ -1277,7 +1291,20 @@ def cmd_screenshot(cfg: Cfg, out: str = "/tmp/winarm-screen.ppm") -> None:
             # 就把 VM 杀了，而且日志里只会留下一行 terminating on signal 15，
             # 看起来像被外部打死，极易误判成环境问题。
             sk.sendall(f"screendump {out}\n".encode())
-            time.sleep(2)
+            # 原来是固定 sleep(2)。screendump 是 QEMU 收到命令后异步做的：画面
+            # 简单时几十毫秒就落盘了，白等两秒；画面复杂时又可能还没写完。
+            # 改成轮询文件出现——文件一出现说明 QEMU 已经开始写了，再给 0.2 秒
+            # 收尾。带 3 秒上限，超了就走下面那句「没抓到画面」，那本来就是这条
+            # 路的失败出口。2026-11-11 审计补上。
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    if Path(out).stat().st_size > 0:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            time.sleep(0.2)
     except OSError as e:
         die(f"连 monitor 失败：{e}")
     p = Path(out)

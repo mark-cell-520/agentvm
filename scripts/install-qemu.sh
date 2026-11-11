@@ -117,7 +117,17 @@ if [ -w /opt/homebrew ] || [ -w /opt ]; then
     mkdir -p /opt/homebrew
     # 不覆盖已有内容：原来 `cp -R "$tmp"/. /opt/homebrew/`，重跑会把原来的
     # Homebrew 配置和已装的 formula 链接搅乱。
-    cp -Rn "$tmp"/. /opt/homebrew/ 2>/dev/null || cp -R "$tmp"/. /opt/homebrew/
+    #
+    # 后来的写法是 `cp -Rn ... || cp -R ...`，想着「跳过了就跳过，失败了再兜底」。
+    # 但 cp -n 在**跳过**已存在文件时也返回 1（本机实测），所以只要
+    # /opt/homebrew 非空——也就是重跑——就必然落到第二条 cp -R，注释里
+    # 「不覆盖」的意图在重跑时正好作废。改成先问目标空不空：空才拷，
+    # 非空就明说跳过了哪一步。
+    if [ -z "$(ls -A /opt/homebrew 2>/dev/null)" ]; then
+        cp -R "$tmp"/. /opt/homebrew/ || die "拷 Homebrew 进 /opt/homebrew 失败"
+    else
+        warn "/opt/homebrew 非空，跳过拷贝（不动你已经装好的东西）"
+    fi
     warn "接下来 brew 要从 github.com clone homebrew-core，这一步可能几小时"
     HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 \
         /opt/homebrew/bin/brew tap homebrew/core \

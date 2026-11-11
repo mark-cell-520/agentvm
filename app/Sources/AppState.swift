@@ -209,14 +209,31 @@ final class AppState: ObservableObject {
         // 「宿主机检查没全过」而下面一条明细都没有——看着像一堆故障，实际只是
         // 这条命令没跑成。
         guard ev["t"] as? String == "check" else { return }
-        let items = (ev["items"] as? [[String: Any]] ?? []).compactMap { d -> CheckItem? in
-            guard let data = try? JSONSerialization.data(withJSONObject: d)
-                else { return nil }
-            return try? JSONDecoder().decode(CheckItem.self, from: data)
+        var items: [CheckItem] = []
+        var dropped = 0
+        for d in (ev["items"] as? [[String: Any]] ?? []) {
+            guard let data = try? JSONSerialization.data(withJSONObject: d),
+                  let item = try? JSONDecoder().decode(CheckItem.self, from: data)
+            else {
+                // 解不出来的条目要计数，不能静默丢掉。
+                // 原来是 `.compactMap { try? ... }`：后端改/漏 CheckItem 的
+                // name/ok/detail 类型时，那一项就从「宿主机检查没全过」的明细里
+                // 消失，用户看不到全部未过项。同文件的 handleCatalog、handleStatus
+                // 对这类「解码失败静默丢条目」都在上一轮补了 errorMessage +
+                // revision，唯独 check 这条漏了。2026-11-11 审计补上。
+                dropped += 1
+                continue
+            }
+            items.append(item)
         }
         DispatchQueue.main.async {
             self.checkItems = items
             self.checkOk = (ev["ok"] as? Bool) ?? false
+            if dropped > 0 {
+                self.errorMessage = "宿主机检查有 \(dropped) 项显示不出来"
+                    + "（后端给的字段和这个版本的 app 对不上）"
+                self.revision += 1
+            }
         }
     }
 
@@ -555,9 +572,23 @@ final class AppState: ObservableObject {
     /// 调用方是 app delegate 的 applicationShouldTerminate（全仓库唯一的
     /// 退出钩子；sheet 的 .onDisappear 只覆盖关窗口，app 终止时 SwiftUI
     /// 不保证跑它）。
-    func stopAllMacVMs(timeout: TimeInterval = 45) {
+    ///
+    /// 总时长有上限。原来是逐台 `stopAndWait(timeout: 45)`、同步等——超时按台数
+    /// 相乘：同时跑着 3 台 macOS 客人机且都迟迟不响应关机时，
+    /// applicationShouldTerminate 会堵 45x3 = 135 秒（主线程），用户看到退出
+    /// 卡住，而注释只按「一台」考虑了 45 秒。2026-11-11 审计补上总预算。
+    func stopAllMacVMs(totalTimeout: TimeInterval = 45) {
+        let deadline = Date().addingTimeInterval(totalTimeout)
         for rt in macRuntimes.values {
-            rt.stopAndWait(timeout: timeout)
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 {
+                // 剩下的不等了。退出卡住比留一台没优雅关机更难看——后者下次
+                // 启动自愈，前者让用户以为 app 死了。
+                NSLog("AgentVM: 退出时还有 macOS VM 没关完，总超时 %.f 秒已到，不再等",
+                      totalTimeout)
+                break
+            }
+            rt.stopAndWait(timeout: left)
         }
         macRuntimes.removeAll()
         macVM = nil

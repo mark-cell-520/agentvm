@@ -138,9 +138,14 @@ do {
     }
     log("  .. start() 已同步返回")
     // 轮询状态与串口增长
-    for i in 1...12 {
-        Thread.sleep(forTimeInterval: 10)
-        log("  .. \(i*10)s 状态=\(vm.state.rawValue) (1=running,4=pausing) 串口=\(consoleSize()) 字节")
+    // 粒度从 10 秒降到 1 秒。串口其实 100 毫秒就有输出，10 秒粒度意味着它要等
+    // 下一个整点才被看见——排障时平白多等最多 10 秒。这是验证用脚本（VM 并不靠
+    // 这 120 秒活着，之后 dispatchMain 常驻），所以只影响排障手感。
+    // 2026-11-11 审计补上。
+    for i in 1...120 {
+        Thread.sleep(forTimeInterval: 1)
+        let secs = i
+        log("  .. \(secs)s 状态=\(vm.state.rawValue) (1=running,4=pausing) 串口=\(consoleSize()) 字节")
         if consoleSize() > 1000 { log("  ok 串口开始有输出"); break }
     }
 } catch {

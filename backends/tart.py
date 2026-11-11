@@ -140,6 +140,9 @@ class TartBackend(Backend):
         self.dirs = _parse_dir_specs(cfg.get("tart_dirs"))
         self.vnc = _parse_vnc(cfg.get("tart_vnc"))
         self.expose = _parse_expose_specs(cfg.get("tart_expose"))
+        # run_vm 起的 tart 的日志：{name: (路径, 打开的文件句柄)}。
+        # 句柄要留着好关，路径要留着好让 wait_ready 超时时把尾部附在错误里。
+        self._run_logs: dict = {}
 
     def set_share_options(self, dirs=None, vnc=None, expose=None) -> None:
         """命令行覆盖 tart run 的三个透传参数。
@@ -188,19 +191,25 @@ class TartBackend(Backend):
 
     # ------------------------------------------------------------ tart 封装 --
 
-    def _tart(self, *args: str, check: bool = True, stdin: str | None = None) -> str:
+    def _tart(self, *args: str, check: bool = True, stdin: str | None = None,
+              capture: bool = True) -> str:
         if not Path(self.tart).exists():
             raise BackendError(f"tart 不存在：{self.tart}，请先 install")
         proc = subprocess.run(
             [self.tart, *args],
-            capture_output=True,
+            capture_output=capture,
             text=True,
             input=stdin,
         )
         if check and proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            if not detail:
+                # capture=False 时两条流都没被接住，detail 必然是空的。这时不能
+                # 甩一句空消息——告诉用户 tart 自己的输出已经打到终端上面去了。
+                detail = ("没有捕获到输出（这条命令的输出直接写在了终端里，"
+                          "往上面看）" if not capture else "tart 没有输出")
             raise BackendError(
-                f"tart {' '.join(args)} 失败（退出码 {proc.returncode}）："
-                f"{(proc.stderr or proc.stdout).strip()}"
+                f"tart {' '.join(args)} 失败（退出码 {proc.returncode}）：{detail}"
             )
         return (proc.stdout or "").strip()
 
@@ -246,7 +255,15 @@ class TartBackend(Backend):
         source = base_image or self.source
         print(f"==> 克隆 {source} -> {name}")
         # --insecure 是必须的：Tart 拒绝明文 HTTP 注册表
-        self._tart("clone", source, name, "--insecure", "--concurrency", "16")
+        #
+        # capture=False 是刻意的：tart clone 一个 4.3 GB 镜像要 10 到 15 分钟，
+        # 而 _tart 默认 capture_output=True，进度条被整个吞掉、调用方又丢掉返回值
+        # ——用户对着十几分钟零输出的终端，无法区分「在跑」和「卡死」。
+        # 现在让 tart 的进度直接写到本进程的 stderr。check 仍然是 True，
+        # 失败时 _tart 会拿 proc.stderr 报出来（capture=False 时它是 None，
+        # 于是落到 proc.stdout，也是 None，最后是一句空消息——所以下面自己兜）。
+        self._tart("clone", source, name, "--insecure", "--concurrency", "16",
+                   capture=False)
         self._tart("set", name, "--cpu", str(cpu), "--memory", str(memory_mb))
 
     def _run_share_args(self) -> list[str]:
@@ -293,9 +310,22 @@ class TartBackend(Backend):
         # 透传参数放在 Popen 之前算：目录不存在这类错要在这时候就抛出来，
         # 而不是等 tart 起了一半再报一句看不懂的 usage。
         extra = self._run_share_args()
+        # tart 自己的输出不能丢进 DEVNULL。原来 stdout/stderr 全是 DEVNULL：
+        # tart 起不来（参数错、entitlement 缺失、VM 名不存在）时用户要干等
+        # wait_ready 的 240 秒，最后只等到一句「客人机在 240 秒内未就绪」——
+        # 把 tart 的失败说成客人机没就绪，排查方向从头就错。
+        # 现在转到 VM 目录下的 tart.log，wait_ready 超时时会把它尾部附上。
+        logf = self.vms_dir / name / "tart.log"
+        try:
+            logf.parent.mkdir(parents=True, exist_ok=True)
+            log = open(logf, "wb")
+        except OSError:
+            log = subprocess.DEVNULL
+            logf = None
+        self._run_logs[name] = (logf, log)
         proc = subprocess.Popen(
             [self.tart, "run", name, "--no-graphics", *extra],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
         pidfile = self.vms_dir / name / "tart.pid"
@@ -308,9 +338,24 @@ class TartBackend(Backend):
 
     def stop_vm(self, name: str) -> None:
         self._tart("stop", name, check=False)
+        self._close_run_log(name)
 
     def delete_vm(self, name: str) -> None:
         self._tart("delete", name, check=False)
+        self._close_run_log(name)
+
+    def _close_run_log(self, name: str) -> None:
+        """把 run_vm 留着的日志句柄关掉。父进程一直持有一份，不关就是泄漏。"""
+        entry = self._run_logs.pop(name, None)
+        if not entry:
+            return
+        _, log = entry
+        try:
+            log.flush()
+            if log is not subprocess.DEVNULL:
+                log.close()
+        except (OSError, ValueError):
+            pass
 
     # -------------------------------------------------------- guest 内执行 --
 
@@ -345,7 +390,17 @@ class TartBackend(Backend):
             raise BackendError(f"tart 不存在：{self.tart}")
         try:
             proc = subprocess.run(
-                [self.tart, "exec", name, "sh", "-s"],
+                # 必须是 bash 不是 sh。40-provision-guest.sh 第 21 行是
+                # `set -euo pipefail`，而 tart 的客人机是 Debian，/bin/sh 是
+                # dash，dash 不支持 pipefail——整段脚本第一行就退，换 apt 源和
+                # 装编译工具链一样都不做，agentvm.py provision 必然以退出码 2
+                # 失败。2026-11-11 实测（/bin/dash -s 喂 set -euo pipefail）：
+                #   dash: set: Illegal option -o pipefail，退出码 2
+                #   bash：正常往下走，退出码 0
+                # Makefile 的 provision 目标早就为同一个原因改成了 bash -s，
+                # 这条是漏改的同类。backends/base.py 的 docstring 里
+                # 「和原项目 tart exec vm sh -s 一致」说的正是这个被否定的写法。
+                [self.tart, "exec", name, "bash", "-s"],
                 input=script,
                 capture_output=True,
                 text=True,
@@ -364,11 +419,51 @@ class TartBackend(Backend):
     def wait_ready(self, name: str, timeout: int = 240) -> None:
         import time
 
+        # 退避而不是固定 10 秒。原来是 while + time.sleep(10)：客人机首启要 90 秒
+        # 左右，前几轮必然失败，等于干等；更要紧的是 tart exec 挂住时单次要等满
+        # 它的 20 秒超时，240 秒的预算实际会变成 240 + 24x20 = 720 秒，用户等了
+        # 十二分钟才看到超时，而那之前没有任何输出。
+        # 现在 1、2、4、8 然后封顶 10 秒，且每轮都打一行——等待期间用户至少知道
+        # 它在等什么。2026-11-11 审计补上。
         deadline = time.time() + timeout
+        attempt = 0
+        interval = 1
         while time.time() < deadline:
+            attempt += 1
             try:
                 self.exec_vm(name, "true", timeout=20)
                 return
             except BackendError:
-                time.sleep(10)
-        raise BackendError(f"客人机在 {timeout} 秒内未就绪")
+                left = int(deadline - time.time())
+                if left <= 0:
+                    break
+                print(f"    等客人机就绪（第 {attempt} 次，还剩约 {left} 秒）…",
+                      flush=True)
+                time.sleep(min(interval, left))
+                interval = min(interval * 2, 10)
+        # 超时了。这时候最该说的是 tart 自己怎么了，而不是笼统一句「未就绪」：
+        # tart 起不来（签名、entitlement、VM 名）时它早就退了，等再久也一样。
+        raise BackendError(
+            f"客人机在 {timeout} 秒内未就绪。{self._tart_log_tail(name)}"
+        )
+
+    def _tart_log_tail(self, name: str, lines: int = 12) -> str:
+        """tart.log 的末尾几行，用来附在「未就绪」的错误里。"""
+        entry = self._run_logs.get(name)
+        if not entry:
+            return ""
+        logf, log = entry
+        try:
+            log.flush()
+        except (OSError, ValueError):
+            pass
+        if logf is None or not logf.is_file():
+            return ""
+        try:
+            tail = logf.read_text(errors="replace").splitlines()[-lines:]
+        except OSError:
+            return ""
+        if not tail:
+            return ""
+        return (f"tart 自己的日志尾部（{logf}）：\n    "
+                + "\n    ".join(tail))

@@ -108,12 +108,11 @@ write_secret() {
 
 # Transport an arbitrary string into a guest/file without it appearing in argv
 # in a form that secret-scanners mangle. Encodes to base64, decodes on arrival.
-#   printf '%s' "$secret" | b64_into_guest <vm> /remote/path
-b64_into_guest() {
-  local vm="$1" dest="$2"
-  local b64; b64="$(base64 | tr -d '\n')"
-  # dest 要转义：路径里有空格会把远端命令切断，有单引号更是命令注入。
-  # 用 printf %q 让 bash 生成一个能安全再解析一次的串。
-  local qdest; qdest="$(printf '%q' "$dest")"
-  tart exec "$vm" sh -c "umask 077; printf '%s' '$b64' | base64 -d > $qdest; chmod 600 $qdest"
-}
+#
+# 这里原来有一个 b64_into_guest()，2026-11-11 审计删掉了，理由是两条：
+#   1. 全仓库没有任何调用方，是死代码；
+#   2. 它做的正是 agentvm.py:278-286 的注释明确否定的那个做法——把 base64 后的
+#      值拼进 tart exec 的 argv。base64 不是加密，进程表里可还原，而那处注释
+#      写的是「原项目把 base64 后的值放进 tart exec 的 argv……所以这里严一档」。
+# 秘密进客人机的正确通道是 stdin：agentvm.py 的 _push_secret 和
+# backends/*.py 的 exec_vm_script（input=script）都是这么做的。

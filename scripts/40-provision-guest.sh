@@ -4,8 +4,11 @@
 # Copy in with:  tart exec <vm> bash -s < scripts/40-provision-guest.sh
 # or push it and run it: see `make provision`.
 #
-# 必须是 bash 不是 sh：第 18 行是 `set -euo pipefail`，而 Debian 的 /bin/sh 是
+# 必须是 bash 不是 sh：第 21 行是 `set -euo pipefail`，而 Debian 的 /bin/sh 是
 # dash，dash 不支持 pipefail，整段脚本第一行就退，换源和装编译器一样都不做。
+# 2026-11-11 实测（/bin/dash -s）：set: Illegal option -o pipefail，退出码 2。
+# 所以三个入口必须都送 bash：Makefile 的 provision 目标、backends/tart.py 的
+# exec_vm_script、以及直接 `tart exec <vm> bash -s < 本文件`。
 #
 # What this fixes, and why each step exists:
 #
@@ -65,11 +68,45 @@ else
 fi
 
 say "apt-get update"
-$SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq
+# 只在实际会换源时才 update。原来无条件跑一次：apt-get update 要把整个
+# Packages 索引拉一遍（换成本地镜像后是几十 MB），而这一步在「源已经是镜像、
+# 包也装好了」的重跑里纯属白下。2026-11-11 审计补上。
+NEED_UPDATE=0
+case "${AGENTVM_APT_MIRROR:-}" in
+  "") [ -f /etc/apt/mirrors/.agentvm-mirror-applied ] || NEED_UPDATE=1 ;;
+  *)  NEED_UPDATE=1 ;;   # 显式指定了新镜像，按用户的要求重新换源
+esac
+# 上面那个标记文件本身不可靠（客人机重建就没了），所以再兜一个：镜像列表里
+# 已经没有 deb.debian.org 就说明换过源了。
+if [ "$NEED_UPDATE" -eq 0 ] && grep -rqs "deb.debian.org" /etc/apt/ 2>/dev/null; then
+  NEED_UPDATE=1
+fi
+if [ "$NEED_UPDATE" -eq 1 ]; then
+  $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq
+  $SUDO touch /etc/apt/mirrors/.agentvm-mirror-applied 2>/dev/null || true
+else
+  say "apt 源已经是镜像且索引没过期，跳过 apt-get update"
+fi
 
 say "installing build toolchain"
-$SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-  apt-get install -y -qq build-essential python3-dev libffi-dev curl ca-certificates
+# 两个改动，都是省客人机盘和下载量——而客人机盘落在外接盘上（实测写入只有
+# 14.5 MB/s）：
+#  1. --no-install-recommends。build-essential 的 recommends 链会多拉一批包，
+#     常见量级几十 MB 起，而编译工具链一个都用不上。
+#  2. 装完 clean + 清 lists。apt 的 Packages 索引常驻 /var/lib/apt/lists，
+#     一个 Debian 基础系统上是几十 MB，装完包就没用了。
+# 另外加一道「装好了就跳过」：dpkg -s 全中就不再跑 apt-get install。原来重跑
+# provision 必然再走一次 apt-get install（有 -y 也仍然要解析依赖、下载校验）。
+if $SUDO dpkg -s build-essential python3-dev libffi-dev curl ca-certificates \
+        >/dev/null 2>&1; then
+  say "build toolchain already installed, skipping apt-get install"
+else
+  $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+    apt-get install -y -qq --no-install-recommends \
+    build-essential python3-dev libffi-dev curl ca-certificates
+  $SUDO apt-get clean
+  $SUDO rm -rf /var/lib/apt/lists/*
+fi
 
 say "verifying toolchain"
 gcc --version | head -1

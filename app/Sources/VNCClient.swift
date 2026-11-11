@@ -153,9 +153,17 @@ final class VNCClient: ObservableObject {
         generation &+= 1
         let mine = generation
         set("正在连接 \(host):\(port)")
-        let c = NWConnection(host: NWEndpoint.Host(host),
-                             port: NWEndpoint.Port(rawValue: port)!,
-                             using: .tcp)
+        // 端口越界时不要强解包。原来是 `NWEndpoint.Port(rawValue: port)!`：
+        // 当前 ConsoleView.init 对越界端口会改连 0 并同时置 portError，
+        // onAppear 里 portError 非空就不 connect，所以 port 0 走不到这儿——
+        // 但这是个潜在一崩点，而「不可达」是别人代码维持的现状，不是这条语句
+        // 自己的保证。改成 guard，崩也崩成一句人话。2026-11-11 审计补上。
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            set("端口 \(port) 不是合法的 TCP 端口号（应在 1 到 65535 之间）")
+            fail("端口 \(port) 不是合法的 TCP 端口号")
+            return
+        }
+        let c = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
         c.stateUpdateHandler = { [weak self] st in
             guard let self else { return }
             // 只认当前这一条连接的状态。被 cancel 掉的旧连接也会走到这里
@@ -498,6 +506,17 @@ final class VNCClient: ObservableObject {
         }
         t.resume()
         keepAlive = t
+    }
+
+    /// 兜底清理。正常关 sheet 时会走到 disconnect，不泄漏；但万一某条路径下
+    /// VNCClient 先于 ConsoleView.onDisappear 析构，那个每 250ms 触发的
+    /// keepAlive 定时器会带着 [weak self] 永远空转、conn 也不被显式 cancel。
+    /// deinit 是最后一道防线。2026-11-11 审计补上。
+    deinit {
+        keepAlive?.cancel()
+        keepAlive = nil
+        conn?.cancel()
+        conn = nil
     }
 
     private func stopKeepAlive() {

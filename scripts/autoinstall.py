@@ -173,6 +173,19 @@ ACT_PAUSE = 2.0             # 做完一个动作等这么久再看
 DISK_QUIET = 2.0
 # 最多做多少个动作。防 runaway：真出岔子时不能让驱动器在那儿按一晚上回车。
 ACT_LIMIT = 200
+# 「服务起来了没」的探测节奏。原来是每轮一次、超时 1.0 秒——而它顺序试两个
+# 端口，遇到 QEMU hostfwd 那种「接住连接但不回数据」的沉默对面时一次就
+# 2.005 秒（实测），把整个轮询节奏从 0.5 秒一轮拖到 2.5 秒一轮。现在每
+# PROBE_EVERY_SECONDS 秒才探一次，单次超时压到 PROBE_TIMEOUT。drive() 有
+# 45 分钟预算，晚 10 秒发现服务起来没有代价。
+PROBE_EVERY_SECONDS = 10.0
+PROBE_TIMEOUT = 0.3
+# 画面连续多少轮没稳过就报警、多少轮就放弃。见 drive() 里那个分支的说明：
+# 每轮都变的画面会让「等画面稳」这道门永远 continue，而后面的动作熔断器排在
+# 它后面，一个动作都不做、一行日志都不打。600 轮约 8 分钟（按 0.8 秒一轮），
+# 2400 轮约 32 分钟——都在 45 分钟的 budget 之内，不会等到超时才暴露。
+UNSTABLE_WARN_ROUNDS = 600
+UNSTABLE_GIVE_UP = 2400
 # 每个动作之前把当前画面存成 <vm 目录>/auto-<序号>.png，只保留最近这么多张。
 # 自动安装退成手动时，用户（和我们）第一句话就是「它停在什么屏幕上」——不留
 # 现场就只能靠猜。2026-11-11 实测：不留图时盯着日志数回车次数，怎么数都对不上
@@ -785,6 +798,30 @@ def _png(w: int, h: int, rgb: bytes) -> bytes:
             + chunk(b"IEND", b""))
 
 
+def _next_frame_no(vdir: Path) -> int:
+    """这一轮 save_frame 的起始编号：现有 auto-<n> 的最大 n 加一。
+
+    为什么不能从 0 开始：save_frame 的剪枝按 _frame_no 的全局数值序保留最高的
+    KEEP_FRAMES 个。如果 VM 目录里留着上一轮编号更高的帧（例如 auto-150.png 起
+    24 张），新一轮写出的 auto-0.png 排在最下面，olds[:-24] 会在同一个调用里把
+    它刚写的这个文件删掉——之后每一次 save_frame 都是「写完即删」，200 个动作
+    全写全删、一张帧都不留，而「它停在什么屏幕上」这个唯一证据正好没了。
+    2026-11-11 沙箱实测复现：先放 auto-150..173 共 24 张，再 save_frame(n=0)，
+    auto-0.png 在同一个调用里被删；n=1..5 同样如此。
+
+    要复现得让「vm.json 没了而 auto-*.png 还在」——install --force 会 _rmtree
+    整个目录，不带 --force 时 vm.json 存在就被拒，所以那是崩溃或手搓出来的状态。
+    正因为罕见，它一旦发生就特别难归因。M34 第十九条修的是「剪枝按字典序排」，
+    这一条是同一个失败换了个方向回来。
+    """
+    m = -1
+    for p in (*vdir.glob(f"auto-*{FRAME_SUFFIX}"), *vdir.glob("auto-*.ppm")):
+        n = _frame_no(p)
+        if n < (1 << 30):        # 读不出编号的那些不算
+            m = max(m, n)
+    return m + 1
+
+
 def save_frame(vdir: Path, n: int, frame: bytes, w: int, h: int) -> None:
     """把一帧存成 PNG，只留最近 KEEP_FRAMES 张。
 
@@ -869,6 +906,9 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                 pass
 
     mon = vdir / "monitor.sock"
+    # 「服务起来了没」的下一次探测时刻。等 VNC 那段和主循环共用它，
+    # 两边都不能每轮探一次（见 PROBE_EVERY_SECONDS 的说明）。
+    next_probe = 0.0
     port = int(vm.get("vnc_display", 0) or 0) + 5900
     if port <= 5900:
         say("这台虚拟机没有配 VNC 显示编号，没法自动点安装器", "warn")
@@ -885,10 +925,16 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
     rfb = None
     deadline = time.time() + 120
     waited = 0.0
+    # 这段里的就绪探测也走同一个节流。原来它每轮一次、每次最多 2 秒（两个端口
+    # 各 1 秒），而慢档下 120 秒窗口里真正能尝试 RFB 连接的次数从约 60 次降到
+    # 约 30 次。VNC 通常 20~40 秒就连上，所以影响比主循环小，但既然是同一个
+    # 浪费就一起收掉。
     while time.time() < deadline:
-        if service_ready(vm, timeout=1.0):
-            say("客人机的服务已经起来了，不用点安装器")
-            return "done"
+        if time.time() >= next_probe:
+            next_probe = time.time() + PROBE_EVERY_SECONDS
+            if service_ready(vm, timeout=PROBE_TIMEOUT):
+                say("客人机的服务已经起来了，不用点安装器")
+                return "done"
         try:
             rfb = RFB(port)
             break
@@ -922,18 +968,54 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
     grew_at = 0.0                    # 盘最后一次变大的时刻
     last_at = 0.0
     still = 0                        # 画面连续变化了多少次（翻页时多给 settle）
-    acts = 0                        # 一共做了多少个动作（回车或点击）
+    unstable = 0                     # 连续多少轮画面没稳过（见下面的熔断）
+    # 起始编号接在目录里现有帧的后面，不从 0 开始。从 0 开始会让剪枝把
+    # 本轮刚写的帧删掉，见 _next_frame_no 的说明。
+    acts = _next_frame_no(vdir)   # 一共做了多少个动作（回车或点击）
     ejected = False
     budget_end = time.time() + budget_minutes * 60
     frame: bytes | None = None       # 最近一次真的拿到的画面
     rounds = 0                       # 取过多少轮帧（用来决定什么时候全屏重同步）
+    last_saved: bytes | None = None  # 上一帧存过盘的 frame 对象，见 stash
+
+    def stash(frame):
+        """存一帧，但同一帧只存一次。
+
+        tried 0 / 1 / else 三条分支各存一次，而增量模式下画面没变时 frame()
+        返回 None、got 直接是上一个 bytes 对象——那三张是同一屏。
+        实测一屏 1406x744 带文字的安装画面 PNG 是 136.3 KB（纯色底只有 1.5 KB，
+        所以绝对量随画面变，三倍放大是结构性的），跑满 ACT_LIMIT=200 就是
+        27.91 MB 写进去、剪枝只留 3.35 MB，白写 24.56 MB，折合每小时 17.6 MB
+        写放大。2026-11-11 审计补上。
+
+        重启循环和「画面稳不下来」那两处不走这个：它们是关键证据，宁可多存一张。
+        """
+        nonlocal last_saved
+        if frame is None or frame is last_saved:
+            return
+        last_saved = frame
+        save_frame(vdir, acts, frame, rfb.w, rfb.h)
 
     try:
         with rfb:
             while time.time() < budget_end:
-                if service_ready(vm, timeout=1.0):
-                    say(f"客人机服务已就绪，安装完成（自动操作了 {acts} 步）")
-                    return "done"
+                # 服务就绪探测要降频。
+                #
+                # 原来是每轮第一句就 service_ready(vm, timeout=1.0)。它顺序试
+                # web 和 ssh 两个端口，每个一次 create_connection 加一次 recv，
+                # 而 recv 的超时就是传进去的 timeout。QEMU 的 hostfwd「来者不拒」
+                # （见 service_ready 的注释）：对面是「接受了连接但永远不回数据」的
+                # 沉默监听者时，一次调用 2.005 秒（2026-11-11 实测），两个端口各
+                # 占满 1.0 秒。慢档下每轮先付 2.0 秒，再叠 INCR_TIMEOUT 的 5 秒，
+                # 一轮 7 秒以上；而画面在动的安装器屏幕上 rfb.frame() 是毫秒级
+                # 返回的，轮询节奏完全被这 2 秒主导，从约 0.5 秒一轮掉到约 2.5 秒
+                # 一轮——45 分钟预算能覆盖的安装进度少五倍，直接推高撞 timeout
+                # 的概率。drive() 本来就有预算，晚 10 秒发现服务起来没有任何代价。
+                if time.time() >= next_probe:
+                    next_probe = time.time() + PROBE_EVERY_SECONDS
+                    if service_ready(vm, timeout=PROBE_TIMEOUT):
+                        say(f"客人机服务已就绪，安装完成（自动操作了 {acts} 步）")
+                        return "done"
                 try:
                     # 平时只要变化的那一块，QEMU 就不用每轮把整块显存编一遍推过来
                     # （见 request_incr 的说明）。每隔 RESYNC_EVERY 轮全屏要一次，
@@ -1032,9 +1114,29 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                 if last_sig is None or not same_screen(sig, last_sig):
                     last_sig, last_at = sig, time.time()
                     still += 1
+                    unstable += 1
                     time.sleep(0.8 if still >= 4 else 0.4)
+                    # 画面每轮都变时，这个分支会一直 continue 下去——而下面那个
+                    # 「同一屏试过几种办法」的熔断器排在它后面，根本走不到。
+                    # 安装器屏幕上只要有一个每轮都变的东西（不确定进度条、闪烁的
+                    # 光标、角落的时钟、滚动日志窗），same_screen 恒为假，于是
+                    # 一个动作都不做、一行日志都不打，一路转到 budget 用完返回
+                    # timeout。用户无法区分「安装器在转」和「驱动器死了」，而
+                    # budget 是唯一的刹车。
+                    # 2026-11-11 审计补上：连续不稳定到 UNSTABLE_WARN_ROUNDS 先
+                    # 打一行心跳（让人知道它还活着、在等什么），到
+                    # UNSTABLE_GIVE_UP 就退成 manual 并把原因说清楚。
+                    if unstable == UNSTABLE_WARN_ROUNDS:
+                        say(f"画面已经连续 {unstable} 轮在变，还在静默等它稳下来"
+                            f"（进度条一直动的安装器就是这样，属正常）", "warn")
+                    if unstable >= UNSTABLE_GIVE_UP:
+                        save_frame(vdir, acts, got, rfb.w, rfb.h)
+                        say(f"画面连续 {unstable} 轮没稳过，判断不出该点哪里。"
+                            f"自动安装停下来，剩下的请您在画面里点完", "warn")
+                        return "manual"
                     continue
                 still = 0
+                unstable = 0
                 if time.time() - last_at < SETTLE_SECONDS:
                     time.sleep(0.3)
                     continue
@@ -1068,14 +1170,14 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                 tried = mem.times_tried(sig)
                 if tried == 0:
                     say("按回车（默认按钮）")
-                    save_frame(vdir, acts, got, rfb.w, rfb.h)
+                    stash(got)
                     rfb.key_tap(KEY_RETURN)
                 elif tried == 1 and btn is not None:
                     say(f"回车没推进，改点主按钮 ({btn[0]},{btn[1]})")
-                    save_frame(vdir, acts, got, rfb.w, rfb.h)
+                    stash(got)
                     rfb.click(*btn)
                 else:
-                    save_frame(vdir, acts, got, rfb.w, rfb.h)
+                    stash(got)
                     say("回车和点按钮都试过了，屏幕还是没动。"
                         "自动安装停下来，剩下的请您在画面里点完", "warn")
                     return "manual"
