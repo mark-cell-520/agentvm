@@ -233,6 +233,16 @@ case "check":
     if v.majorVersion < 12 {
         MacEmit.log("macOS 12 以下没有 VZMacOSRestoreImage，装不了 macOS 客人机。", level: "warn")
     }
+    // **退出码必须反映检查结果。** 原来是打完 JSON 就往下走，退出码恒为 0——
+    // 而 install.sh 装完跑的是 `vmz check >/dev/null 2>&1` 只看退出码，
+    // app/build.sh 里也一样。于是一份没有 com.apple.security.virtualization
+    // 权利的裸二进制，两个脚本都报「check 通过」，用户到点安装时才死在
+    // 「restore image catalog failed to load」。2026-11-11 实测踩到：
+    // 未签名那份的 check 输出里 entitlement 明写 ok:false，退出码却是 0。
+    //
+    // 只让 entitlement 这一项决定退出码：另外两项（核数、系统版本）在这一行
+    // 之前就已经各自 warn 过，而且它们不是「装完了但跑不起来」那类静默故障。
+    if !ent.ok { exit(1) }
     #else
     MacEmit.error("只在 Apple Silicon 的 Mac 上有效。")
     #endif

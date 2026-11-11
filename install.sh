@@ -68,9 +68,17 @@ if command -v swiftc >/dev/null 2>&1; then
                 --force "$VMBIN/vmz" 2>>"$VMZ_LOG"; then
             # 跑一次 check 确认它真的能起来。签名过的 Mach-O 也可能因为
             # 别的原故起不来（库缺失、架构不符），而「文件在那儿」不等于能用。
-            if "$VMBIN/vmz" check >/dev/null 2>&1; then
+            #
+            # **判据是 JSON 里有没有 ok:false，不是退出码。** `vmz check` 原来
+            # 打完 JSON 就退出 0，哪怕 entitlement 那一项明写 ok:false——这个
+            # `>/dev/null 2>&1` 因此从来没真正验到过东西，一份裸二进制也能走到
+            # 「check 通过」那一行。2026-11-11 实测踩到。源码里已经改成退出码
+            # 非零，这里仍然解析输出：不能自己也被同一个坑骗过去。
+            if vmz_out="$("$VMBIN/vmz" check 2>>"$VMZ_LOG")" \
+                    && ! printf '%s' "$vmz_out" | grep -q '"ok":false'; then
                 ok "vmz 已装到 $VMBIN/vmz（check 通过）"
             else
+                printf '%s\n' "$vmz_out" | sed 's/^/    /' >&2
                 warn "vmz 装好了但 check 跑不通，macOS 虚拟机可能用不了"
                 warn "详见 $VMZ_LOG"
                 rm -f "$VMBIN/vmz"

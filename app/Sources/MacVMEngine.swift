@@ -1813,8 +1813,20 @@ func macAssertPortsFree(_ forwards: [MacVMForward]) throws {
 /// 已经等了几十分钟，而「空间不够」这件事在开始之前花一次 statfs 就知道。
 ///
 /// 估法：镜像（本地文件按精确大小；远程按 UniversalMac IPSW 的实测值
-/// 25.6 GB 估）+ 系统盘标称大小。快照和克隆走 clonefile，底册共用，
+/// 25.6 GB 估）+ 系统盘**实际会写入的量**。快照和克隆走 clonefile，底册共用，
 /// 不额外算。
+///
+/// **系统盘不能按标称大小算。** 2026-11-11 实测踩到：这里原来是
+/// `macParseSize(spec.disk)`，也就是 catalog 里的 80G，于是 80G + 25.6G
+/// 要求 85.9 GB 空闲——而这块盘是 `truncate` 建的稀疏盘，标称大小不占空间，
+/// 实测装完只写 27 GB。后果是一台剩 39.5 GB 的机器（明明装得下）被这句
+/// 「磁盘空间不够」挡住，而错误信息里还写着「镜像 Zero KB + 系统盘 85.9 GB」，
+/// 看不出是估法错了。vmkit 那边（cmd_install_macos）一直按 28 GB 估，
+/// 两边差三倍，注释里却写着「两边一致」。
+///
+/// 取标称和实测估算里小的那个：稀疏盘写爆的概率远小于「被误报挡住装不上」，
+/// 而且真写爆时后面的下载和建盘会给出真正的 ENOSPC，那时候信息是准的。
+let MAC_DISK_WRITE_ESTIMATE: UInt64 = 30 * 1024 * 1024 * 1024
 func macAssertFreeSpace(ipsw: UInt64, disk: UInt64) throws {
     let root = MacVMPaths.root
     let free = (try? root.resourceValues(forKeys: [.volumeAvailableCapacityKey]))
@@ -1859,7 +1871,8 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
         // 本地镜像的大小是精确的，照它算。
         let ipswSize = (try? FileManager.default
             .attributesOfItem(atPath: ipswPath.path)[.size] as? UInt64) ?? 0
-        try macAssertFreeSpace(ipsw: ipswSize, disk: macParseSize(spec.disk))
+        try macAssertFreeSpace(ipsw: ipswSize,
+                             disk: min(macParseSize(spec.disk), MAC_DISK_WRITE_ESTIMATE))
         MacEmit.stage("catalog", "读取本地恢复镜像")
         // 用户自己那份也登记进全局缓存：硬链一份过去，0 字节，
         // 而下一台 macOS 虚拟机就不用再下 25.6 GB。原文件不动。
@@ -1883,7 +1896,7 @@ func macInstall(spec: MacVMSpec, ipswLocal: String?,
         // 宁可多估，也别让用户下到 90% 才失败。
         try macAssertFreeSpace(
             ipsw: macDownloadedBytes(ipswPath) > 0 ? 0 : 26 * 1024 * 1024 * 1024,
-            disk: macParseSize(spec.disk))
+            disk: min(macParseSize(spec.disk), MAC_DISK_WRITE_ESTIMATE))
         if macDownloadedBytes(ipswPath) == 0 {
             MacEmit.stage("download", "下载 \(remote.lastPathComponent)")
             // 单连接，不是并发：实测 Apple CDN 上加连接只会把每条的份额摊薄，

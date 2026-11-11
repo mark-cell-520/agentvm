@@ -414,5 +414,78 @@ class TestParseSize(unittest.TestCase):
         self.assertGreater(vm.parse_size("99999999999G"), 0)
 
 
+
+
+class TestVmzSelfCheck(Sandbox):
+    """`vmkit check` 里 vmz 那一项：必须真的跑一次自检，而不是只确认文件在。
+
+    2026-11-11 实测的教训：app/build.sh 当时只编译不 codesign，产出的
+    scripts/vmz/vmz 是一份没有 com.apple.security.virtualization 权利的裸二进制，
+    而 find_vmz() 按 mtime 取最新候选，它赢过了 install.sh 签过的那份。这时候
+    check 里这一项报的是 ok、detail 是路径，用户看着一片绿去点安装，然后死在
+    「restore image catalog failed to load」——一句看不出是权限问题的话。
+
+    两个坑叠在一起才造成这个结果，两条都要防：
+      1. 只查文件存在（原来是 `"ok": vz is not None`）。
+      2. 只看得退出码。`vmz check` 原来打完 JSON 就退出 0，哪怕里面 entitlement
+         那一项明写 ok:false——所以「跑一次 check」在源码修好之前是无效的。
+    """
+
+    def _fake_vmz(self, body: str, code: int) -> Path:
+        """一个假 vmz：打印给定 JSON、按给定码退出。"""
+        p = self.tmp / "fake-vmz"
+        p.write_text(f"#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\nexit {code}\n")
+        p.chmod(0o755)
+        return p
+
+    def _check_vmz_item(self, fake: Path):
+        """把 AGENTVM_VMZ 指到假 vmz，跑 check，返回那一项。"""
+        old = os.environ.get("AGENTVM_VMZ")
+        os.environ["AGENTVM_VMZ"] = str(fake)
+        try:
+            info = vm.check_data()
+        finally:
+            if old is None:
+                os.environ.pop("AGENTVM_VMZ", None)
+            else:
+                os.environ["AGENTVM_VMZ"] = old
+        return info
+
+    def test_a_vmz_whose_selfcheck_fails_is_not_reported_ok(self):
+        """自检输出里有 ok:false，这一项必须 FAIL——哪怕退出码是 0。"""
+        bad = ('{"t":"check","items":['
+               '{"name":"Apple Silicon","ok":true,"detail":"12 核"},'
+               '{"name":"entitlement","ok":false,'
+               '"detail":"签名里没有 com.apple.security.virtualization"}]}')
+        fake = self._fake_vmz(bad, 0)          # 退出码 0，和真 vmz 修好前一样
+        info = self._check_vmz_item(fake)
+        self.assertFalse(info["vmz_ok"], "自检不过却被判成 ok")
+        item = [i for i in info["items"] if "vmz" in i["name"]][0]
+        self.assertFalse(item["ok"])
+        # 失败原因要说出来，不能只说「自检不过」——entitlement 这个词必须出现，
+        # 否则用户还是不知道要去重新签名。
+        self.assertIn("entitlement", item["detail"])
+
+    def test_a_healthy_vmz_is_still_ok(self):
+        """反向：真能用的 vmz 不能被这条判据误杀。"""
+        good = ('{"t":"check","items":['
+                '{"name":"Apple Silicon","ok":true,"detail":"12 核"},'
+                '{"name":"entitlement","ok":true,'
+                '"detail":"com.apple.security.virtualization（签名里有）"}]}')
+        fake = self._fake_vmz(good, 0)
+        info = self._check_vmz_item(fake)
+        self.assertTrue(info["vmz_ok"])
+        item = [i for i in info["items"] if "vmz" in i["name"]][0]
+        self.assertTrue(item["ok"])
+
+    def test_a_vmz_that_exits_nonzero_is_not_ok(self):
+        """源码改好之后退出码也非零了，这条路径同样要红。"""
+        bad = ('{"t":"check","items":['
+               '{"name":"entitlement","ok":false,"detail":"没有权利"}]}')
+        fake = self._fake_vmz(bad, 1)
+        info = self._check_vmz_item(fake)
+        self.assertFalse(info["vmz_ok"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

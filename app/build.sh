@@ -92,6 +92,44 @@ else
     echo "    vmz 编译失败（退出码 ${vmz_status}）。Windows/Linux 不受影响，macOS 虚拟机用不了。"
     rm -f "$VMBIN"
 fi
+
+# **必须签名，而且必须带 entitlements。** 2026-11-11 实测：这个脚本原来只编译、
+# 不 codesign，于是 scripts/vmz/vmz 是一份没有 com.apple.security.virtualization
+# 权利的裸二进制，而 find_vmz() 是按 mtime 取最新的候选——build.sh 一跑，它产出
+# 的这份就赢过 install.sh 装到 ~/.agentvm/bin/vmz 的那份（那份是签过的），
+# 之后 `install --distro macos-27` 一律失败在
+# 「restore image catalog failed to load. Installation service returned an
+# unexpected error」，而这句话看不出是权限问题。install.sh 里同一段逻辑的注释
+# 早就写明「没有这一条 entitlement 签名，VZMacOSRestoreImage 就跑不了」，
+# 漏的是这边。
+#
+# 签名用 -s -（ad-hoc）：本机自用不需要开发者证书，权利声明照样生效。
+if [ -f "$VMBIN" ]; then
+    if codesign -s - --entitlements "$ROOT/app/Resources/entitlements.plist" \
+            --force "$VMBIN" 2>>"$vmz_log"; then
+        # 签完立刻自检，和 install.sh 一样。check 跑不通的 vmz 留着比没有更糟：
+        # vmkit 的 check 只确认文件存在，会报「ok」，然后把故障推迟到用户点安装。
+        #
+        # **判据是 JSON 里有没有 ok:false，不是退出码。** `vmz check` 原来打完
+        # JSON 就退出 0，哪怕 entitlement 那一项是 false——install.sh 里
+        # `vmz check >/dev/null 2>&1` 因此从来没真正验到过东西。源码里已经改成
+        # 退出码非零，但这里仍然解析输出：用户机器上可能还是一份旧 vmz，
+        # 而这段是自检，不能自己也被同一个坑骗过去。
+        if vmz_out="$("$VMBIN" check 2>>"$vmz_log")" \
+                && ! printf '%s' "$vmz_out" | grep -q '"ok":false'; then
+            echo "    vmz 已签名并自检通过"
+        else
+            sed 's/^/    /' "$vmz_log"
+            printf '%s\n' "$vmz_out" | sed 's/^/    /'
+            echo "    vmz 签名了但自检不过，删掉（macOS 虚拟机用不了）"
+            rm -f "$VMBIN"
+        fi
+    else
+        sed 's/^/    /' "$vmz_log"
+        echo "    vmz 签名失败，删掉（留着会让 vmkit 以为装好了）"
+        rm -f "$VMBIN"
+    fi
+fi
 # 拷进 app 之前先确认它真是个 Mach-O。上面已经 rm 过残文件，这里是第二道：
 # 万一编译「成功」而输出不是可执行文件（磁盘满时 ld 会留一个空文件），
 # 拷进去用户拿到的是一个跑不起来的 vmz，而报错在很远的将来。

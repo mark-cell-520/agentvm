@@ -553,7 +553,13 @@ def verify(path: Path, distro: dict) -> None:
 
 # ------------------------------------------------------------ 环境检查 --
 
-def cmd_check() -> int:
+def check_data() -> dict:
+    """把宿主机能不能跑虚拟机查一遍，返回那个 dict。
+
+    和 cmd_check 分开是为了能单测：原来这里连着「打印 JSON 并返回退出码」，
+    而测试要断言的正是里面某一项是 ok 还是 FAIL（vmz 那一项，见
+    TestVmzSelfCheck）。拆开之后测试直接拿 dict，不用去解析 stdout。
+    """
     info: dict = {"ok": True, "arch": platform.machine(), "items": []}
     if platform.machine() != "arm64":
         info["ok"] = False
@@ -585,11 +591,51 @@ def cmd_check() -> int:
     # com.apple.security.virtualization entitlement 的 Swift 小程序。
     # 找不到 vmz 的时候不能把整个 check 判失败——那会让 Windows/Linux
     # 用户看到一片红，而他们压根不需要这个。
+    #
+    # **光确认文件存在是不够的。** 2026-11-11 实测：app/build.sh 当时只编译不
+    # 签名，产出的 scripts/vmz/vmz 是一份没有 entitlement 的裸二进制，而
+    # find_vmz 按 mtime 取最新，它赢过了 install.sh 签过的那份。这时候这一项
+    # 报的是 ok、detail 是路径，用户看着全绿去点安装，然后死在
+    # 「restore image catalog failed to load」。所以这里真的跑一次 `vmz check`：
+    # 那个子命令就是用来验 entitlement 和 VZ 可用性的（install.sh 装完也跑它）。
     vz = find_vmz()
     info["vmz"] = str(vz) if vz else None
+    if vz is None:
+        vz_ok, vz_detail = False, "未安装。macOS 虚拟机需要它，另外两种不受影响"
+    else:
+        try:
+            r = subprocess.run([str(vz), "check"], capture_output=True,
+                               text=True, timeout=60)
+            # **解析 JSON，不看退出码。** `vmz check` 原来打完 JSON 就退出 0，
+            # 哪怕里面 entitlement 那一项是 ok:false——所以「跑一次 check」这件事
+            # 在源码修好之前是无效的，一份没有 com.apple.security.virtualization
+            # 权利的裸二进制会被判成 ok。2026-11-11 实测：未签名那份的 check
+            # 输出里 entitlement 明写 false，退出码是 0。
+            bad = []
+            try:
+                rep = json.loads(r.stdout.strip().splitlines()[-1]
+                                 if r.stdout.strip() else "{}")
+                bad = [i for i in rep.get("items", []) if not i.get("ok")]
+            except (ValueError, AttributeError):
+                bad = []
+            vz_ok = not bad and r.returncode == 0
+            if vz_ok:
+                vz_detail = str(vz)
+            else:
+                vz_detail = (f"{vz} 自检不过，macOS 虚拟机用不了"
+                             f"（重跑 install.sh 或 app/build.sh 重新编译签名）")
+                if bad:
+                    vz_detail += "：" + "；".join(
+                        f"{i.get('name')} {str(i.get('detail'))[:80]}" for i in bad)
+                elif (r.stdout + r.stderr).strip():
+                    vz_detail += "：" + (r.stdout + r.stderr).strip().splitlines()[0][:120]
+        except (OSError, subprocess.SubprocessError) as e:
+            vz_ok, vz_detail = False, f"{vz} 跑不起来：{e}"
     info["items"].append({
-        "name": "vmz（macOS 客人机）", "ok": vz is not None,
-        "detail": str(vz) if vz else "未安装。macOS 虚拟机需要它，另外两种不受影响"})
+        "name": "vmz（macOS 客人机）", "ok": vz_ok, "detail": vz_detail})
+    # 这一项单独失败不把整个 check 判红：装 Windows/Linux 的人不需要 vmz。
+    # 但要记下来，让「全绿却装不了 macOS」这种事在现场就能看出来。
+    info["vmz_ok"] = vz_ok
 
     df = shutil.disk_usage(HOME)
     free = df.free
@@ -618,6 +664,11 @@ def cmd_check() -> int:
     else:
         info.setdefault("macos_free_ok", True)
 
+    return info
+
+
+def cmd_check() -> int:
+    info = check_data()
     Emit._w({"t": "check", **info})
     return 0 if info["ok"] else 1
 
@@ -3115,20 +3166,38 @@ def cmd_install_macos(vm: dict, distro: dict, ipsw: str | None = None) -> dict:
     # 磁盘要先看一眼。原来一律按 60 GB 估：25.6 GB 镜像 + 装完三十多 GB。
     # 但镜像现在有全局缓存（~/.agentvm/images/ipsw），缓存命中的话这一次只占
     # 系统盘那一份，实测 27 GB——照 60 GB 估会把「够用」报成「可能失败」。
-    # vmz 那边自己也会用同一份缓存再判一次，两边一致。
+    # （这句「vmz 那边自己也会用同一份缓存再判一次，两边一致」原来写在这儿，
+    # 而实测两边差三倍：vmz 当时按标称盘大小 80 GB 算。已对齐，见下面。）
     # catalog 里 macOS 条目的 url 是空的（地址运行时才问 Apple 要），所以不能
     # 用 distro["url"] 推文件名，直接看缓存目录里有没有东西。
     def _ipsw_present() -> bool:
         if ipsw and Path(ipsw).expanduser().is_file():
             return True
-        for d in (IMAGES / "ipsw", vm_dir(name) / "ipsw"):
+        # **是 vm["name"]，不是 name。** 这个函数的签名是 (vm, distro, ipsw)，
+        # 没有 name 这个局部变量——写成裸 name 就是 NameError，而它就在本函数
+        # 开头第三行，`install --distro macos-27` 一跑必炸，连 vmz 都起不来。
+        # 实测：2026-11-11 第一次真装 macOS 虚拟机时抓到，堆栈直指下面这行。
+        # 同一处上面那段注释说「ipsw 是参数传进来的，不是函数里读 args……
+        # 实测踩过，NameError 裸栈到用户脸上」——那一处修了，这一处漏了，
+        # 因为全仓库从来没有真跑过这条路径（cloud-init 和应答文件那两条路
+        # 有测试覆盖，macOS 这条没有）。
+        for d in (IMAGES / "ipsw", vm_dir(vm["name"]) / "ipsw"):
             if d.is_dir():
                 for f in d.iterdir():
                     if f.is_file() and f.stat().st_size > 0:
                         return True
         return False
     ipsw_cached = _ipsw_present()
-    disk_actual = 28 << 30      # 实测装完写入约 27 GB，留点余量
+    # 30 GB，和 vmz 那边的 MAC_DISK_WRITE_ESTIMATE 取同一个数。
+    #
+    # 原来是 28 GB（实测装完写入约 27 GB，留点余量），而 vmz 那边按**标称盘大小**
+    # 80 GB 算——两边差三倍，这段注释却写着「vmz 那边自己也会用同一份缓存再判
+    # 一次，两边一致」。2026-11-11 实测：一台剩 39.5 GB 的机器上，vmkit 这边
+    # 判「够用」往下走，vmz 那边一句「磁盘空间不够：还需要约 85.9 GB（镜像
+    # Zero KB + 系统盘 85.9 GB）」把整个安装毙掉，而用户根本看不出来是估法错了。
+    # 系统盘是 truncate 建的稀疏盘，标称大小不占空间，写爆的概率远小于被误报
+    # 挡住——所以两边都改成按实际写入量估，并且用同一个数。
+    disk_actual = 30 << 30      # 实测装完写入约 27 GB，留余量
     need = disk_actual if ipsw_cached else (disk_actual + distro["size"])
     free = shutil.disk_usage(HOME).free
     if free < need:
