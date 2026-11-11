@@ -54,6 +54,7 @@ import importlib.util
 import os
 import platform
 import shutil
+import shlex
 import socket
 import subprocess
 import sys
@@ -963,11 +964,19 @@ def free_vnc_display(cfg: Cfg) -> int:
 
 
 def recorded_vnc_display(cfg: Cfg) -> int:
-    """QEMU 实际在用的 display 号。没有记录（VM 没起过）时才退回重新探。"""
+    """QEMU 实际在用的 display 号。没有记录时退回配置里那个号，**不重新探**。
+
+    原来回退去调 free_vnc_display()，而它是会写盘的（它自己的注释就写着：
+    启动时探到的空闲只是「那一刻」的空闲，写盘才是为了让 status 报的和 QEMU
+    实际监听的一致）。于是 snapshot restore 刚删掉的 vnc.display——它注释里
+    写明「留着会让 status 报一个已经不监听的端口」——被下一次**只读**的 status
+    又写回来，用户照 status 给的端口连上去什么都没有。一次查询把一次清理
+    撤掉了，2026-11-11 审计实测复现。只读的路径不能写盘。
+    """
     try:
         return int(cfg.vnc_display_file.read_text().strip())
     except (OSError, ValueError):
-        return free_vnc_display(cfg)
+        return int(cfg.vnc_display)
 
 
 def qemu_running(cfg: Cfg) -> int | None:
@@ -1496,6 +1505,15 @@ def cmd_autostart(cfg: Cfg, disable: bool = False) -> None:
     script = Path(__file__).resolve()
 
     wrapper.parent.mkdir(parents=True, exist_ok=True)
+    # **三个插值点全部要 shlex.quote。** 原来原样写进 wrapper，而 wrapper 是
+    # 被 launchd 当 /bin/sh 脚本执行的：vm_dir 里带一个双引号就能把后面的
+    # export 行闭合并接上任意命令，每次登录都会跑一遍。危害仅限命令行自伤
+    # （只有本机用户自己能传 --vm-dir），但同一个仓库的 vmkit.cmd_autostart
+    # 对这一类是挡的（见它 4922 行的注释：「命令行自伤面，但仍然要挡」），
+    # 所以这是漏挡，不是取舍。2026-11-11 审计补上。
+    q_vm_dir = shlex.quote(str(cfg.vm_dir))
+    q_py = shlex.quote(str(py))
+    q_script = shlex.quote(str(script))
     wrapper.write_text(f"""#!/bin/sh
 # 由 launchd 调用的 winarm VM 启动包装。不要手工改，
 # `winarm-vm.py autostart` 会重写它。
@@ -1505,7 +1523,7 @@ def cmd_autostart(cfg: Cfg, disable: bool = False) -> None:
 # 日志里只剩一行 exec 失败，看不出是路径问题。
 export PATH="{hb}/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOMEBREW_PREFIX="{hb}"
-export VM_DIR="{cfg.vm_dir}"
+export VM_DIR={q_vm_dir}
 # HEADLESS=0 让 QEMU 用 Cocoa 前端开一个原生 macOS 窗口。VM 就在本机，没必要
 # 绕 VNC 或远程桌面。ramfb 仍然保留，Windows 靠它出图；不想每次登录都弹窗口
 # 就把这行改成 1，或直接用 `winarm-vm.py start` 手工起。
@@ -1514,7 +1532,7 @@ export HEADLESS="0"
 # stdin 读会直接 EOF 退出。
 # --foreground 让这个进程堵到 QEMU 退出为止，launchd 的 KeepAlive 才监护
 # 得到真正干活的那个进程，而不是监护一个早就退出的启动器。
-exec "{py}" "{script}" start --foreground < /dev/null
+exec {q_py} {q_script} start --foreground < /dev/null
 """)
     wrapper.chmod(0o755)
 

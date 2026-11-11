@@ -104,6 +104,7 @@ stop: ## Stop the VM (autostart 装过的话重启后会再起来，见 autostar
 test: ## Unit-test the auto-install driver and the vmkit audit fixes (offline, no VM)
 	@python3 -I scripts/test-autoinstall.py
 	@python3 -I scripts/test-vmkit-audit.py
+	@python3 -I scripts/test-vmkit-commands.py
 
 lint: ## Syntax-check every script
 	@bash scripts/lint-wide-punct.sh

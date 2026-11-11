@@ -55,6 +55,7 @@ stdout 每行一个 JSON 对象，界面直接解析：
     vmkit.py delete --name d1
     vmkit.py open --name d1              把虚拟机窗口带到前台
     vmkit.py autostart --name d1 [--disable]
+    vmkit.py prune [--name d1] [--apply]  找出 VM 目录里没人认领的大文件
 """
 
 from __future__ import annotations
@@ -404,6 +405,17 @@ def _save_vm_impl(vm: dict) -> None:
 
 
 def all_vms() -> list[dict]:
+    """所有虚拟机的 vm.json。
+
+    **和 load_vm 一样要防着一半的配置。** 原来这里只捕 JSONDecodeError，而
+    read_text 的 OSError（权限、文件正在被替换）和「合法 JSON 但不是对象」
+    （内容是 `[]` 或 `"x"`）都能直接把 list / status / configure 打穿：
+    实测一份内容为 `[]` 的 vm.json 让 `vmkit list` 甩
+    `AttributeError: 'list' object has no attribute 'get'`，stdout 上一个事件
+    都没有，而其他 VM 都好的——用户想用 list 定位是哪台坏了，偏偏是 list 先死。
+    load_vm 早就为这种文件加了 isinstance 检查和 name 兜底（见它的注释），
+    这条路径漏了。2026-11-11 审计补上。
+    """
     out = []
     if not VMS.is_dir():
         return out
@@ -411,9 +423,13 @@ def all_vms() -> list[dict]:
         f = p / "vm.json"
         if f.is_file():
             try:
-                out.append(json.loads(f.read_text()))
-            except json.JSONDecodeError:
+                data = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError, ValueError):
                 continue
+            if not isinstance(data, dict):
+                continue
+            data.setdefault("name", p.name)
+            out.append(data)
     return out
 
 
@@ -1580,15 +1596,15 @@ def share_args(vm: dict) -> list[str]:
 
 def linux_qemu_args(vm: dict) -> list[str]:
     code, vars_tmpl = find_edk2()
-    d = vm_dir(vm["name"])
+    d = vm_dir(_vm_field(vm, "name"))
     seed = d / "seed.iso"
     args = [
-        "-name", vm["name"],
+        "-name", str(_vm_field(vm, "name")),
         "-accel", "hvf",
         "-cpu", "host",
         "-M", "virt,highmem=on",
-        "-m", vm["ram"],
-        "-smp", str(vm["cpus"]),
+        "-m", str(_vm_field(vm, "ram")),
+        "-smp", str(_vm_field(vm, "cpus")),
         # UEFI：code 只读共用，vars 每个 VM 私有可写
         "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
         "-drive", f"if=pflash,format=raw,file={d / 'efi-vars.fd'}",
@@ -1901,14 +1917,14 @@ def linux_ssh_ready(vm: dict, timeout: float = 8) -> bool:
     QEMU 的 hostfwd 在 VM 启动那一刻就把宿主机侧端口绑好了，nc -z 必然通，
     跟客人机起没起来无关。只有真登录成功才算就绪。
     """
-    key = vm["ssh_key"]
+    key = _vm_field(vm, "ssh_key")
     r = subprocess.run(
-        [find_tool("ssh"), "-i", key, "-p", str(vm["ssh_port"]),
+        [find_tool("ssh"), "-i", key, "-p", str(_vm_field(vm, "ssh_port")),
          "-o", "StrictHostKeyChecking=no",
          "-o", "UserKnownHostsFile=/dev/null",
          "-o", f"ConnectTimeout={int(timeout)}",
          "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
-         f"{vm['user']}@127.0.0.1", "true"],
+         f"{_vm_field(vm, 'user')}@127.0.0.1", "true"],
         capture_output=True, text=True)
     return r.returncode == 0
 
@@ -3283,6 +3299,22 @@ def resolve_headless(vm: dict, args) -> bool:
     return want
 
 
+def _vm_field(vm: dict, key: str):
+    """取 vm.json 里的字段，缺了给一句能照着做的话，不是一段 Python 堆栈。
+
+    load_vm 只给 name 和 kind 补默认值，而 vm.json 是会被写一半的（见
+    load_vm 的注释：手改、旧版本、别的入口都能产出缺字段的文件）。原来
+    winarm_env / linux_ssh_ready / linux_qemu_args 里直接下标，
+    `vmkit start --name win11` 遇到缺 ram 的文件甩一段 KeyError 到用户脸上，
+    而用户只是想启动一台机器。2026-11-11 审计补上。
+    """
+    if key not in vm or vm[key] is None:
+        die(f"虚拟机 {vm.get('name', '?')} 的配置里缺 {key} 这一项"
+            f"（{vm_dir(vm.get('name', '')) / 'vm.json'}）。\n"
+            f"用 configure 把它补上，或者删掉这台重新 install。")
+    return vm[key]
+
+
 def winarm_env(vm: dict, headless: bool) -> dict:
     """给 winarm-vm.py 准备环境变量。
 
@@ -3295,15 +3327,15 @@ def winarm_env(vm: dict, headless: bool) -> dict:
     每次 stop 都固定复现：先卡 90 秒，再丢客人机未落盘数据。
     """
     return {
-        "VM_DIR": str(vm_dir(vm["name"])),
-        "RAM_SIZE": vm["ram"],
-        "CPU_CORES": str(vm["cpus"]),
-        "USERNAME": vm["user"],
-        "PASSWORD": vm["password"],
-        "SSH_KEY": vm["ssh_key"],
-        "SSH_PORT": str(vm["ssh_port"]),
-        "RDP_PORT": str(vm["rdp_port"]),
-        "VNC_DISPLAY": str(vm["vnc_display"]),
+        "VM_DIR": str(vm_dir(_vm_field(vm, "name"))),
+        "RAM_SIZE": str(_vm_field(vm, "ram")),
+        "CPU_CORES": str(_vm_field(vm, "cpus")),
+        "USERNAME": str(_vm_field(vm, "user")),
+        "PASSWORD": str(_vm_field(vm, "password")),
+        "SSH_KEY": str(_vm_field(vm, "ssh_key")),
+        "SSH_PORT": str(_vm_field(vm, "ssh_port")),
+        "RDP_PORT": str(_vm_field(vm, "rdp_port")),
+        "VNC_DISPLAY": str(_vm_field(vm, "vnc_display")),
         "HEADLESS": "1" if headless else "0",
     }
 
@@ -3535,18 +3567,33 @@ def cmd_stop(args) -> int:
         return 0
     if linux_ssh_ready(vm, timeout=5):
         log("SSH 可达，走客人机自己的关机流程")
-        subprocess.run([find_tool("ssh"), "-i", vm["ssh_key"],
-                        "-p", str(vm["ssh_port"]),
-                        "-o", "StrictHostKeyChecking=no",
-                        "-o", "UserKnownHostsFile=/dev/null",
-                        "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
-                        f"{vm['user']}@127.0.0.1", "sudo shutdown -h now"],
-                       capture_output=True, text=True)
-        for _ in range(120):
-            time.sleep(1)
-            if not qemu_pid(vm):
-                ok("已优雅关机")
-                return 0
+        # **返回码要看。** 原来 subprocess.run 的返回值整个丢掉了：登录用户
+        # 没有免密 sudo 时，ssh 连得上、`linux_ssh_ready` 探测也过（它跑的
+        # 是 `true`，不需要 sudo），可关机命令实际是失败的，客人机回一句
+        # "agent is not in the sudoers file"——vmkit 无视它，照旧进入下面那个
+        # 120 秒轮询，等满再落 ACPI 等 60 秒，最后 kill -9。每次 stop 固定卡
+        # 3 分钟左右，末尾还落一句「优雅关机超时，强杀。qcow2 可能留下脏数据」，
+        # 而真相是第一句命令就没执行成。winarm-vm.py 同一段是查 returncode 的。
+        # 2026-11-11 审计补上。
+        r = subprocess.run([find_tool("ssh"), "-i", str(_vm_field(vm, "ssh_key")),
+                            "-p", str(_vm_field(vm, "ssh_port")),
+                            "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null",
+                            "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
+                            f"{_vm_field(vm, 'user')}@127.0.0.1",
+                            "sudo shutdown -h now"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            for _ in range(120):
+                time.sleep(1)
+                if not qemu_pid(vm):
+                    ok("已优雅关机")
+                    return 0
+        else:
+            # 关机命令没执行成：不进那个 120 秒的干等，直接降级到 ACPI。
+            msg = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:200]
+            warn(f"SSH 关机命令失败（退出码 {r.returncode}）{msg}")
+            warn("常见原因是这个登录用户没有免密 sudo。改走 ACPI 电源键事件。")
     d = vm_dir(vm["name"])
     mon = d / "monitor.sock"
     if mon.exists():
@@ -3823,6 +3870,36 @@ def _next_disk_id(vm: dict) -> str:
     die("附加盘编号用完了（data1 到 data99）")
 
 
+class _VmWriteLock:
+    """同一台 VM 的「读-改-写」临界区，用法 `with _VmWriteLock(name):`。
+
+    configure / share / disk 三条路都是 load_vm → 改内存里的 dict →
+    save_vm 整体覆写。_save_vm_impl 是原子 replace，但替换掉的是整份文件、
+    不做合并：两个命令同时跑，后写的那个把前一个的改动整份吞掉。2026-11-11
+    审计实测：两条 configure 并发（一个改 cpu、一个改 mem），两条都输出
+    「已改」、退出码 0，最终 vm.json 里 cpu 那一项没了，而用户已经被告知改好了。
+    install 那条路早就有 flock（_claim_install_lock），这几条一直没有。
+
+    用 flock 而不是 O_CREAT|O_EXCL：这是要互相等的临界区，不是要抢占的锁。
+    """
+
+    def __init__(self, name: str) -> None:
+        self.path = vm_dir(name) / ".write.lock"
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+        return False
+
+
 def cmd_disk(args) -> int:
     """管理附加数据盘：加一块、摘一块、看有几块。
 
@@ -3832,8 +3909,17 @@ def cmd_disk(args) -> int:
     新盘是空的，客人机里还要分区格式化才能用：
     Linux `mkfs.ext4 /dev/vdb1` 再 mount，Windows 用磁盘管理初始化。
     """
-    vm = load_vm(args.name)
-    name = vm["name"]
+    # **load_vm 必须在锁里面。** 这条命令是「读 vm.json → 改 → 整份覆写」，
+    # 只锁写那一半没用：两个进程各拿一份旧副本进临界区，后保存的那个照样把
+    # 前一个的改动整份吞掉。见 _VmWriteLock 的注释。2026-11-11 审计补上。
+    if not vm_file(args.name).is_file():
+        die(f"没有这个虚拟机：{args.name}。用 list 看现有的。")
+    with _VmWriteLock(args.name):
+        vm = load_vm(args.name)
+        return _disk_impl(args, vm, vm["name"])
+
+
+def _disk_impl(args, vm: dict, name: str) -> int:
     disks = vm.setdefault("disks", [])
 
     if args.action == "list":
@@ -3862,8 +3948,19 @@ def cmd_disk(args) -> int:
         d = vm_dir(name)
         ext = "qcow2" if args.format == "qcow2" else "img"
         target = d / f"{did}.{ext}"
-        if target.exists():
-            die(f"{target} 已存在，换个虚拟机名或先删掉它")
+        # **exists() 不够，要连 is_symlink() 一起判。** 一个指向别处的悬空软链
+        # exists() 为假，接着 open(target,"wb") 会顺着它写到那个别处去。
+        if target.exists() or target.is_symlink():
+            # 这句话原来是死胡同：「换个虚拟机名或先删掉它」——文件就在这台 VM
+            # 的目录里，换虚拟机名一点用没有；而 disk remove 又只认 vm.json 里
+            # 登记过的项，报「没有叫 data1 的附加盘。现有的：（一个都没有）」。
+            # 上一次加盘中途死掉就会留下这种残文件，用户只能自己 rm。
+            die(f"{target} 已经在了。\n"
+                f"如果它是上一次加盘失败留下的残文件（vm.json 里没有这一项），"
+                f"先删掉它再重来：\n"
+                f"  rm -f {target}\n"
+                f"想先看看现在登记了哪些附加盘："
+                f"{_self_cmd()} disk list --name {name}")
         Emit.stage("disk", f"创建附加盘 {did}（{args.size}）")
         if args.format == "qcow2":
             run([find_tool("qemu-img"), "create", "-f", "qcow2",
@@ -3874,7 +3971,14 @@ def cmd_disk(args) -> int:
                 fh.truncate(want)
         disks.append({"id": did, "file": str(target), "format": args.format,
                       "bus": args.bus, "size": args.size.upper()})
-        save_vm(vm)
+        try:
+            save_vm(vm)
+        except OSError:
+            # 文件建了却没登记成功：把文件删掉，别留一个 vm.json 里没有的孤儿。
+            # 留着它，重试报「已存在」、disk remove 报「没有这一项」，两条路
+            # 都走不通，用户只能自己 rm。
+            target.unlink(missing_ok=True)
+            raise
         ok(f"已加附加盘 {did}：{target}（{args.size} {args.format}，"
            f"{args.bus}，稀疏，写到了才占空间）")
         if qemu_pid(vm):
@@ -4025,6 +4129,34 @@ def check_snapshot_tag(tag: str) -> str:
     return tag
 
 
+def _winarm_snapshot_list(vm: dict) -> list[dict]:
+    """Windows VM 的快照列表，字段形状和 qcow2 那条对齐（tag / size / date）。
+
+    为什么要在 vmkit 里自己数一遍：winarm 的 cmd_snapshot("list") 只用 print
+    打人话，没有结构化输出，而 app 的 handleSnapshots 只认
+    `{"t":"done","vm":{"snapshots":[{"tag":...}]}}`——缺 tag 字段整条事件就被
+    guard 丢掉。原来 Windows VM 在 app 的存储面板里永远显示「还没有快照」，
+    而 snapshots/base/ 明明在那儿；命令行用户也只拿到两行人话，没有机器可读
+    结果。2026-11-11 审计实测复现。
+    """
+    d = vm_dir(vm["name"]) / "snapshots"
+    out = []
+    if not d.is_dir():
+        return out
+    for p in sorted(q for q in d.iterdir() if q.is_dir()):
+        size = sum(f.stat().st_blocks * 512
+                   for f in p.iterdir() if f.is_file())
+        out.append({
+            "id": p.name,
+            "tag": p.name,
+            "size": human(size),
+            "date": time.strftime("%Y-%m-%d %H:%M:%S",
+                                  time.localtime(p.stat().st_mtime)),
+            "has_disk": (p / "data.img").is_file(),
+        })
+    return out
+
+
 def cmd_snapshot(args) -> int:
     """qcow2 内部快照：拍一张、列出来、回滚、删掉。
 
@@ -4068,6 +4200,18 @@ def cmd_snapshot(args) -> int:
     # 两边的词不一样：vmkit 说 create/apply，winarm 说 save/restore。
     # 映射在这儿做，别让用户记两套动词。
     if vm.get("kind") == "windows":
+        # list 要在 vmkit 这一侧发出结构化事件，见 _winarm_snapshot_list 的
+        # 注释：winarm 只 print 人话，app 那边一条都收不到。放在 winarm() 之前：
+        # 列快照根本不需要把 winarm 那个模块加载起来。
+        if args.action == "list":
+            snaps = _winarm_snapshot_list(vm)
+            if not snaps:
+                ok(f"{name} 还没有快照")
+            for sn in snaps:
+                ok(f"{sn['tag']}  {sn['size']}  {sn['date']}"
+                   + ("" if sn["has_disk"] else "  缺磁盘(坏)"))
+            Emit.done({"snapshots": snaps})
+            return 0
         w = winarm()
         os.environ.update(winarm_env(vm, True))
         act = {"create": "save", "apply": "restore"}.get(args.action, args.action)
@@ -4189,6 +4333,22 @@ def cmd_clone(args) -> int:
         rc = _relay(proc, "clone")
         if rc != 0:
             die(f"克隆失败（退出码 {rc}）")
+        # **克隆完了要补一份 vm.json。** 原来这里直接 return 0：vmz 只写自己的
+        # macvm.json，而 vmkit 的 list / status / start / configure 全认 vm.json
+        # （install 那条路因此专门补了 _macos_vm_stub，见它的注释）。漏了这一手
+        # 的后果是一台 25 GB 的孤儿：目录里什么都有，`vmkit list` 看不见它，
+        # `status --name mac2` 报「没有这个虚拟机」，只有 delete 因为额外认
+        # macvm.json 还能删。2026-11-11 审计实测复现。
+        stub = dict(src)
+        stub["name"] = new
+        # 附加盘不跟过去：vmz 的 clone 只克隆系统盘。把源盘的文件路径留在 stub
+        # 里意味着两台 VM 写同一块 raw 盘，那比没有更糟，所以摘掉并说一声。
+        if stub.get("disks"):
+            warn("macOS 虚拟机的克隆只带系统盘，附加盘没有跟过去"
+                 "（vmz 那边是整盘 clonefile）。")
+            stub["disks"] = []
+        save_vm(stub)
+        ok(f"已在 {vm_dir(new)} 写好配置，vmkit list 现在认它了")
         return 0
     if qemu_pid(src):
         die("源虚拟机正在运行，先 stop 再克隆——运行中复制出来的状态不一致。")
@@ -4265,21 +4425,46 @@ def cmd_clone(args) -> int:
     elif src_seed.is_file():
         shutil.copy2(src_seed, d_new / "seed.iso")
 
-    # 附加盘：qcow2 的再叠一层 overlay（和源共用底册），raw 的复制文件
+    # 附加盘：qcow2 的再叠一层 overlay（和源共用底册），raw 的复制文件。
+    #
+    # **每一步都要确认文件真的在那儿。** 原来三个命令全部 check=False 且返回码
+    # 一个都不看，然后无条件 moved.append(nd)、save_vm(vm)：源盘权限坏了、磁盘
+    # 满、跨卷失败时 clone 退出码 0、日志还打「已克隆成 X」，而新 VM 的 vm.json
+    # 记着一块不存在的盘。启动时 extra_disk_args 只在日志里 warn 一句「文件不在
+    # 了，跳过」，vm_broken 又不检查附加盘——list / status 显示一切正常，数据
+    # 静默消失。同一个函数里系统盘的 cp -c 是查了 returncode 的（见上面），
+    # 这段是漏的。2026-11-11 审计实测复现（源盘 chmod 000，克隆「成功」）。
     moved: list[dict] = []
     for d in src.get("disks", []):
-        f = Path(d["file"])
+        src_file = d.get("file")
+        if not src_file:
+            continue
+        f = Path(src_file)
         if not f.is_file():
             continue
         nd = dict(d)
         nd["file"] = str(d_new / f.name)
         if d.get("format") == "qcow2":
-            run([find_tool("qemu-img"), "create", "-f", "qcow2",
-                 "-b", str(f), "-F", "qcow2", nd["file"]], check=False)
+            r = run([find_tool("qemu-img"), "create", "-f", "qcow2",
+                     "-b", str(f), "-F", "qcow2", nd["file"]], check=False)
+            made = r.returncode == 0 and Path(nd["file"]).is_file()
         else:
             r = run(["cp", "-c", str(f), nd["file"]], check=False)
-            if r.returncode != 0:
-                run(["cp", str(f), nd["file"]], check=False)
+            made = r.returncode == 0 and Path(nd["file"]).is_file()
+            if not made:
+                # clonefile 失败（跨卷、目标文件系统不支持）再退回普通拷贝
+                r = run(["cp", str(f), nd["file"]], check=False)
+                made = r.returncode == 0 and Path(nd["file"]).is_file()
+        if not made:
+            # 不能带着一份记着不存在文件的 vm.json 往下走：那种 VM「配置齐全
+            # 但永远启动不了」，而 list / status 一路全绿。半成的克隆比没有更糟，
+            # 所以在这儿停下，让用户查清楚后删掉重来（--force 会清掉目标目录）。
+            die(f"附加盘 {d.get('id', f.name)} 没复制成功"
+                f"（{f} → {nd['file']}）。\n"
+                f"克隆停在半路上，{d_new} 现在是不完整的。\n"
+                f"查清原因后重跑，加 --force 清掉它：\n"
+                f"  {_self_cmd()} clone --name {src['name']}"
+                f" --new-name {new} --force")
         moved.append(nd)
 
     # 端口全部分配新的，免得两个 VM 抢同一个口
@@ -4332,10 +4517,20 @@ def cmd_share(args) -> int:
     macOS 走 VZ 也没有——原来两种都不挡，共享被静默记进 vm.json 而从不生效，
     界面显示「已共享」，用户在客人机里怎么也找不到那个目录。
     """
-    vm = load_vm(args.name)
-    if vm["kind"] != "linux":
-        die(f"共享目录只在 Linux 虚拟机上有效（virtio-9p）。"
-            f"{vm['kind']} 这条路的磁盘/共享参数表里没有它，记了也不会挂上。")
+    # **load_vm 必须在锁里面。** 这条命令是「读 vm.json → 改 → 整份覆写」，
+    # 只锁写那一半没用：两个进程各拿一份旧副本进临界区，后保存的那个照样把
+    # 前一个的改动整份吞掉。见 _VmWriteLock 的注释。2026-11-11 审计补上。
+    if not vm_file(args.name).is_file():
+        die(f"没有这个虚拟机：{args.name}。用 list 看现有的。")
+    with _VmWriteLock(args.name):
+        vm = load_vm(args.name)
+        if vm["kind"] != "linux":
+            die(f"共享目录只在 Linux 虚拟机上有效（virtio-9p）。"
+                f"{vm['kind']} 这条路的磁盘/共享参数表里没有它，记了也不会挂上。")
+        return _share_impl(args, vm)
+
+
+def _share_impl(args, vm: dict) -> int:
     """共享目录：把宿主机上的一个文件夹挂进虚拟机（virtio-9p）。
 
     为什么需要它：虚拟机里装了东西，想把文件取出来或者放进去，原来只能走 SSH
@@ -4348,7 +4543,6 @@ def cmd_share(args) -> int:
                 mountvol 或者第三方 9p 客户端
     这一步替不了——挂载点是客人机里的事，而且每个系统做法不一样。
     """
-    vm = load_vm(args.name)
     shares = vm.setdefault("shares", [])
 
     if args.action == "list":
@@ -4408,6 +4602,30 @@ def cmd_share(args) -> int:
     die(f"不认识的动作：{args.action}")
 
 
+def _remove_autostart_plist(name: str) -> None:
+    """卸掉一台虚拟机的开机自启 plist 并删掉文件。
+
+    **每种客人都要卸，不只 macOS。** 原来这段只写在 cmd_delete 的
+    `elif macvm.json` 分支里，有 vm.json 的 Linux / Windows / 自选安装包 VM
+    走另一条分支，直接 _rmtree 就报成功。而 plist 还在
+    ~/Library/LaunchAgents/ 里且仍是 loaded，它指向的 wrapper 就在被删掉的
+    VM 目录里：之后每次登录 launchd 执行一个不存在的脚本 → 非零退出 →
+    KeepAlive 加 ThrottleInterval 15 → 每 15 秒重试一次，永不停止，还会往
+    已删除目录写日志失败。用户看到的是「删了的虚拟机还在每隔一会儿折腾一下」。
+    2026-11-11 审计实测复现（删除前后 LaunchAgents 里都留着那份 plist）。
+    `autostart --disable` 还能补救，但用户不会知道要跑它。
+
+    bootout 之后再 unload 是老版本 launchd 的兼容写法，两个都发。
+    """
+    plist = HOME / "Library" / "LaunchAgents" / f"com.agentvm.{name}.plist"
+    if not plist.exists():
+        return
+    run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)], check=False)
+    run(["launchctl", "unload", str(plist)], check=False)
+    plist.unlink(missing_ok=True)
+    ok(f"已卸掉开机自启 {plist}")
+
+
 def cmd_delete(args) -> int:
     name = args.name
     d = vm_dir(name)
@@ -4450,21 +4668,113 @@ def cmd_delete(args) -> int:
                     f"请在 app 里选中它关机，然后再删。")
             warn("VM 还在跑，先关机再删")
             cmd_stop(args)
-        # 开机自启的 plist 必须一起卸掉。原来只 _rmtree(d)：plist 还留在
-        # ~/Library/LaunchAgents/，而它指向的 wrapper 就在被删掉的 VM 目录里。
-        # 之后每次登录 launchd 执行一个不存在的脚本 → 非零退出 → KeepAlive 加
-        # ThrottleInterval 15 → 每 15 秒重试一次，永不停止，还会往已删除目录写
-        # 日志失败。用户看到的是「删了的虚拟机还在每隔一会儿折腾一下」。
-        # bootout 之后再 unload 是老版本 launchd 的兼容写法，两个都发。
-        plist = HOME / "Library" / "LaunchAgents" / f"com.agentvm.{name}.plist"
-        if plist.exists():
-            run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
-                check=False)
-            run(["launchctl", "unload", str(plist)], check=False)
-            plist.unlink(missing_ok=True)
-            ok(f"已卸掉开机自启 {plist}")
+    # 开机自启的 plist 每种客人都要卸，见 _remove_autostart_plist 的注释：
+    # 原来这一段只长在下面那个 macOS 分支里，另外三种客人删完还留着一个
+    # 每 15 秒跑一次的 launchd 任务。
+    _remove_autostart_plist(name)
     _rmtree(d)
     ok(f"已删除 {d}")
+    return 0
+
+
+def _vm_known_files(vm: dict) -> set[str]:
+    """一台 VM 目录里「有主」的文件名，prune 靠它判断谁是孤儿。
+
+    清单必须和 install / configure / disk / clone 真正写进 VM 目录的东西逐项
+    对齐。**漏列一个的后果比没有这个命令更糟**：prune 把一个还在用的文件报成
+    孤儿，用户照着 --apply 删掉，VM 直接坏。所以这里宁可多列——多列只会让
+     prune 漏报一个真孤儿，漏列会让它误删。
+
+    系统盘的名字两种都列上（linux 是 qcow2 overlay，另几种是整盘 raw），
+    不按 kind 分：一个写了一半的 vm.json 的 kind 未必可信。
+    """
+    names = {
+        "vm.json", "macvm.json", "macvm.pid", "qemu.pid", "install.pid",
+        "qemu.log", "install.log", "launchd.sh", "efi-vars.fd", "vars.fd",
+        "seed.iso", "install.iso", "prepared.iso", "vnc.display", "monitor.sock",
+        "hardware.model", "machine.id", "aux.nvram", "last-screen.ppm",
+        ".write.lock", "disk.qcow2", "data.img",
+    }
+    # 附加盘：vm.json 的 disks[].file 是绝对路径，取文件名。
+    for d in vm.get("disks", []):
+        f = d.get("file")
+        if f:
+            names.add(Path(f).name)
+    return names
+
+
+def _is_transient_vm_file(name: str) -> bool:
+    """安装过程留下的过程文件。它们有主，只是主是「过程」不是「配置」。"""
+    return (name.endswith((".ppm", ".log", ".pid", ".sock", ".fd"))
+            or name.startswith("auto-"))
+
+
+def cmd_prune(args) -> int:
+    """找出虚拟机目录里没人认领的大文件。
+
+    为什么需要它：VM 目录里最占地方的文件恰恰是「写进去了但没有任何一条命令
+    会提它」的那种——加盘中途失败留下的 data1.img、换安装包之后没人用的
+    install.iso、重装后变大的旧盘。list / status / check 全只认 vm.json 里
+    登记的项，这些文件占着磁盘却不出现在任何输出里。tart 有同名的 prune，
+     lima 有 clean，做的都是这件事：把「看不见的占用」变成「看得见的一行」。
+
+    **默认只报不删。** 删文件是不可逆的，而这个命令的判断依据是一份清单，
+    清单就可能漏（见 _vm_known_files 的注释）。所以要删必须显式 --apply，
+    而且 VM 在跑的时候一律不删——QEMU 正拿着那个文件写，删了就是把盘从它
+    脚下抽走。
+    """
+    if args.name:
+        vms = [load_vm(args.name)]
+    else:
+        vms = all_vms()
+    floor = parse_size(args.min_size)
+    total = 0
+    reported: list[dict] = []
+    for rec in vms:
+        name = rec.get("name", "?")
+        d = vm_dir(name)
+        if not d.is_dir():
+            continue
+        known = _vm_known_files(rec)
+        running = bool(qemu_pid(rec)) or bool(macos_pid_entry(rec))
+        orphans = []
+        for p in sorted(d.iterdir()):
+            # 只扫顶层文件。目录（snapshots/、prep/、ipsw/）整体跳过：
+            # 里面的东西都有专门的命令管，不在这儿评判。
+            if not p.is_file() or p.is_symlink():
+                continue
+            if p.name in known or _is_transient_vm_file(p.name):
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size < floor:
+                continue
+            orphans.append((p, size))
+        if not orphans:
+            continue
+        for p, size in orphans:
+            total += size
+            reported.append({"vm": name, "file": p.name, "bytes": size})
+            ok(f"{name}: {p.name}  {human(size)}  （vm.json 里没有这一项）")
+        if running:
+            warn(f"{name} 正在运行，只报不删。要删先关机。")
+            continue
+        if args.apply:
+            for p, _ in orphans:
+                try:
+                    p.unlink()
+                    ok(f"  已删 {p}")
+                except OSError as e:
+                    warn(f"  删不掉 {p}：{e}")
+    if not reported:
+        ok("没有没人认领的大文件")
+        Emit.done({"orphans": [], "bytes": 0})
+        return 0
+    if not args.apply:
+        ok(f"合计 {human(total)}。确认要删就加 --apply（VM 在跑的时候不会删）。")
+    Emit.done({"orphans": reported, "bytes": total})
     return 0
 
 
@@ -4607,17 +4917,30 @@ def cmd_configure(args) -> int:
        在这儿替不了，所以明说。
     3. **改磁盘大小时虚拟机必须关机。** qcow2 镜像被 QEMU 占着写锁，resize 会失败。
     """
-    vm = load_vm(args.name)
     # 密码也可能从文件来。放在最前面：configure_macos 和下面那串
     # `if args.password` 都读 args.password，一个入口两种来源容易漏一边。
     resolve_password(args)
-    name = vm.get("name", args.name)
+    # 先确认这台机器在，再拿锁：_VmWriteLock 会在 vm_dir 里建锁文件，
+    # 名字不存在时那等于白造一个空目录。
+    if not vm_file(args.name).is_file():
+        die(f"没有这个虚拟机：{args.name}。用 list 看现有的。")
+    # **load_vm 必须在锁里面。** 这条命令是「读 vm.json → 改 → 整份覆写」，
+    # 只锁写那一半没用：两个进程各拿一份旧副本进临界区，后保存的那个照样把
+    # 前一个的改动整份吞掉。实测两条 configure 并发（一个改 cpu、一个改 mem），
+    # 两条都输出「已改」、退出码 0，最终 vm.json 里 cpu 那一项没了，而用户
+    # 已经被告知改好了。见 _VmWriteLock 的注释。2026-11-11 审计补上。
+    with _VmWriteLock(args.name):
+        vm = load_vm(args.name)
+        name = vm.get("name", args.name)
+        # macOS 客人机的配置不在 vm.json 里，在 macvm.json（vmz 的格式）。
+        # 两边各管各的文件：vmkit 的 save_vm 是整体重写，混在一个文件里
+        # 迟早互相冲掉。这里单独走一条路，改完照样说清楚要重启才生效。
+        if vm.get("kind") == "macos":
+            return configure_macos(args)
+        return _configure_qemu(args, vm, name)
 
-    # macOS 客人机的配置不在 vm.json 里，在 macvm.json（vmz 的格式）。
-    # 两边各管各的文件：vmkit 的 save_vm 是整体重写，混在一个文件里
-    # 迟早互相冲掉。这里单独走一条路，改完照样说清楚要重启才生效。
-    if vm.get("kind") == "macos":
-        return configure_macos(args)
+
+def _configure_qemu(args, vm: dict, name: str) -> int:
 
     changed: list[str] = []
 
@@ -4878,6 +5201,26 @@ def configure_macos(args) -> int:
     # 的那个窗口。
     os.chmod(str(tmp), 0o600)
     tmp.replace(spec_path)
+    # vm.json 里的同名字段要一起改。**原来只写 macvm.json。** 而 vm_record 读的
+    # 是 vm.json 的 cpus / ram / user：改完 status 和 app 详情页照旧显示旧值，
+    # 用户按界面给的登录名去登，登的是一个已经不存在的账号。2026-11-11 审计
+    # 实测：configure --cpu 8 --user bob 之后 macvm.json 是 8 核 bob，
+    # vm.json 还是 4 核 agent，vm_record 报的也是 4 核 agent。
+    #
+    # 密码故意不跟过去：macvm.json 是 0600（上面刚设的），而 vm.json 走
+    # _save_vm_impl、默认 0644，把明文密码抄过去等于把它摊开。
+    vjson = vm_dir(name) / "vm.json"
+    if vjson.is_file():
+        try:
+            rec = json.loads(vjson.read_text())
+        except (OSError, ValueError):
+            rec = None
+        if isinstance(rec, dict):
+            for k in ("cpus", "ram", "user", "width", "height"):
+                if k in spec:
+                    rec[k] = spec[k]
+            save_vm(rec)
+            ok("vm.json 里的同名项也一起改了（list / status 现在显示新值）")
     for c in changed:
         ok(f"已改 {c}")
     ok("重启之后生效。")
@@ -5120,6 +5463,13 @@ def main() -> int:
     p.add_argument("--tag", help="挂载标签，客人机里按它认")
     p.add_argument("--path", help="宿主机上的目录")
 
+    p = sub.add_parser("prune", help="找出 VM 目录里没人认领的大文件（默认只报不删）")
+    p.add_argument("--name", help="只看这一台；不给就看所有")
+    p.add_argument("--apply", action="store_true",
+                   help="真的删掉报出来的文件（VM 在跑的时候不删）")
+    p.add_argument("--min-size", default="1M",
+                   help="小于这个大小的不当孤儿，例如 512K、10M")
+
     p = sub.add_parser("guest", help="通过 QEMU guest agent 碰客人机")
     p.add_argument("action", choices=["ping", "ip", "disks", "exec", "shutdown"])
     p.add_argument("--name", required=True)
@@ -5161,6 +5511,11 @@ def main() -> int:
     if args.cmd == "status":
         # status 允许不带 --name（看全部），所以要在下面的检查之前处理
         return cmd_status(args)
+    if args.cmd == "prune":
+        # prune 也允许不带 --name：不给就是扫所有 VM，那正是它最主要的用法
+        # （「我的磁盘被什么占了」）。放在下面那个统一检查之前，否则
+        # `vmkit.py prune` 会死在「prune 需要 --name」。
+        return cmd_prune(args)
     if not args.name:
         die(f"{args.cmd} 需要 --name")
     # 名字先过白名单再进任何子命令。vm_dir() 是 VMS / name 直接拼路径，
@@ -5196,6 +5551,8 @@ def main() -> int:
         return cmd_clone(args)
     if args.cmd == "share":
         return cmd_share(args)
+    if args.cmd == "prune":
+        return cmd_prune(args)
     if args.cmd == "guest":
         return cmd_guest(args)
     if args.cmd == "screenshot":
