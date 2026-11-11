@@ -885,6 +885,62 @@ class TestIncrementalUpdates(unittest.TestCase):
         finally:
             srv.stop = True
 
+    def test_default_timeout_follows_the_request_mode(self):
+        """不传 timeout 时等多久，由「刚发的是哪种请求」决定。
+
+        这是 2026-11-11 那次修复的锁定测试。原来 frame() 的签名是
+        `timeout: float = 25.0`，而 drive() 一直不传参——于是增量请求也按 25 秒等。
+        增量模式下 25 秒不是「等一帧」，是「等一个不会来的东西」：画面没变时服务端
+        一条都不发，这一等就是整整 25 秒。实测一轮 25.00 秒，「同一个画面试三次
+        就撤」因此要 81 秒，其中 96% 是干等。
+
+        测法是把两个常量临时改小再比：既锁住「分层」这个行为，又不用真等 5 秒和
+        25 秒。常量的取值由下面那条单独断言。
+        """
+        srv = FakeRFB(frame=button_screen())
+        srv.start()
+        try:
+            with ai.RFB(srv.port) as rfb:
+                rfb.request_full()
+                self.assertEqual(rfb.frame(), button_screen())
+                srv.silent = True                 # 从此一条都不回，也不断开
+                old = (ai.INCR_TIMEOUT, ai.FULL_TIMEOUT)
+                ai.INCR_TIMEOUT, ai.FULL_TIMEOUT = 0.3, 1.2
+                try:
+                    rfb.request_incr()
+                    t0 = time.perf_counter()
+                    self.assertIsNone(rfb.frame())        # 不传 timeout
+                    incr_wait = time.perf_counter() - t0
+                    rfb.request_full()
+                    t0 = time.perf_counter()
+                    with self.assertRaises(ai.AutoError):
+                        rfb.frame()                       # 同样不传
+                    full_wait = time.perf_counter() - t0
+                finally:
+                    ai.INCR_TIMEOUT, ai.FULL_TIMEOUT = old
+                # 增量等满自己的那个数就返回 None，不会去等全屏那一档
+                self.assertGreaterEqual(incr_wait, 0.3)
+                self.assertLess(incr_wait, 1.2)
+                # 全屏那一档等到超时是 raise，不是 None——它确实在等一帧
+                self.assertGreaterEqual(full_wait, 1.2)
+                self.assertLess(full_wait, 4.0)
+                # 两者必须分得开，否则这次修复等于没做
+                self.assertLess(incr_wait, full_wait)
+        finally:
+            srv.stop = True
+
+    def test_the_two_timeouts_are_ordered_for_the_right_reason(self):
+        """常量的取值本身：增量必须短，但不能短到还没等出新帧就断定画面静止。
+
+        只断言关系不断言具体数字——具体数字是会随实测调的，而这两条关系是这次
+        修复的理由，改坏了必须红。
+        """
+        self.assertLess(ai.INCR_TIMEOUT, ai.FULL_TIMEOUT)
+        # 必须大于盘静默门槛：复制文件那几分钟里画面几秒才动一格，等不到新帧就
+        # 判「静止」会把进度页当成卡住的向导页。
+        self.assertGreater(ai.INCR_TIMEOUT, ai.DISK_QUIET)
+        self.assertGreater(ai.INCR_TIMEOUT, ai.SETTLE_SECONDS)
+
 
 class TestFrameMemory(unittest.TestCase):
     """动作帧的两段记忆（2026-11-11 加）。

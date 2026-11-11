@@ -211,6 +211,24 @@ RESYNC_EVERY = 30
 EARLY_KEEP = 32
 RECENT_KEEP = 16
 
+# 等一帧愿意等多久，分两种请求给两个数（2026-11-11 加）。
+#
+# 增量请求：5 秒。原来不分模式、一律 25 秒，而 25 秒这个数只在一种情况下有用——
+# 全屏请求下等一帧。增量请求下它直接决定了「画面静止时一轮要多久」：实测
+# （/tmp/bench_wait.py，服务端只握手、不回帧也不断开）改造前一轮 25.00 秒，
+# 于是「同一个画面试三次就撤」实际要 81 秒，其中 96% 是干等。而 drive() 里那个
+# 「画面不动就把轮询放慢」的计数器要 4 轮才生效，4 轮是 100 秒——等于从来没生效过。
+#
+# 为什么不是 1 秒：要大于 DISK_QUIET(2.0) 和 SETTLE_SECONDS(1.0)，否则会出现
+# 「还没等出新帧就断定画面静止」。5 秒也够包容进度页那种「3、4 秒才动一格」的
+# 帧间隔，减少漏帧之后把复用帧误判成同屏的机会。
+#
+# 全屏请求：25 秒不动。这里不能跟着缩：非增量请求下 RFC 6143 要求服务端立即回帧，
+# 25 秒还不回说明连接有问题，这时候 raise 让 drive() 退回手动是对的；缩到 5 秒
+# 只会把「QEMU 正好忙了一下」误报成连接故障，白丢一次自动安装。
+INCR_TIMEOUT = 5.0
+FULL_TIMEOUT = 25.0
+
 
 class FrameMemory:
     """动作帧的两段记忆。
@@ -350,8 +368,13 @@ class RFB:
         self.sk.sendall(b"\x03\x01\x00\x00\x00\x00"
                         + self.w.to_bytes(2, "big") + self.h.to_bytes(2, "big"))
 
-    def frame(self, timeout: float = 25.0):
+    def frame(self, timeout: float | None = None):
         """取一帧。全屏模式返回 w*h*4 字节；增量模式可能返回 None（画面没变）。
+
+        `timeout` 不给就按当前请求模式选：增量 5 秒、全屏 25 秒（见 INCR_TIMEOUT
+        那里的说明）。**模式在 request_full / request_incr 里就已经定了**，这里只是
+        照着读——把选择集中在这一处，是为了不让调用方各写一个数：drive() 原来就是
+        不传参拿默认值，于是增量请求也按 25 秒等，一轮干等 25 秒。
 
         全屏请求下会一直读到**整个画面都画满**为止（2026-11-11 修）。RFC 6143
         7.5.3 说服务端可以爱分几条 FramebufferUpdate 就分几条，原来只读第一条
@@ -363,13 +386,19 @@ class RFB:
         增量模式下：第一条 FramebufferUpdate 落到本地副本上就返回；等到超时一条
         都没有，返回 None——那说明画面压根没动，调用方该直接用上一帧。
         """
+        if timeout is None:
+            timeout = FULL_TIMEOUT if self._want_full else INCR_TIMEOUT
         deadline = time.time() + timeout
         if self._fb is None:
             out = bytearray(self.w * self.h * 4)
-            painted = bytearray(self.w * self.h)
         else:
             out = self._fb                     # 就地更新本地副本
-            painted = bytearray(self.w * self.h)
+        # painted 只有全屏模式用得上：它回答「这一帧还有没有区域没画到」，而增量
+        # 模式第一条更新就返回、返回处的判断也直接走 `not self._want_full` 那一支。
+        # 原来两个分支都老老实实分配一个 w*h 的 mask，1406×744 是 1MB，安装期间
+        # 几千轮就是几千次 1MB 的分配加清零，GC 全为此打工，而增量模式下它一个字节
+        # 都没被读过。
+        painted = bytearray(self.w * self.h) if self._want_full else None
         while True:
             left = deadline - time.time()
             if left <= 0:
@@ -420,8 +449,9 @@ class RFB:
                 for r in range(rhh):
                     off = ((y + r) * self.w + x) * 4
                     out[off:off + stride] = data[r * stride:(r + 1) * stride]
-                    painted[(y + r) * self.w + x:(y + r) * self.w + x + rw] = \
-                        b"\x01" * rw
+                    if painted is not None:
+                        painted[(y + r) * self.w + x:(y + r) * self.w + x + rw] = \
+                            b"\x01" * rw
             if not self._want_full or not painted.count(0):
                 if len(out) != self.w * self.h * 4:
                     raise AutoError("RFB 帧大小不对")
@@ -891,7 +921,7 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
     last_used = disk_used(vdir)      # 上一轮看到的盘占用
     grew_at = 0.0                    # 盘最后一次变大的时刻
     last_at = 0.0
-    still = 0                        # 连续多少轮画面没变（用来放慢轮询）
+    still = 0                        # 画面连续变化了多少次（翻页时多给 settle）
     acts = 0                        # 一共做了多少个动作（回车或点击）
     ejected = False
     budget_end = time.time() + budget_minutes * 60
@@ -993,6 +1023,12 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
 
                 # 画面要稳一下才动作。安装器切换时要重绘，半帧上按下去会打到空气。
                 # 进度页画面一直在动，这道判断自然把它挡住——不会去按一个没意义的回车。
+                #
+                # 注意 still 数的是「画面连续变化了多少次」，不是「静止了多少轮」：
+                # 这个分支只有在 sig 和上一轮不同时才进得来，画面没变时它压根不走。
+                # 所以 0.8 秒那一档的含义是「安装器在连续翻页，多给它一点 settle」，
+                # 不是「等久了就放慢」——后者由 INCR_TIMEOUT 决定（2026-11-11：
+                # 上一轮在这里写的注释说的是后者，和代码实际干的事不是一件）。
                 if last_sig is None or not same_screen(sig, last_sig):
                     last_sig, last_at = sig, time.time()
                     still += 1
