@@ -687,6 +687,19 @@ final class VNCScreenView: NSView {
         // installMoveTracking 直接返回了），补装一次。AppKit 只在 bounds 变化时
         // 自动重调，不会因为「刚拿到窗口」再调一遍。
         installMoveTracking()
+        // **独立控制台一出现就把键盘焦点抢过来。**
+        //
+        // 原来只有 mouseDown 里那一句 makeFirstResponder，于是键盘要等用户
+        // 先点一下画面才通。而装系统时经常打开控制台的第一件事就是按回车
+        // 确认——点之前那一下回车是丢的，用户看到的就是「回车键没反应」。
+        // 2026-11-12 用户原话：「安装过程各种点击，回车键无法使用」。
+        //
+        // 只对独立控制台这么做。嵌在新建向导里的那块画面照样不抢：那会让
+        // 向导的 Tab / Enter / Space 全部失灵，用户没法用键盘走到「下一步」
+        // （见 viewWillMove(toWindow:) 那段注释，2026-11-10 实测踩过）。
+        if !embedded, let w = window {
+            DispatchQueue.main.async { w.makeFirstResponder(self) }
+        }
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {

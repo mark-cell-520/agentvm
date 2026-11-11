@@ -142,9 +142,15 @@ struct ContentView: View {
         // 控制台单独一个窗口/sheet。用 item 而不是布尔量：关掉的时候要把
         // consoleVM 清空，否则下一次打开同一个 VM 时 SwiftUI 认为内容没变，
         // 不会重建——而那个客户端连着上一次的连接。
+        // 控制台那张纸原来只有 .frame(minWidth:minHeight:)，是个不能拉大的
+        // 死尺寸——客人机分辨率高的时候（Windows Setup 常用 1024x768 以上）
+        // 画面被缩得很小，想看细节只能干瞪眼。2026-11-12 用户报「无法放缩小」。
+        // ScalableSheet 见 NewVMWizard.swift 顶部：给 NSWindow 补 .resizable，
+        // 再把初始高度补到内容需要的大小。
         .sheet(item: $state.consoleVM) { vm in
             ConsoleView(name: vm.name, port: vm.vncPort)
                 .frame(minWidth: 860, minHeight: 620)
+                .modifier(ScalableSheet(minHeight: 720))
         }
         .sheet(item: $state.settingsVM) { vm in
             SettingsView(vm: vm)

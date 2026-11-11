@@ -2900,6 +2900,29 @@ def _install_signal_guard(name: str) -> None:
             pass
 
 
+def _hold_awake(pid: int | None = None):
+    """安装期间别让这台 Mac 睡。返回那个 caffeinate 进程，调用方负责收摊。
+
+    为什么必须有：HVF 虚拟机在系统睡眠时会被直接杀掉。安装要跑很久——
+    Windows 十几分钟、macOS 四十多分钟。2026-11-11 实测：同一台 linux1，
+    起来后几分钟内 QEMU 进程就没了，qemu.log 是 0 字节、系统日志里没有
+    任何记录；用 caffeinate -i 挡着睡眠，同一台虚拟机活了十几分钟还在。
+    差别只在于「有没有人在旁边动鼠标」——用户坐在电脑前装什么都成，
+    走开一会儿就失败，而这正是用户报的现象。
+
+    `caffeinate -w <pid>` 会一直持有断言直到那个进程退出，所以传安装进程的
+    pid 最准；不传就等自己退出。caffeinate 不在（非 Mac）时静默跳过。
+    """
+    try:
+        return subprocess.Popen(
+            ["caffeinate", "-i", "-s", "-w",
+             str(pid if pid is not None else os.getpid())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception:
+        return None
+
+
 def spawn_detached_install(args) -> int:
     """把安装甩到后台跑，父进程立刻返回。
 
@@ -3083,6 +3106,11 @@ def spawn_detached_install(args) -> int:
     # 时也能读到东西；子进程随后会用自己的 pid 覆写（_claim_install_lock）。
     # 不重新建文件——那会放弃锁，也让 app 有一小段时间读到不存在的文件。
     _set_install_pid(pidf, proc.pid)
+    # **别让机器在安装期间睡过去。** 这个父进程马上就要退出，而 caffeinate
+    # 用了 start_new_session，会被 init 收养、一直守到 proc.pid 退出为止。
+    # 少了它：HVF 虚拟机在系统睡眠时会被杀，一个四十多分钟的 macOS 安装
+    # 能在用户走开洗个脸的间隙里凭空消失。2026-11-11 实测踩过两次。
+    _hold_awake(proc.pid)
     Emit.done({"name": name, "log": str(logf), "pid": proc.pid,
                "detached": True})
     return 0
@@ -5800,9 +5828,15 @@ def main() -> int:
     if args.cmd == "install":
         if args.detach:
             return spawn_detached_install(args)
+        awake = _hold_awake()
         try:
             return cmd_install(args)
         finally:
+            if awake is not None:
+                try:
+                    awake.terminate()
+                except Exception:
+                    pass
             # install.pid 用完就删。
             #
             # 留着它，app 的 resumeWatching 会拿一个死进程号当真：macOS 的 pid
