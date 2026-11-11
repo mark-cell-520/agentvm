@@ -128,13 +128,29 @@ struct NewVMWizard: View {
         guard let d = state.pickedDistro else { return false }
         let name = state.vmName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return false }
-        // 名字会当目录名和主机名用，只放字母数字和 - _
-        let allowed = name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        // 名字会当目录名和主机名用。判据必须和 vmkit 的 check_vm_name 逐字一致：
+        // 首字符是字母或数字，其余可以是字母、数字、点、- 或 _，总长不超过 63
+        // （见 scripts/vmkit.py 的 _VM_NAME_RE）。
+        //
+        // 原来是 `$0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"`——Swift 的
+        // isLetter 对中文为真，于是「虚拟机」这种名字能过 app 这一关，vmkit 一秒
+        // 后 die 在「名字只能以字母数字开头」上，而错误弹窗显示的却是被覆盖后的
+        // 「安装没起来，没拿到日志路径」。用户在向导里被弹回配置页，既不知道错在
+        // 哪也找不到入口。2026-11-11 审计补上。
+        // （SettingsView 的帮助文字同样写着旧规则，一并改。）
+        let first = name.unicodeScalars.first!
+        let headOK = CharacterSet.alphanumerics.contains(first)
+        let tailOK = name.unicodeScalars.dropFirst().allSatisfy {
+            CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz"
+                                     + "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                     + "0123456789._-").contains($0)
+        }
+        let nameOK = headOK && tailOK && name.unicodeScalars.count <= 63
         // 密码下限。VZMacGuestProvisioningOptions 会校验，太短的话第一次启动
         // 静默不建账号——界面看不出问题，用户登不进去也不知道为什么。
         // 在这儿就挡住，比装完 40 分钟才发现强。
         let pwOK = state.vmPassword.count >= 4
-        return allowed && pwOK && !state.backend.busy && !d.id.isEmpty
+        return nameOK && pwOK && !state.backend.busy && !d.id.isEmpty
     }
 }
 

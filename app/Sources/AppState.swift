@@ -95,6 +95,10 @@ final class AppState: ObservableObject {
     // sshd 就起不来——表象是「装完了但 SSH 连不上」。
     @Published var vmPassword = "Agentvm2026"
     @Published var showPassword = false
+    /// 用户在这次会话里有没有显式改过密码。重装时要用它区分「用户设的」和
+    /// 「表单残留的默认值」——后者可能是 resetWizard 打回来的，不代表用户的
+    /// 意图。见 reinstall 的注释。
+    private var passwordTouched = false
 
     init() {
         // 必须第一个设：Backend 自己身上那 5 个写 errorMessage 的地方（起不来、
@@ -113,6 +117,22 @@ final class AppState: ObservableObject {
     }
 
     // -------------------------------------------------------------- 读取 --
+
+    /// 一台虚拟机自己的密码（从它的 vm.json 读）。重装时用它，装出来的账号才和
+    /// 原来一致——见 reinstall 的注释。
+    ///
+    /// 只读自己机器上的 0600 文件（vmkit 存的时候就是 0600），不经过网络。
+    /// 读不到就给 nil，调用方按「没有」处理。
+    private func savedPassword(name: String) -> String? {
+        let url = Backend.vmsDirectory
+            .appendingPathComponent(name)
+            .appendingPathComponent("vm.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let dict = obj as? [String: Any],
+              let pw = dict["password"] as? String else { return nil }
+        return pw
+    }
 
     func refreshCatalog() {
         backend.run(["catalog"], onEvent: handleCatalog)
@@ -247,16 +267,43 @@ final class AppState: ObservableObject {
 
     // -------------------------------------------------------------- 安装 --
 
+    /// 用户在配置步改过的资源配置。pick() 不再无脑覆盖它——用户把内存从 2G 改到
+    /// 8G，回上一步再点一下同一张卡片就被打回 2G，而他以为自己改过了。
+    /// 2026-11-11 审计补上。
+    private var tuned = false
+
     func pick(_ d: Distro) {
+        let switching = pickedDistro?.id != d.id
         pickedDistro = d
-        // 按该系统的推荐值填，用户想改再改
-        vmCpus = d.defaultCpus
-        vmRam = d.defaultRam
-        vmDisk = d.defaultDisk
-        vmUser = d.defaultUser
-        if vmName.isEmpty {
-            vmName = d.isWindows ? "win11" : "linux\(vms.count + 1)"
+        // 换系统时按新系统的推荐值填；重复点同一张卡片时不动——那是用户在
+        // 「上一步」和「这一步」之间来回走，手里的改动不该被抹掉。
+        if switching || !tuned {
+            vmCpus = d.defaultCpus
+            vmRam = d.defaultRam
+            vmDisk = d.defaultDisk
+            vmUser = d.defaultUser
+            tuned = false
         }
+        if vmName.isEmpty {
+            // 默认名按系统类型分：原来是 isWindows ? "win11" : "linux<N>"，
+            // 选 macOS 时会被命名成 linux2。Linux 那几种用 linux + 序号，
+            // macOS 用 macos + 序号，Windows 用 win11。
+            switch d.kind {
+            case "windows": vmName = "win11"
+            case "macos": vmName = "macos\(vms.count + 1)"
+            default: vmName = "linux\(vms.count + 1)"
+            }
+        }
+    }
+
+    /// 用户在配置步改了资源。记下来，pick() 再来就不覆盖。
+    func markTuned() {
+        tuned = true
+    }
+
+    /// 用户改过密码。reinstall 靠它决定用表单里的值还是 VM 自己的旧值。
+    func markPasswordTouched() {
+        passwordTouched = true
     }
 
     func startInstall() {
@@ -468,10 +515,24 @@ final class AppState: ObservableObject {
     /// 这一种必须由 app 进程持有 VZVirtualMachine——画面要显示在 app 里，
     /// 而 VZVirtualMachineView 不能跨进程。所以 start 之后 app 就是这个
     /// 虚拟机的宿主，app 退出它就停。
+    /// macOS 虚拟机起不来时的一句话。
+    ///
+    /// **必须同时写 backend.errorMessage。** macVMLastError 唯一的展示处是
+    /// MacVMWindow，也就是 macVM 这个 sheet 的内部——而下面这几条路径
+    /// （没装完、读不到 macvm.json、start() 抛错）一个都不开 sheet，
+    /// 那句话写在那儿永远没人看见：用户点了「启动」什么反应都没有，只会
+    /// 反复点同一个按钮。backend.errorMessage 走 ContentView 的 .alert，
+    /// 不依赖任何窗口已经打开。2026-11-11 审计补上。
+    func failMacVM(_ msg: String) {
+        macVMLastError = msg
+        backend.errorMessage = msg
+        revision += 1
+    }
+
     func startMacVM(_ vm: VMInfo) {
         macVMLastError = ""
         guard vm.macInstalled ?? false else {
-            macVMLastError = "这个虚拟机还没装完。先在列表里选中它，点「开始安装」。"
+            failMacVM("这个虚拟机还没装完。先在列表里选中它，点「开始安装」。")
             return
         }
         if macRuntimes[vm.name]?.vm != nil {
@@ -479,8 +540,8 @@ final class AppState: ObservableObject {
             return
         }
         guard let spec = MacVMSpec.load(name: vm.name) else {
-            macVMLastError = "读不到 macOS 虚拟机的配置（~/.agentvm/vms/"
-                + vm.name + "/macvm.json）。"
+            failMacVM("读不到 macOS 虚拟机的配置（~/.agentvm/vms/"
+                + vm.name + "/macvm.json）。")
             return
         }
         let rt = MacVMRuntime()
@@ -535,8 +596,8 @@ final class AppState: ObservableObject {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.macRuntimes.removeValue(forKey: vm.name)
-                    self.macVMLastError = error.localizedDescription
-                    self.revision += 1
+                    // 同 failMacVM 的说明：不开 sheet 的失败也得让人看见。
+                    self.failMacVM("macOS 虚拟机启动失败：\(error.localizedDescription)")
                 }
             }
         }
@@ -560,7 +621,9 @@ final class AppState: ObservableObject {
                     // 等超时：客人机还在跑，runtime 必须留着——vm 还在里面，
                     // 还能再叫一次 stop。摘掉就等于没有任何对象能停它了，
                     // 它会一直占 CPU/内存到 app 退出，而界面上显示「已停止」。
-                    self.macVMLastError = "优雅关机等超时（客人机可能停在登录界面）。虚拟机还在运行，可以再停一次，或者在客人机里选「关机」。"
+                    // 这句话同样要弹出来：stop 是用户点的按钮，点了没反应
+                    // 和失败没有区别。
+                    self.failMacVM("优雅关机等超时（客人机可能停在登录界面）。虚拟机还在运行，可以再停一次，或者在客人机里选「关机」。")
                     self.revision += 1
                     return
                 }
@@ -654,7 +717,18 @@ final class AppState: ObservableObject {
         // 密码跟新建向导同一个来源。不传的话 vmkit 用它自己的默认值，
         // 而用户从向导里看到的一直是表单里那个——两处不一致，
         // 装完登不进去时没有任何线索指向这里。
-        if !vmPassword.isEmpty { args += ["--password", vmPassword] }
+        //
+        // **但不能用 state.vmPassword 的当前值。** 它是向导表单的残留：用户中途
+        // 打开过一次新建向导再取消，resetWizard 就把它打回默认的 Agentvm2026，
+        // 而重装这条路直接跳到安装页、不展示配置表单，用户既看不到也改不了这个
+        // 密码——装完登不进去，且没有任何界面告诉过他密码是什么。
+        // 改成：用户在这次会话里显式设过就用那个，否则沿用这台虚拟机自己的
+        // vm.json（后端读得到，装出来的账号才和原来一致）。
+        if passwordTouched {
+            if !vmPassword.isEmpty { args += ["--password", vmPassword] }
+        } else if let old = savedPassword(name: vm.name), !old.isEmpty {
+            args += ["--password", old]
+        }
         installFinished = false
         installedVM = nil
         installEnded = false

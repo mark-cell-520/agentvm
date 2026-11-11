@@ -476,7 +476,24 @@ def download(url: str, dest: Path, sid: str = "download",
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     if dest.is_file() and dest.stat().st_size > 0:
-        ok(f"镜像已在本地：{dest}（{human(dest.stat().st_size)}）")
+        have_size = dest.stat().st_size
+        # 大小和调用方给的对不上，就不是同一份镜像。
+        #
+        # 原来这里只要「存在且非空」就打印「镜像已在本地」返回，而两个调用方
+        # （cmd_install_linux / cmd_install_windows）正是判了大小不符才调
+        # download 的：于是下载被跳过、一句成功提示打出来，紧接着 verify()
+        # 必然哈希不匹配而 die。用户看到的是「镜像已在本地（3.9 GB）」加一句
+        # 「sha256 不匹配」，两个说法互相矛盾，而真实原因（盘上那份是旧版）
+        # 一个字都不提，只能靠猜。2026-11-11 实测复现了这个形状。
+        #
+        # 不自动删：dest 可能是指向移动盘的软链（images/ 的布局），删软链会
+        # 悄悄改变镜像的存放位置，下次就下到本地盘上了。说清差多少、给出可
+        # 直接执行的命令，让用户自己决定。
+        if expect and have_size != expect:
+            die(f"本地已有 {dest}，大小是 {human(have_size)}，"
+                f"而这一版要 {human(expect)}——不是同一份镜像，用不了。\n"
+                f"删掉它再装（或换成对的那份）：\n    rm {dest}")
+        ok(f"镜像已在本地：{dest}（{human(have_size)}）")
         return dest
 
     have = part.stat().st_size if part.is_file() else 0
@@ -1186,6 +1203,38 @@ def pubkey_text(vm: dict) -> str:
     return "\n".join(f"      - {text}" for _ in (0,))
 
 
+def _cached_ipsw(name: str | None = None) -> Path | None:
+    """全局缓存（或某个 VM 自己的 ipsw 目录）里那份恢复镜像。
+
+    先看 ~/.agentvm/images/ipsw，没有再看 <vm>/ipsw。返回第一个非空文件。
+    打印计划（install_plan）和真正把 --ipsw 传给 vmz（cmd_install）都用它——
+    原来只有前者用，于是日志说「复用本地恢复镜像」而 vmz 什么都没收到，
+    安装直接死在「恢复映像不存在」上。2026-11-11 实测踩到。
+    """
+    dirs = [IMAGES / "ipsw"]
+    if name:
+        dirs.append(vm_dir(name) / "ipsw")
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.iterdir()):
+            if f.is_file() and f.stat().st_size > 0:
+                # **必须解析软链，返回真实路径。**
+                #
+                # ~/.agentvm/images 是指向移动硬盘的软链目录（镜像池的布局，见
+                # PLAN 第十七轮），而 VZMacOSRestoreImage.load(from:) 不跟随
+                # 符号链接：传 /Users/mm/.agentvm/images/ipsw/UniversalMac_...ipsw
+                # 过去，它报「读不了这个 IPSW：恢复映像无效。恢复映像不存在。」
+                # ——文件就在那儿、大小精确匹配 catalog、head -c 16 看是合法的
+                # ZIP（PK\x03\x04），纯粹是路径隔了一层软链。
+                # 同一个文件用 /Volumes/移动/... 的真实路径，一次就过。
+                # 2026-11-11 实测：macOS 这条路第一次真正跑起来就死在这儿，
+                # 而日志里还写着「复用本地恢复镜像」——那句话只用于打印，路径
+                # 从没传给 vmz，传了又是软链，两件事叠在一起。
+                return f.resolve()
+    return None
+
+
 def install_plan(vm: dict, distro: dict) -> None:
     """开装之前把要走的路说一遍：几步、大约多久、要占多少空间、哪些能复用。
 
@@ -1232,20 +1281,9 @@ def install_plan(vm: dict, distro: dict) -> None:
         # 那 25.6 GB；这一条要明说，否则用户看到「秒过」会以为坏了。
         # catalog 里 macOS 条目的 url 是空的（地址要运行时问 Apple 拿），所以
         # 不能像另两条那样用 distro["url"] 推文件名——直接看缓存目录里有什么。
-        cache_dir = IMAGES / "ipsw"
-        cached_file = None
-        if cache_dir.is_dir():
-            for f in sorted(cache_dir.iterdir()):
-                if f.is_file() and f.stat().st_size > 0:
-                    cached_file = f
-                    break
-        if cached_file is None:
-            own = vm_dir(name) / "ipsw"
-            if own.is_dir():
-                for f in sorted(own.iterdir()):
-                    if f.is_file() and f.stat().st_size > 0:
-                        cached_file = f
-                        break
+        # 用 _cached_ipsw：和真正传给 vmz 的那一处是同一个函数，不会再出现
+        # 「日志说复用、实际没传」各找一份的情况。
+        cached_file = _cached_ipsw(name)
         if cached_file is not None:
             # catalog 的 install_minutes 是「含下载」的数（30 到 60 分钟里
             # 二十来分钟在下载）。镜像已在本地，这一段整段省掉，照实说，
@@ -1338,7 +1376,17 @@ def cmd_install_linux(vm: dict, distro: dict) -> dict:
             f"加 --force 重装：\n"
             f"  {_self_cmd()} install --name {name} --force")
 
+    # ssh 命令必须自带 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null。
+    #
+    # 这些虚拟机的端口会被复用（删掉再装同一个名字，端口又分配回同一个），而
+    # 每次 cloud-init 生成的 host key 是新的：用户照抄这条命令去连，看到的是
+    # 「REMOTE HOST IDENTIFICATION HAS CHANGED」加「可能有人在窃听」，紧接着
+    # "Password authentication is disabled to avoid man-in-the-middle
+    # attacks"——对一个本机回环上的一次性虚拟机这是纯噪音，还会让人以为真被
+    # 攻击了。2026-11-11 实测复现（装 linux1 时撞上）。
+    # winarm-vm.py 自己发起的 ssh 早就带这两个参数，给用户的这条却没有。
     ssh_cmd = (f"ssh -i {vm['ssh_key']} -p {vm['ssh_port']} "
+               f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
                f"{vm['user']}@127.0.0.1")
     vm["ready"] = True
     vm["ssh_command"] = ssh_cmd
@@ -1488,6 +1536,8 @@ def cmd_install_local(vm: dict, source: Path, auto: bool = True,
 
     # manual / timeout / 上面那个拔盘重启也没等到服务：VM 留着运行，
     # 控制权交还用户。这时候绝不能报「装完了」——那是最难排查的一种谎。
+    # 标记让 cmd_install 别发 done、退出码给失败，见那边的注释。
+    vm["install_manual"] = True
     _local_manual_instructions(vm)
     save_vm(vm)
     return vm
@@ -2362,7 +2412,7 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
         Emit.stage("boot", "安装 Windows（约 10 到 15 分钟）")
         w.cmd_start(cfg, install=True)
         Emit.stage("ssh", "等安装完成")
-        deadline = time.time() + vm.get("wait_minutes", 40) * 60
+        deadline = time.time() + vm.get("wait_minutes", 60) * 60
         t0 = time.time()
         last_shot = 0.0
         ssh_up = False
@@ -2370,6 +2420,33 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
             if w.ssh_ready(cfg):
                 ok(f"SSH 已就绪，用时 {int(time.time() - t0)} 秒")
                 ssh_up = True
+                # SSH 通不等于装完，绝不能在这儿就 break 去关机。
+                #
+                # first-logon 脚本在 sshd 起来之后还有三四秒收尾（Start-Sleep 3、
+                # 按需装 sshd 登录任务），而其中一步是把 AutoAdminLogon 钉成 1、
+                # 删掉 AutoLogonCount。这几行没跑完就 shutdown 的话：重启停在
+                # 登录界面 → sshd 是靠自动登录那个交互会话拉起来的 → SSH 再也
+                # 起不来，而这一行已经把 ready=true 写进 vm.json、报告「虚拟机
+                # 已就绪」。轮询相位落在 sshd 起来后的那几秒内就会切中。
+                #
+                # 判据换成客人机自己写的 winarm-ready 标记（脚本最后一行才写），
+                # 带 180 秒兜底：等不到也继续走，不把安装卡死在这儿。
+                # 2026-11-11 审计复验确认（客人机脚本见 winarm-vm.py 里那段
+                # PowerShell 的 347 / 432 行）。
+                gt0 = time.time()
+                got_ready = False
+                while time.time() < deadline and time.time() - gt0 < 180:
+                    if w.guest_setup_done(cfg):
+                        got_ready = True
+                        break
+                    if not w.qemu_running(cfg):
+                        break
+                    time.sleep(2)
+                if got_ready:
+                    ok(f"客人机首次登录脚本已跑完（又用了 {int(time.time() - gt0)} 秒）")
+                else:
+                    warn("等客人机收尾超时（或虚拟机已退出），仍按原流程继续。"
+                         "若重启后停在登录界面，在详情页再点一次启动即可")
                 break
             if not w.qemu_running(cfg):
                 # 不能只说「看 qemu.log」。实测那个文件在这种情况下是空的：
@@ -2401,9 +2478,9 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
                 last_shot = time.time()
                 screendump(d / "monitor.sock", d / "last-screen.ppm")
             Emit.progress("ssh", (time.time() - t0) /
-                          (vm.get("wait_minutes", 40) * 60),
+                          (vm.get("wait_minutes", 60) * 60),
                           int(time.time() - t0),
-                          vm.get("wait_minutes", 40) * 60, 0)
+                          vm.get("wait_minutes", 60) * 60, 0)
             time.sleep(5)
         else:
             warn("超时仍未就绪，VM 还在跑。看日志或 open 开窗口。")
@@ -2412,12 +2489,20 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
         # 入口，用户连上一个没装完的系统。同 start_linux 里那段注释。
         if not ssh_up:
             save_vm(vm)
+            # 超时最常见的原因不是 Setup 慢，而是首次登录脚本卡在装 OpenSSH：
+            # Add-WindowsCapability 从 Windows Update 拉 FoD，慢起来能挂十几分钟，
+            # 而它挂住时 sshd 没装、AutoAdminLogon 没钉、winarm-ready 没写，
+            # SSH 永远不就绪。2026-11-11 实测复现：客人机日志只有三行
+            # （starting / drivers / installing OpenSSH Server），40 分钟预算
+            # 就这么烧光了。把这条说出来，用户才知道该看哪儿、该不该重装。
             die(f"虚拟机 {name} 没装完：等了 "
                 f"{vm.get('wait_minutes', 40)} 分钟 SSH 都没就绪。\n"
-                f"VM 还在跑，先看看它卡在哪儿：\n"
+                f"最常见的原因：首次登录脚本卡在下载 OpenSSH 组件"
+                f"（Add-WindowsCapability 等 Windows Update）。"
+                f"VM 还在跑，先在画面里确认它走到哪一步：\n"
                 f"  {_self_cmd()} open --name {name}\n"
                 f"  {_self_cmd()} screenshot --name {name}\n"
-                f"确认是 Setup 卡住或 virtio 盘没被识别之后，加 --force 重装：\n"
+                f"确认是 Setup 卡住或 OpenSSH 没装上之后，加 --force 重装：\n"
                 f"  {_self_cmd()} install --name {name} --force")
     except winarm()._Die as e:
         die(str(e))
@@ -2449,7 +2534,11 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
     _sync_windows_vnc(vm)
 
     vm["ready"] = True
+    # 同 cmd_install_linux 里的说明：端口复用 + 每次新的 host key，不带这两个
+    # 参数用户一连就是「主机身份已变更」的警告。
     vm["ssh_command"] = (f"ssh -i {vm['ssh_key']} -p {vm['ssh_port']} "
+                         f"-o StrictHostKeyChecking=no "
+                         f"-o UserKnownHostsFile=/dev/null "
                          f"{vm['user']}@127.0.0.1")
     vm["rdp_command"] = (f"open vnc://127.0.0.1:{5900 + vm['vnc_display']} "
                          f"（或 Microsoft Remote Desktop 连 "
@@ -2696,6 +2785,13 @@ def _claim_install_lock(name: str) -> Path:
     return pidf
 
 
+# 安装期间启动的、需要被信号处理器一起带走的直接子进程（vmz）。
+# 为什么需要它：macOS 安装期的客人机是 vmz，而它一个 pid 文件都不写
+# （qemu.pid 要到 QEMU 起来才有，macvm.pid 是 macStart 时才写的），
+# _install_signal_guard 翻那两个文件什么都翻不到。见那边的注释。
+_INSTALL_CHILDREN: list = []
+
+
 def _set_install_pid(pidf: Path, pid: int) -> None:
     """把 install.pid 的内容改写成 pid。只改内容，不重新建文件——重建等于放弃
     那把 flock。写失败不致命：app 那边读到空或读不到会按「没在跑」处理，最坏是
@@ -2733,6 +2829,14 @@ def _install_signal_guard(name: str) -> None:
     start_new_session 出来的孤儿继续跑，占着 2 GB 内存、SSH 端口和 VNC 端口，
     而用户以为「取消了就什么都没了」。pid 文件还在，所以 `stop` 还能停，
     但没有任何东西告诉用户这儿还挂着一台。
+
+    **还要杀 vmz 这个直接子进程。** 2026-11-11 审计补上：前台 macOS 安装的
+    客人机是 vmz，而它安装期一个 pid 文件都不写——qemu.pid 要到 QEMU 起来
+    才有，macvm.pid 是 macStart 时才写的（MacVMEngine 的 macWritePID）。
+    于是上面翻两个文件什么都翻不到，vmkit 当场 os._exit(130)，vmz 作为普通
+    子进程继续跑：继续下 25.6 GB 恢复镜像、继续写系统盘，而同名重装会被
+    _refuse_existing 挡下，用户看到的是一台「装不了也停不掉」的虚拟机。
+    所以子进程对象在这里留一份，handler 直接 kill 它。
     """
     def handler(signum, frame):
         d = vm_dir(name)
@@ -2753,6 +2857,27 @@ def _install_signal_guard(name: str) -> None:
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
                     pass
+        # vmz 这类直接子进程：安装期它不写任何 pid 文件（见上面的注释），
+        # 只能靠对象本身杀。先 SIGTERM 给一次机会，不退就补 SIGKILL——它可能
+        # 卡在一个不响应的网络读上，而用户已经按了停止，不该继续等。
+        for proc in list(_INSTALL_CHILDREN):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except OSError:
+                pass
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if all(p.poll() is not None for p in _INSTALL_CHILDREN):
+                break
+            time.sleep(0.2)
+        for proc in list(_INSTALL_CHILDREN):
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except OSError:
+                pass
+        _INSTALL_CHILDREN.clear()
         # install.pid 也要清。os._exit 不走 finally，main() 里那道清理在这儿
         # 不生效；而留着一个死 pid 的后果见 main() 里 install 那段注释。
         try:
@@ -2875,10 +3000,25 @@ def spawn_detached_install(args) -> int:
                 argv += [flag, str(v)]
         if args.force:
             argv.append("--force")
-        if args.source:
-            # vmz 认的是 --ipsw，vmkit 这边叫 --source（跟另外两种安装包
-            # 共用一个参数名）。两套名字在边界上换一次，别让用户记两套。
-            argv += ["--ipsw", args.source]
+        # vmz 认的是 --ipsw，vmkit 这边叫 --source（跟另外两种安装包
+        # 共用一个参数名）。两套名字在边界上换一次，别让用户记两套。
+        ipsw = args.source
+        # 没显式给 --source 时，把全局缓存里那份 IPSW 传过去。
+        #
+        # **原来这条分支只认 args.source，于是 app（永远带 --detach，走的就是
+        # 这条路）装 macOS 时 vmz 一个 --ipsw 都收不到**：它自己去问 Apple 要
+        # 镜像地址、再翻自己的缓存，而 ~/.agentvm/images/ipsw 是指向移动硬盘的
+        # 软链目录，VZMacOSRestoreImage 不跟随符号链接——25.6 GB 的文件就在盘
+        # 上、大小精确匹配 catalog、还是合法的 ZIP，vmz 报的是「恢复映像不存在」。
+        # 前台那条路（cmd_install）早就该修，可 app 从来不走它。
+        # 2026-11-11 实测：macOS 这条路在 app 里从来没真正装成功过。
+        if not ipsw:
+            cached = _cached_ipsw()
+            if cached:
+                ipsw = str(cached)
+                log(f"vmz 将使用本地恢复镜像 {ipsw}")
+        if ipsw:
+            argv += ["--ipsw", str(Path(ipsw).expanduser())]
         # 密码走文件，不走命令行参数。项目自己的规约是「密钥一律从文件读取，
         # 经 base64 传输，落地 0600，用完即删，全程不经过命令行参数」，
         # 而 macOS 这条路径一开始是把密码直接拼进 argv 的：ps 对所有本地
@@ -2891,6 +3031,24 @@ def spawn_detached_install(args) -> int:
         # 虚拟机」，app 里也看不到这台机器。这不是「以后再补」的小疏漏，
         # 是装完就不可见。
         d.mkdir(parents=True, exist_ok=True)
+        # 正在跑的 macOS VM 不能覆写它的 vm.json。
+        #
+        # _refuse_existing 带了 --force 会放行，而下面这个 save_vm 会把一台
+        # 活着的机器写成空壳（ready=false、cpus/ram/disk/user 全回落成默认
+        # 4/8G/80G/agent），之后 status 和 app 详情页显示的和真实机器完全
+        # 不一致，而真实的那台还在跑。前台那条路（cmd_install 的 --force 分支）
+        # 有这道停机检查，甩后台的这条漏了。2026-11-11 审计补上。
+        #
+        # **load_vm 之前必须先问 vm_file 在不在。** 它读不到 vm.json 会直接
+        # die「没有这个虚拟机」，而这条路新建一台 macOS 时那个文件本来就不存在
+        # ——第一次这么写的时候，`install --distro macos-27 --name macos1` 被
+        # 自己加的检查挡在「没有这个虚拟机」上，一次都没跑起来。2026-11-11
+        # 实测踩到。
+        old = load_vm(name) if vm_file(name).exists() else None
+        if old and qemu_pid(old):
+            die(f"{name} 正在运行。先 stop 再重装：\n"
+                f"  vmkit.py stop --name {name}\n"
+                f"不然会覆写一台活着的虚拟机的配置。")
         save_vm(_macos_vm_stub(name, args))
     else:
         # 另外两种：再跑一遍 vmkit 自己，把 --detach 去掉。
@@ -3088,6 +3246,24 @@ def cmd_install(args) -> int:
                 macos_ipsw = args.source
         except SystemExit:
             macos_ipsw = None
+    # 没显式给 --source 时，用全局缓存里那份 IPSW。
+    #
+    # **原来这儿漏了。** plan_install 那边（见 _plan_macos）会遍历
+    # ~/.agentvm/images/ipsw 找到缓存文件、打印「计划：1. 复用本地恢复镜像
+    # UniversalMac_...ipsw → …」和「恢复镜像 23.8 GB 已在本地（全局缓存，
+    # 0 字节新占空间）」，但那个路径只用于打印，从来没传进 cmd_install_macos
+    # ——vmz 收不到 --ipsw，于是它自己去找恢复镜像、找不到，报一句
+    # 「读不了这个 IPSW：恢复映像无效。恢复映像不存在。」而用户刚看到的日志
+    # 说的是「复用本地恢复镜像」。两句话直接矛盾，而 25.6 GB 的文件就在盘上。
+    # 2026-11-11 实测踩到（macOS 这条路第一次真正跑起来就炸）。
+    if macos_ipsw is None and args.distro:
+        try:
+            if find_distro(load_catalog(), args.distro).get("kind") == "macos":
+                cached = _cached_ipsw()
+                if cached:
+                    macos_ipsw = str(cached)
+        except SystemExit:
+            macos_ipsw = None
 
     if (args.source or args.source_url) and not macos_ipsw:
         if args.source and args.source_url:
@@ -3148,6 +3324,18 @@ def cmd_install(args) -> int:
                             f"（{human(src.stat().st_size)}）")
         vm = cmd_install_local(vm, src, auto=not args.no_auto,
                                wait_minutes=args.wait)
+        # 自动安装没能走完、控制权交还用户时，cmd_install_local 会打上这个标记。
+        # 这时候绝不能发 done：app 那边 done 只要能解成 VMInfo 就置
+        # installFinished，向导跳到「装好了」那一页、画一个绿色的勾，而系统
+        # 根本没装完。cmd_install_local 自己的注释写着「这时候绝不能报装完了」，
+        # 原来却 return 0 让调用方照常发 done、退出码还是成功——命令行上
+        # `install ... && start ...` 也会顺着去启动一台没装完的 VM。
+        # --no-auto 那条路不打标记：那是用户明确选了自己点，不是失败。
+        # 2026-11-11 审计补上。
+        if vm.pop("install_manual", False):
+            die(f"{name} 的自动安装没能走完，控制权交还给你："
+                f"在虚拟机画面里把剩下的步骤点完。"
+                f"装完之后在详情页点一次启动，它就正常了。")
         Emit.done(vm_record(vm))
         return 0
 
@@ -3290,18 +3478,70 @@ def cmd_install_macos(vm: dict, distro: dict, ipsw: str | None = None) -> dict:
                             stderr=subprocess.STDOUT, text=True,
                             cwd=str(HERE), env=_vmz_install_env())
     assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
+    # 登记给信号处理器：用户按「停止」或关掉终端时要能把它一起带走。安装期它
+    # 不写任何 pid 文件，见 _INSTALL_CHILDREN 的注释。
+    _INSTALL_CHILDREN.append(proc)
+    # 前台这条路径必须自己有刹车。
+    #
+    # 原来是裸的 `for line in proc.stdout:`——vmz 卡住（问 Apple 拿 restore
+    # image catalog 没响应、VZMacOSInstaller 停住）时这个循环永久阻塞，既没有
+    # 进度也没有「可能失败了」的提示，用户对着一个不动的终端无从判断，只能
+    # 猜是不是在下 25.6 GB。Linux（300 秒 SSH）、Windows（--wait 分钟）、
+    # 本地包（budget_minutes）三条路都有明确预算，只有这一条没有。
+    # 2026-11-11 审计补上。
+    #
+    # 两个刹车：整体 4 小时（慢机器上写 30 GB 系统盘可能要很久），静默 30 分钟
+    # （vmz 每个阶段都发 JSON 事件——下载进度、写入进度——长时间一个字都不出
+    # 基本就是卡住了）。读循环放单独一条线程，主线程才能一边等一边看时钟：
+    # 阻塞的 readline 是没法在里面判断超时的。
+    stamp = [time.time()]
+
+    def pump() -> None:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            stamp[0] = time.time()
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                # vmz 里有几处直接 print（跟 winarm-vm.py 一样），宽容一点
+                Emit.log(line)
+                continue
+            Emit._w(ev)
+
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    deadline = time.time() + 4 * 3600
+    why = ""
+    while th.is_alive() and time.time() < deadline:
+        th.join(1.0)
+        if time.time() - stamp[0] > 30 * 60:
+            why = "quiet"
+            break
+    if th.is_alive():
+        if not why:
+            why = "total"
+        if why == "quiet":
+            warn("vmz 已经 30 分钟没有任何输出，判定为卡住，终止这次安装。")
+        else:
+            warn("安装超过 4 小时仍未结束，终止。")
+        # 杀 vmz。它没有 start_new_session，是直接子进程，kill 就够；万一它
+        # 卡在一个不响应的网络读上，SIGKILL 也能把它弄出去。
         try:
-            ev = json.loads(line)
-        except ValueError:
-            # vmz 里有几处直接 print（跟 winarm-vm.py 一样），宽容一点
-            Emit.log(line)
-            continue
-        Emit._w(ev)
+            proc.kill()
+        except OSError:
+            pass
+        th.join(10)
+        die(f"vmz 安装超时（{why}）。已写入的部分保留在 {vm_dir(vm['name'])}，"
+            f"重跑 install 会接着来；想从头来就加 --force。")
     rc = proc.wait()
+    # 安装结束了，把它从信号处理器的名单里去掉：留着一个已退出的 Popen 对象
+    # 只会让 handler 多等几轮 poll()，而 poll() 对已退出的进程立刻返回。
+    try:
+        _INSTALL_CHILDREN.remove(proc)
+    except ValueError:
+        pass
     if rc != 0:
         die(f"vmz 安装失败（退出码 {rc}）。完整日志："
             f"{vm_dir(vm['name']) / 'install.log'}")
@@ -4260,6 +4500,11 @@ def cmd_snapshot(args) -> int:
             for sn in snaps:
                 ok(f"{sn['tag']}  {sn['size']}  {sn['date']}"
                    + ("" if sn["has_disk"] else "  缺磁盘(坏)"))
+            # 形状：Emit.done 会把整个 dict 包进 vm 键（见 Emit.done 的实现，
+            # `{"t":"done","vm":<这里传的 dict>}`），所以 app 的 handleSnapshots
+            # 要的 ev["vm"]["snapshots"] 正是这么来的。
+            # 2026-11-11 曾经把这里改成 Emit.done({"vm": {"snapshots": snaps}})，
+            # 结果包出双层 {"vm":{"vm":{...}}}，app 和测试一起挂——别再加一层。
             Emit.done({"snapshots": snaps})
             return 0
         w = winarm()
@@ -4275,6 +4520,7 @@ def cmd_snapshot(args) -> int:
         f = _vm_qcow2(vm)
         if not f:
             ok(f"{name} 没有可拍快照的 qcow2 盘")
+            # 同上：空列表也不要再包一层 vm，Emit.done 会包。
             Emit.done({"snapshots": []})
             return 0
         out = list_snapshots(f)
@@ -4282,6 +4528,7 @@ def cmd_snapshot(args) -> int:
             ok(f"{name} 还没有快照")
         for sn in out:
             ok(f"{sn['tag']}  {sn['size']}  {sn['date']}")
+        # 同上：不要再包一层 vm。
         Emit.done({"snapshots": out})
         return 0
 
@@ -4539,8 +4786,12 @@ def cmd_clone(args) -> int:
     # 用户复制这条命令去连，连上的是源虚拟机而不是克隆——两个 VM 还都在跑的话
     # 根本分不清。克隆出来的是装好的系统，命令应该直接能用，所以按新端口重算。
     if vm.get("ssh_port"):
+        # 两个 -o 的理由同 cmd_install_linux：克隆的 host key 和源不一样，
+        # 不带上的话用户一连就是「主机身份已变更」。
         vm["ssh_command"] = (f"ssh -i {vm.get('ssh_key', '')} "
                              f"-p {vm['ssh_port']} "
+                             f"-o StrictHostKeyChecking=no "
+                             f"-o UserKnownHostsFile=/dev/null "
                              f"{vm.get('user', 'agent')}@127.0.0.1")
     if vm.get("rdp_port"):
         vm["rdp_command"] = (f"open vnc://127.0.0.1:{5900 + vm['vnc_display']}"
@@ -5427,7 +5678,13 @@ def main() -> int:
                    help="密码文件，内容读进内存后即删，不进命令行参数")
     p.add_argument("--ssh-key")
     p.add_argument("--headless", action="store_true")
-    p.add_argument("--wait", type=int, default=40, help="等就绪的分钟数")
+    # 默认 60 分钟，不是 40。2026-11-11 两次实测：Windows Setup 在 2 核 HVF 上
+    # 跑到 47 分钟还没进首次登录（specialize 阶段的 CBS 组件检测停了很久），
+    # 40 分钟预算把一次本来可能成功的安装判成失败，而 VM 还在跑、盘上已写了
+    # 10 GB——用户重装要先手动删目录。catalog 里写的「10 到 15 分钟」是 Setup
+    # 本身的时间，不含它前面那段又慢又不动的组件检测。
+    # 命令行和 app 都能用 --wait 覆盖。
+    p.add_argument("--wait", type=int, default=60, help="等就绪的分钟数")
     p.add_argument("--no-auto", action="store_true",
                    help="本地安装包不要自动点安装器，跑起来之后用户自己在"
                         "画面里点完（默认自动点）")

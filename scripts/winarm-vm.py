@@ -357,16 +357,34 @@ if (Test-Path C:\Drivers) {
 
 # --- OpenSSH Server -------------------------------------------------------
 Log "installing OpenSSH Server"
-Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-  Log "FoD unavailable, fetching Win32-OpenSSH ARM64 from GitHub"
+# **Add-WindowsCapability 必须带超时。** 2026-11-11 实测：它从 Windows Update
+# 拉 OpenSSH FoD，在客人机网络慢/被限流时能挂住十几分钟不返回，而它是在
+# `if (-not (Get-Service sshd))` 之前的同步调用——挂住就意味着下面全部不执行：
+# sshd 没装、AutoAdminLogon 没钉、winarm-ready 没写，宿主机那边 40 分钟预算
+# 耗尽后报一句「等了 40 分钟 SSH 都没就绪」，和真实原因毫无关系。
+# 实测日志只有三行：starting / drivers / installing OpenSSH Server，然后就没有
+# 然后了。
+# 放后台 job 里等，最多 4 分钟；超时或没装上就走 GitHub 那个 fallback
+# （几 MB 的 zip，比 FoD 快一个量级）。fallback 原来永远走不到，就是因为它排在
+# 那句同步调用后面。
+$capDone = $false
+$cap = Start-Job { Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 }
+if (Wait-Job $cap -Timeout 240) {
+  if ((Get-Service sshd -ErrorAction SilentlyContinue)) { $capDone = $true }
+  Log "OpenSSH FoD: $($capDone ? 'installed' : 'not installed')"
+} else {
+  Log "OpenSSH FoD timed out after 240s -- falling back to GitHub release"
+}
+$cap | Remove-Job -Force
+if (-not $capDone) {
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $u = 'https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-ARM64.zip'
     $z = "$env:TEMP\openssh.zip"
-    Invoke-WebRequest -Uri $u -OutFile $z -UseBasicParsing
+    Log "fetching Win32-OpenSSH ARM64 from GitHub"
+    Invoke-WebRequest -Uri $u -OutFile $z -UseBasicParsing -TimeoutSec 180
     Expand-Archive -Path $z -DestinationPath 'C:\Program Files' -Force
-    & 'C:\Program Files\OpenSSH-ARM64\install-sshd.ps1'
+    & 'C:\Program Files\OpenSSH-ARM64\install-sshd.ps1' 2>&1 | Out-Null
   } catch { Log "OpenSSH GitHub fallback failed: $_" }
 }
 
@@ -1210,6 +1228,37 @@ def ssh_ready(cfg: Cfg, timeout: float = 12) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0 and "winarm-ok" in r.stdout
+
+
+def guest_setup_done(cfg: Cfg, timeout: float = 10) -> bool:
+    """客人机首次登录脚本是否已经跑完。
+
+    判据是 C:\\OEM\\winarm-ready 这个标记文件：first-logon 脚本的**最后一行**
+    才写它，而它前面几步里紧挨着的是把 AutoAdminLogon 钉成 1、删掉
+    AutoLogonCount。只判 SSH 通不通是不够的——sshd 一起来宿主机就能连上，
+    那时脚本还有三四秒收尾，钉自动登录那几行尚未执行。
+
+    为什么必须在关机前等它：见 vmkit.py 安装循环里的注释。简单说，sshd 是靠
+    自动登录那个交互会话拉起来的，自动登录没钉死 → 重启停在登录界面 →
+    SSH 再也起不来，而宿主机已经把 ready=true 写出去、报告「虚拟机已就绪」。
+    """
+    cmd = [
+        "ssh", "-i", str(cfg.ssh_key),
+        "-p", cfg.ssh_port,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={int(timeout)}",
+        "-o", "BatchMode=yes",
+        f"{cfg.username}@127.0.0.1",
+        # 客人机默认 shell 是 PowerShell（first-logon 脚本把 DefaultShell 改了），
+        # 所以用 PowerShell 的 Test-Path。输出 True/False。
+        "if (Test-Path C:\\OEM\\winarm-ready) { 'READY' } else { 'NOTYET' }",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and "READY" in r.stdout
 
 
 def disk_used(p: Path) -> float:

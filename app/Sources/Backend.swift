@@ -237,6 +237,9 @@ final class Backend: ObservableObject {
     private var tailTimer: DispatchSourceTimer?
     /// 日志已读到的字节数。轮询时用它 seek，避免把同一段解析两遍。
     private var tailOffset: UInt64 = 0
+    /// 正在尾的那个文件的 inode。轮询时拿它判断日志有没有被换成另一个文件
+    /// （--force 重装就会），见 readMore 里的说明。
+    private var tailFileId: Int = 0
     /// 正在尾的安装进程 pid。用来判断安装是否结束。
     private var tailPid: Int32?
 
@@ -304,7 +307,15 @@ final class Backend: ObservableObject {
                 guard let url = logURL, installPid > 0 else {
                     // 连日志路径都没拿到，说明起就没起来
                     self?.running -= 1
-                    self?.errorMessage = "安装没起来，没拿到日志路径"
+                    // 不能无条件覆写 errorMessage。父进程秒死时（名字后端不认、
+                    // 同名已存在）后端已经把具体原因写进 errorMessage 了，而这里
+                    // 原来一句「安装没起来，没拿到日志路径」把它盖掉——用户看到
+                    // 的和真实原因毫无关系，真实原因只留在日志区里要自己滚到底。
+                    // 只在自己还没有更具体的原因时才补这句兜底。
+                    if self?.errorMessage?.isEmpty != false {
+                        self?.errorMessage = "安装没起来，没拿到日志路径。"
+                            + "常见原因：虚拟机名字后端不接受，或者同名虚拟机已存在。"
+                    }
                     completion()
                     return
                 }
@@ -339,7 +350,14 @@ final class Backend: ObservableObject {
     func tailLog(_ url: URL, pid: Int32, fromStart: Bool = true,
                  onEvent: @escaping ([String: Any]) -> Void,
                  completion: @escaping () -> Void) {
-        if fromStart { tailOffset = 0 }
+        if fromStart {
+            tailOffset = 0
+            // 从当前这个文件的身份开始比。置 0 会让第一次轮询判定「换文件了」
+            // 并把 offset 归零——从头读正是 fromStart 想要的效果。为假时
+            // （resumeTailing）不动它：那边已经按当前文件对齐过了，置零会让
+            // 整份日志被重读一遍、同一个错误弹窗连跳两次（2026-11-10 踩过）。
+            tailFileId = 0
+        }
         tailPid = pid
 
         let parser = StreamParser()
@@ -348,6 +366,31 @@ final class Backend: ObservableObject {
         }
 
         func readMore() {
+            // 先确认这个路径上还是不是刚才那个文件。
+            //
+            // --force 重装时 vmkit 会把整个 VM 目录 rmtree 掉再重建 install.log
+            // （子进程的 _rmtree + _reopen_install_log），路径没变、内容却换了
+            // 一整个文件。原来这里只按 tailOffset 接着读：上一轮日志有 40 MB 时
+            // tailOffset 比新文件还大，seek 过去 readDataToEndOfFile 永远返回空，
+            // 而 `if !data.isEmpty` 让ingest 一次都不发生——新安装的日志一条都收
+            // 不到，界面停在「准备中」直到新文件字节数长过旧文件为止。
+            // 2026-11-11 审计复验：vmkit.py 的 spawn_detached_install 用 append
+            // 写表头，子进程随后 _rmtree 换新 inode。
+            // 判据用 inode（systemFileNumber），不用 mtime：同一秒内写完再删重建
+            // 时 mtime 可能一模一样。
+            let fileId = self.fileId(of: url)
+            let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path))
+                ?? [:]
+            let size = (attrs[.size] as? Int) ?? 0
+            if fileId != tailFileId {
+                // 换文件了。offset 归零从头读——这正是我们想看的那个新日志。
+                // 旧内容已经读过一遍，不会重复弹错误（见 tailLog 的 fromStart）。
+                tailFileId = fileId
+                tailOffset = 0
+            } else if UInt64(size) < tailOffset {
+                // 同一个 inode 但变小了：被 truncate 过。同样从头读。
+                tailOffset = 0
+            }
             guard let fh = try? FileHandle(forReadingFrom: url) else { return }
             defer { try? fh.close() }
             fh.seek(toFileOffset: tailOffset)
@@ -386,6 +429,14 @@ final class Backend: ObservableObject {
         timer.resume()
     }
 
+    /// 这个路径上当前文件的 inode。读不到给 0——那时 readMore 会判定「文件被
+    /// 换过」并把 offset 归零，对刚创建的日志来说正是要的行为。
+    private func fileId(of url: URL) -> Int {
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path))
+            ?? [:]
+        return (attrs[.systemFileNumber] as? Int) ?? 0
+    }
+
     /// app 重新打开时接着看一个还在跑的安装。
     func resumeTailing(_ url: URL, pid: Int32,
                        onEvent: @escaping ([String: Any]) -> Void,
@@ -398,6 +449,9 @@ final class Backend: ObservableObject {
         }
         if let data = try? Data(contentsOf: url), !data.isEmpty {
             tailOffset = UInt64(data.count)
+            // 身份也要对齐，否则 tailLog(fromStart: false) 之后的第一次轮询会
+            // 判定「文件被换过」而把整份日志重读一遍。
+            tailFileId = fileId(of: url)
             parser.ingest(data, onEvent: onEvent)
         }
         // 同一个理由：不能写 kill(pid, 0)。见 tailLog 里那段注释。

@@ -103,7 +103,10 @@ struct ConfigForm: View {
             } header: {
                 Text("起个名字")
             } footer: {
-                Text("名字会当目录名用，只能含字母、数字、- 和 _。")
+                // 规则要和 vmkit 的 check_vm_name 一致：首字符字母数字，其余可以
+                // 加 . - _，最长 63。原来这句漏了「点号可以用」也没说首字符和长度，
+                // 而两端的真实规则都不是它写的这样。2026-11-11 审计补上。
+                Text("名字会当目录名用：以字母或数字开头，其余可以是字母、数字、. - _，最长 63 个字符。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -115,6 +118,9 @@ struct ConfigForm: View {
                             state.vmCpus = min(p.cpus, Host.cores)
                             state.vmRam = p.ram
                             state.vmDisk = p.disk
+                            // 用户动过资源配置。记下来，pick() 再来就不覆盖
+                            // （见 AppState.pick 的注释）。
+                            state.markTuned()
                         }
                     }
                 }
@@ -127,18 +133,22 @@ struct ConfigForm: View {
             }
 
             Section {
-                Stepper("CPU 核心：\(state.vmCpus)", value: $state.vmCpus,
+                Stepper("CPU 核心：\(state.vmCpus)",
+                        value: Binding(get: { state.vmCpus },
+                                       set: { state.vmCpus = $0; state.markTuned() }),
                         in: 1...Host.cores)
                 ResourceBar(value: Double(state.vmCpus), total: Double(Host.cores),
                             label: "CPU", valueText: "\(state.vmCpus) / \(Host.coresText)")
-                Picker("内存", selection: $state.vmRam) {
+                Picker("内存", selection: Binding(get: { state.vmRam },
+                                                  set: { state.vmRam = $0; state.markTuned() })) {
                     ForEach(memOptions, id: \.self) { Text($0) }
                 }
                 ResourceBar(value: memBytes(state.vmRam),
                             total: Double(Host.bytes),
                             label: "内存",
                             valueText: "\(state.vmRam) / \(Host.memText)")
-                Picker("磁盘", selection: $state.vmDisk) {
+                Picker("磁盘", selection: Binding(get: { state.vmDisk },
+                                                  set: { state.vmDisk = $0; state.markTuned() })) {
                     ForEach(diskOptions, id: \.self) { Text($0) }
                 }
                 Text("磁盘是稀疏文件，写到了才真占空间，所以给大一点不浪费。")
@@ -156,14 +166,27 @@ struct ConfigForm: View {
 
             Section {
                 LabeledContent("登录名") {
-                    TextField("用户名", text: $state.vmUser).frame(width: 200)
+                    TextField("用户名",
+                              text: Binding(get: { state.vmUser },
+                                            set: { state.vmUser = $0; state.markTuned() }))
+                        .frame(width: 200)
                 }
                 LabeledContent("密码") {
                     Group {
+                        // 两个绑定都带上 markPasswordTouched：重装时要靠它区分
+                        // 「用户设的密码」和「表单里的默认值」。见 AppState.reinstall。
                         if state.showPassword {
-                            TextField("密码", text: $state.vmPassword).frame(width: 200)
+                            TextField("密码",
+                                      text: Binding(get: { state.vmPassword },
+                                                    set: { state.vmPassword = $0
+                                                           state.markPasswordTouched() }))
+                                .frame(width: 200)
                         } else {
-                            SecureField("密码", text: $state.vmPassword).frame(width: 200)
+                            SecureField("密码",
+                                        text: Binding(get: { state.vmPassword },
+                                                      set: { state.vmPassword = $0
+                                                             state.markPasswordTouched() }))
+                                .frame(width: 200)
                         }
                     }
                 }
