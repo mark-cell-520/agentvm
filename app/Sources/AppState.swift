@@ -230,7 +230,15 @@ final class AppState: ObservableObject {
             self.checkItems = items
             self.checkOk = (ev["ok"] as? Bool) ?? false
             if dropped > 0 {
-                self.errorMessage = "宿主机检查有 \(dropped) 项显示不出来"
+                // 写 backend.errorMessage，不是 self.errorMessage——AppState 没有
+                // 这个成员，界面上要显示的那句话在 Backend 上。同文件其他分支
+                // （handleCatalog / handleStatus / handleImages）写的都是
+                // backend.errorMessage。2026-11-11 实测踩到：写成 self. 之后
+                // app/Sources 的真编译直接
+                // "value of type 'AppState' has no member 'errorMessage'"，
+                // 而 make lint 的 Swift 检查是 swiftc -parse——只查语法、不查
+                // 类型，这句到用户机器上编 app 时才炸。
+                self.backend.errorMessage = "宿主机检查有 \(dropped) 项显示不出来"
                     + "（后端给的字段和这个版本的 app 对不上）"
                 self.revision += 1
             }

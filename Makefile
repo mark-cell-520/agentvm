@@ -123,24 +123,31 @@ lint: ## Syntax-check every script
 	@for f in agentvm.py backends/*.py scripts/*.py scripts/lib/*.py; do \
 		python3 -I -c "import ast,sys;ast.parse(open(sys.argv[1],encoding='utf-8').read(),sys.argv[1])" "$$f" \
 			&& echo "  ok $$f" || exit 1; done
+	# Swift 用 -typecheck，不是 -parse。-parse 只过语法层：名字写错、引用不
+	# 存在的成员、类型不匹配，它一条都不报。2026-11-11 实测踩到：AppState.swift
+	# 里写过一句 self.errorMessage（AppState 没有这个成员，那句话在 Backend
+	# 上），make lint 的 swiftc -parse 全绿，而 app/build.sh 的真编译直接
+	# error——这个仓库的 app 一度处于「lint 全过但编不出来」的状态。
+	# -typecheck 要过一遍类型层，实测三批合计约 2.8 秒（-parse 是 0.21 秒），
+	# 换来的正是这类错误的可见性。
 	@if command -v swiftc >/dev/null 2>&1; then \
-		swiftc -parse -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
+		swiftc -typecheck -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
 			-target arm64-apple-macos14.0 \
 			app/Sources/MacVMEngine.swift scripts/vmz/main.swift \
 			&& echo "  ok swift (MacVMEngine + vmz)"; \
 	 else echo "  skip swift (没有 swiftc)"; fi
 	@if command -v swiftc >/dev/null 2>&1; then \
-		swiftc -parse -parse-as-library -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
+		swiftc -typecheck -parse-as-library -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
 			-target arm64-apple-macos14.0 \
 			app/Sources/*.swift \
 			&& echo "  ok swift (app/Sources 全部)"; \
 	 else echo "  skip swift (没有 swiftc)"; fi
-	# vzrun.swift 必须单独 parse：它和 vmz/main.swift 一样是带顶层可执行代码的
-	# CLI 入口，两个入口放进同一次 swiftc -parse 会互相报
+	# vzrun.swift 必须单独查：它和 vmz/main.swift 一样是带顶层可执行代码的
+	# CLI 入口，两个入口放进同一次 swiftc 会互相报
 	# "statements are not allowed at the top level"——那不是代码错，是编译单元
 	# 里出现了两个 main。分开各查一次才查得出各自的真错。
 	@if command -v swiftc >/dev/null 2>&1; then \
-		swiftc -parse -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
+		swiftc -typecheck -sdk "$$(xcrun --sdk macosx --show-sdk-path)" \
 			-target arm64-apple-macos14.0 \
 			scripts/vzrun.swift \
 			&& echo "  ok swift (vzrun)"; \
