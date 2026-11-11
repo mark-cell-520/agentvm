@@ -1397,8 +1397,12 @@ def cmd_install_local(vm: dict, source: Path, auto: bool = True,
     # ---- 自动安装 ----
     Emit.stage("install", "自动安装中")
     ai = autoinstall()
+    # stage 回调单开一条：它换的是 app 里标题那一行，emit 是往日志里追加。
+    # 「等安装器画面出现」那 20~40 秒原来整个是静默的（固件初始化加光盘引导），
+    # app 上一直挂着「启动安装器」，用户看不出它到底在等什么。
     result = ai.drive(vm, d, budget_minutes=wait_minutes,
-                      emit=lambda m, lv="info": Emit.log(m, lv))
+                      emit=lambda m, lv="info": Emit.log(m, lv),
+                      stage=lambda sid, label: Emit.stage(sid, label))
 
     if result == "done":
         return _local_mark_ready(vm)

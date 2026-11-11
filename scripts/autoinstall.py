@@ -47,7 +47,9 @@ catalog 里那几条路本来就是一键的：Linux 云镜像压根没有安装
 from __future__ import annotations
 
 import socket
+import struct
 import time
+import zlib
 from pathlib import Path
 
 # 主按钮的颜色判据。fnOS 用的是 (51,116,219)；别的图形安装器主按钮也多是
@@ -83,31 +85,71 @@ FP_DIFF_FRAC = 0.01         # 超过 1% 的采样点变了才算换了一帧
 # 光标就能把「同一帧」推过线。按钮位置是个离散的高信号特征：完成屏的「下一步」
 # 在正中间，网络设置屏的「保存」在右下角，差 148 像素，一眼就能分开。
 FP_BTN_TOL = 8
+# 每个采样点在指纹里占几个字节。帧的内存序是 B,G,R,pad 四字节，所以整组取出来
+# 比只取前三个字节快得多——见 fingerprint() 的说明。
+FP_BPP = 4
+# diff_frac 的「单个分量差多少算变了」查表。translate 是 C 级逐字节映射，
+# 拿它把一个「逐字节差值」串变成「这个字节算不算变」的 0/1 串。
+_DIFF_TABLE = bytes(1 if i > FP_TOL else 0 for i in range(256))
+# primary_button 的单槽缓存：(帧, 按钮中心)。见那个函数的 docstring。
+# 只留一个槽：驱动器是顺序消费帧的，同一帧连续调几次之后就换下一帧了。
+_BTN_CACHE: tuple[bytes, tuple[int, int] | None] | None = None
 
 
 def fingerprint(frame: bytes, w: int, h: int) -> bytes:
-    """画面的粗指纹：按 FP_STEP 采样出来的 RGB 串。"""
+    """画面的粗指纹：按 FP_STEP 采样出来的 BGRA 串，每个采样点 4 字节。
+
+    为什么每组取 4 字节而不是 3 字节（2026-11-11 改）：原来是一个 Python 循环
+    逐点拼三字节（1.36ms/次），现在靠 memoryview.cast 一次切一行（0.05ms/次）。
+    这一步每轮都要做，安装一跑就是几千轮。
+
+    **cast("I") 是这儿的关键，不能换成对 bytes 直接切片。** `bytes[a:b:16]` 的
+    步长按**字节**算，切出来是 200 个单字节，不是 200 个 4 字节组——那等于把指纹
+    退化成了「只采样蓝通道的一个字节」，而 fnOS 那个纯蓝按钮的蓝是 219、浅底是
+    245，差 26 低于 FP_TOL=40，整块按钮就这么从判据里消失了。cast 成无符号 32
+    位整型视图之后，步长按**元素**算，16 字节正好是 4 个像素。第一版就栽在这儿，
+    43 条测试一条都没报——所以现在有一条 test_r_channel_difference_is_seen 盯着。
+    """
+    mv = memoryview(frame).cast("I")
     out = bytearray()
     for y in range(0, h, FP_STEP):
-        base = y * w * 4
-        for x in range(0, w, FP_STEP):
-            o = base + x * 4
-            out += frame[o:o + 3]
+        base = y * w
+        out += mv[base:base + w:FP_STEP].tobytes()
     return bytes(out)
 
 
 def diff_frac(a: bytes, b: bytes) -> float:
-    """两幅指纹里「变了」的采样点占比。长度不一样直接算全变。"""
+    """两幅指纹里「变了」的采样点占比。长度不一样直接算全变。
+
+    四条路全都是 C 级，没有 Python 级逐点循环（2026-11-11 改，原来 2.3ms/次）：
+
+    1. 整串相等 → 0。静止等待期每一轮都撞这一条，一次 memcmp 就完事。
+    2. 两个大整数异或，一次算出所有分量的差值。
+    3. translate 查表，把「差值 > FP_TOL」压成 0/1 串。
+    4. 四个通道各自隔 4 取一个再按位或，得到「这个采样点算不算变」，
+       数一数非零个数就是变化比例。
+
+    为什么值得这么写：drive() 每一轮都要拿当前帧和 seen 里所有历史帧各比一次
+    （判断「是不是又回到这一屏了」「这一屏试过几招」），跑满 200 个动作时一轮
+    就是 200 次 diff_frac。按原来 2.3ms 算是每轮 460ms 纯 CPU——宿主机上一个
+    Python 进程和 QEMU 抢核，安装会变慢，而这一点在日志里完全看不出来。
+    """
     if len(a) != len(b):
         return 1.0
-    diff = 0
-    n = 0
-    for i in range(0, len(a), 3):
-        if (abs(a[i] - b[i]) > FP_TOL or abs(a[i + 1] - b[i + 1]) > FP_TOL
-                or abs(a[i + 2] - b[i + 2]) > FP_TOL):
-            diff += 1
-        n += 1
-    return diff / n if n else 1.0
+    if a == b:
+        return 0.0
+    d = (int.from_bytes(a, "little") ^ int.from_bytes(b, "little")).to_bytes(
+        len(a), "little")
+    m = d.translate(_DIFF_TABLE)
+    n = (len(a) + FP_BPP - 1) // FP_BPP
+    if n == 0:
+        return 1.0
+    v = (int.from_bytes(m[0::FP_BPP], "little")
+         | int.from_bytes(m[1::FP_BPP], "little")
+         | int.from_bytes(m[2::FP_BPP], "little")
+         | int.from_bytes(m[3::FP_BPP], "little"))
+    vb = v.to_bytes(n, "little")
+    return (n - vb.count(0)) / n
 
 
 def same_screen(a, b) -> bool:
@@ -131,16 +173,76 @@ ACT_PAUSE = 2.0             # 做完一个动作等这么久再看
 DISK_QUIET = 2.0
 # 最多做多少个动作。防 runaway：真出岔子时不能让驱动器在那儿按一晚上回车。
 ACT_LIMIT = 200
-# 每个动作之前把当前画面存成 <vm 目录>/auto-<序号>.ppm，只保留最近这么多张。
+# 每个动作之前把当前画面存成 <vm 目录>/auto-<序号>.png，只保留最近这么多张。
 # 自动安装退成手动时，用户（和我们）第一句话就是「它停在什么屏幕上」——不留
 # 现场就只能靠猜。2026-11-11 实测：不留图时盯着日志数回车次数，怎么数都对不上
 # 实际走到了哪一屏，白白绕了一圈。
 KEEP_FRAMES = 24
+# 存成 PNG 而不是 PPM（2026-11-11 改）。两个理由，都能量出来：
+#   · 磁盘：PPM 是不压缩的 800×600×3 = 1.4MB 一张，24 张常驻 34MB，而安装器
+#     画面是大块纯色加文字，PNG 压完 20~40KB——同一个 VM 目录少占 33MB，
+#     那些帧在安装结束之前一张都用不上。
+#   · CPU：PPM 那次改造之前，BGR→RGB 是逐像素 Python 循环，实测 62ms/张；
+#     改成三道切片赋值之后是 0.3ms，再算上 zlib 压 6 级约 8ms，一共不到 9ms。
+#     一个 200 步的安装从 12.5 秒 CPU 降到 1.8 秒。
+# 顺带的好处：Read 工具和 Preview 都认 PNG，原来那堆 .ppm 谁都打不开。
+FRAME_SUFFIX = ".png"
 # 回车的 keysym。这是驱动器的主要动作，见 drive() 里的说明。
 KEY_RETURN = 0xFF0D
 # 盘上写过这么多字节，才算「安装已经开始了」。没到这个数时不弹光盘、也不认
 # 「重启后又回到安装器」——第一屏时盘还是空的，那时候看见重复画面只是点击没生效。
 EJECT_MIN_DISK = 512 << 20
+# 动作帧的记忆分两段留着，不存全部（2026-11-11 改）。
+#
+# 原来是一个 list 把每个动作帧的签名都留着，跑满 ACT_LIMIT=200 就是 200 × 120KB
+# ≈ 24MB——autoinstall 是和 QEMU 并跑的 Python 进程，这 24MB 是白占的。而这两段
+# 记忆的用途完全不同，本来就该分开：
+#   · 最早 32 个动作帧（seen_early）：重启检测的唯一依据。「重启后又回到第一屏」
+#     要认的是第一屏，它几乎总是最早那几个动作之一。
+#   · 最近 16 个动作帧（seen_recent）：「这一屏已经试过几招了」要的是相邻的几次，
+#     隔了十几屏再回到同一屏时按回车重新试一遍并没有什么害处。
+# 两段不重叠（acts < EARLY_KEEP 时只进 early），所以「试过几次」不会把同一帧数两遍
+# ——数重了会提前撞上撤退，把一个只是反应慢的安装器当成点不动。
+# 每这么多轮取帧，就回过头来要一次全屏（2026-11-11 加，配合增量更新用）。
+# 增量更新靠本地副本在两条更新之间保持画面完整，万一漏了一个矩形，副本就和
+# 服务端不一致了，而那种故障从外表看不出来——画面照样在动，只是内容和真的不一样。
+# 全屏重同步的代价是一帧 1.9MB，摊到 30 轮上可以忽略。
+RESYNC_EVERY = 30
+EARLY_KEEP = 32
+RECENT_KEEP = 16
+
+
+class FrameMemory:
+    """动作帧的两段记忆。
+
+    抽成类是为了能单独测：这两个容器怎么长、长满了之后旧的那段还认不认得出第一屏，
+    是重启检测的唯一依据，而它跑一遍 drive() 要一分钟——不值得为它编那么慢的测试。
+    """
+
+    def __init__(self) -> None:
+        self.early: list = []          # 最早的 EARLY_KEEP 个动作帧
+        self.recent: list = []         # 最近 RECENT_KEEP 个动作帧
+
+    def remember(self, sig) -> None:
+        # 两段不重叠，见 EARLY_KEEP 那段注释：重叠会让「试过几次」多数一遍，
+        # 而多数了会提前撞上撤退，把一个只是反应慢的安装器当成点不动。
+        if len(self.early) < EARLY_KEEP:
+            self.early.append(sig)
+        else:
+            self.recent.append(sig)
+            if len(self.recent) > RECENT_KEEP:
+                self.recent.pop(0)
+
+    def was_seen(self, sig) -> bool:
+        return (any(same_screen(sig, s) for s in self.early)
+                or any(same_screen(sig, s) for s in self.recent))
+
+    def times_tried(self, sig) -> int:
+        return (sum(1 for s in self.early if same_screen(sig, s))
+                + sum(1 for s in self.recent if same_screen(sig, s)))
+
+    def __len__(self) -> int:
+        return len(self.early) + len(self.recent)
 
 
 class AutoError(RuntimeError):
@@ -166,7 +268,16 @@ class RFB:
         self.port = port
         self.timeout = timeout
         self.sk = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        # 关掉 Nagle。这个连接上跑的是「按一下回车 → 等一帧看反应」这种一问一答，
+        # 小包被攒起来一起发会直接变成操作延迟。回环上也一样，而且不花钱。
+        self.sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sk.settimeout(timeout)
+        # 下一帧是全屏请求还是增量请求。全屏要求服务端把整个区域画完（RFC 6143
+        # 7.5.3），增量来多少算多少。
+        self._want_full = True
+        # 本地 framebuffer 副本。增量模式就靠它在两条更新之间保持画面完整；
+        # None 表示还没有拿到过任何一帧（第一次必须全屏）。
+        self._fb: bytearray | None = None
         self._handshake()
 
     def _recv(self, n: int) -> bytes:
@@ -214,67 +325,123 @@ class RFB:
                         b"\x00\x00\x00")
 
     def request_full(self) -> None:
+        """要一整帧（incremental=0）。"""
         # FramebufferUpdateRequest 一共 10 字节：类型 1 + incremental 1 +
         # x/y/w/h 各 2。多写一个字节的后果见 SetEncodings 那段注释。
+        self._want_full = True
         self.sk.sendall(b"\x03\x00\x00\x00\x00\x00"
                         + self.w.to_bytes(2, "big") + self.h.to_bytes(2, "big"))
 
-    def frame(self, timeout: float = 25.0) -> bytes:
-        """读一整帧 Raw，返回 w*h*4 字节。"""
+    def request_incr(self) -> None:
+        """只要变化的那一块（incremental=1）。
+
+        这是 2026-11-11 那次优化的主体，而它省的主要不是我们的 CPU，是 **QEMU 的**。
+        这个连接上只有一个客户端（驱动器自己；app 的内嵌控制台是另开的一条），而
+        每发一次全屏请求，QEMU 的 VNC 线程就得把整块显存按 Raw 编一遍、推 1.9MB
+        过来。驱动器一轮要取一次帧，安装一跑就是几千轮——等于让 QEMU 在整个安装
+        期间持续做一件几乎没意义的事，而它做的这些正好和安装器自己抢宿主机 CPU。
+        改成增量之后，QEMU 只编变化区域：进度页那几分钟里一帧只有几十 KB。
+
+        代价是本地要维护一份 framebuffer 副本（self._fb，1.9MB）。另外增量模式
+        有个必须自己兜的性质：画面真的没变时服务端一条都不发，所以这里的超时不是
+        错误，而是「没变」的信号——frame() 在增量模式下超时返回 None。
+        """
+        self._want_full = False
+        self.sk.sendall(b"\x03\x01\x00\x00\x00\x00"
+                        + self.w.to_bytes(2, "big") + self.h.to_bytes(2, "big"))
+
+    def frame(self, timeout: float = 25.0):
+        """取一帧。全屏模式返回 w*h*4 字节；增量模式可能返回 None（画面没变）。
+
+        全屏请求下会一直读到**整个画面都画满**为止（2026-11-11 修）。RFC 6143
+        7.5.3 说服务端可以爱分几条 FramebufferUpdate 就分几条，原来只读第一条
+        就返回：没画到的地方留在初始化的全 0 里，就是一张「半屏真画面、半屏纯黑」
+        的图。而 is_dark 的判据正是「平均亮度低」——一张半黑帧会被当成「客人机
+        重启了」，把 saw_dark 无端置上，放大重启循环判据的误报面（见 drive() 里
+        那段）。代价是一个 480k 字节的 mask 加一次 count，正常情况第一帧就画满。
+
+        增量模式下：第一条 FramebufferUpdate 落到本地副本上就返回；等到超时一条
+        都没有，返回 None——那说明画面压根没动，调用方该直接用上一帧。
+        """
         deadline = time.time() + timeout
+        if self._fb is None:
+            out = bytearray(self.w * self.h * 4)
+            painted = bytearray(self.w * self.h)
+        else:
+            out = self._fb                     # 就地更新本地副本
+            painted = bytearray(self.w * self.h)
         while True:
             left = deadline - time.time()
             if left <= 0:
+                if not self._want_full:
+                    return None                 # 增量等待超时 = 画面没变
                 raise AutoError("等 RFB 帧超时")
             self.sk.settimeout(left)
-            t = self._recv(1)[0]
-            if t == 0:                                  # FramebufferUpdate
-                self._recv(1)
-                nrect = int.from_bytes(self._recv(2), "big")
-                # 一个矩形都没有的空更新：不返回假黑帧。
-                #
-                # out 初始化成全 0，nrect == 0 时它就是一张纯黑图。而 is_dark()
-                # 的判据正是「平均亮度 < 60」——一张假黑帧会被当成「客人机重启了」，
-                # 把 saw_dark 无端置上，放大重启循环判据的误报面（见 drive() 里
-                # 那段）。本实现总是发 incremental=0 的全屏请求，正常不会走到这儿，
-                # 但代价只是多等一轮，比送一张假画面进去安全。2026-11-11 审计补上。
-                if nrect == 0:
+            try:
+                t = self._recv(1)[0]
+            except socket.timeout:
+                # 一个字节都没读到就超时。增量模式下这就是「画面没变」——服务端
+                # 没有可发的区域，于是什么都不发。注意只在这一处这么解释：矩形数据
+                # 读到一半超时是另一回事，那时流已经错位，这个连接不能再用，那个
+                # 异常照旧往上冒，让 drive() 退回手动。
+                if not self._want_full:
+                    return None
+                raise AutoError("等 RFB 帧超时")
+            if t != 0:                                # 别的消息类型
+                self._skip_message(t)
+                continue
+            self._recv(1)                             # 补位
+            nrect = int.from_bytes(self._recv(2), "big")
+            # 一个矩形都没有的空更新：不当成画面。
+            #
+            # 增量模式下服务端有时会回一条空更新（客户端请求了、但没有任何区域
+            # 脏）。原来 nrect == 0 时 out 是全 0，返回去就是一张纯黑图，而 is_dark
+            # 的判据正是「平均亮度 < 60」——一张假黑帧会被当成「客人机重启了」，
+            # 把 saw_dark 无端置上，放大重启循环判据的误报面（见 drive() 里那段）。
+            # 现在 out 接着本地副本，continue 只是多等一轮。2026-11-11 审计补上。
+            if nrect == 0:
+                continue
+            for _ in range(nrect):
+                rh = self._recv(12)
+                x = int.from_bytes(rh[0:2], "big")
+                y = int.from_bytes(rh[2:4], "big")
+                rw = int.from_bytes(rh[4:6], "big")
+                rhh = int.from_bytes(rh[6:8], "big")
+                enc = int.from_bytes(rh[8:12], "big")
+                if enc != 0:
+                    raise AutoError(f"RFB 服务端用了非 Raw 编码 {enc}，"
+                                    f"这个驱动器只认 Raw")
+                if rw == 0 or rhh == 0:
                     continue
-                out = bytearray(self.w * self.h * 4)
-                for _ in range(nrect):
-                    rh = self._recv(12)
-                    x = int.from_bytes(rh[0:2], "big")
-                    y = int.from_bytes(rh[2:4], "big")
-                    rw = int.from_bytes(rh[4:6], "big")
-                    rhh = int.from_bytes(rh[6:8], "big")
-                    enc = int.from_bytes(rh[8:12], "big")
-                    if enc != 0:
-                        raise AutoError(f"RFB 服务端用了非 Raw 编码 {enc}，"
-                                        f"这个驱动器只认 Raw")
-                    if rw == 0 or rhh == 0:
-                        continue
-                    data = self._recv(rw * rhh * 4)
-                    if len(data) != rw * rhh * 4:
-                        raise AutoError("RFB 矩形数据长度不对")
-                    stride = rw * 4
-                    for r in range(rhh):
-                        off = ((y + r) * self.w + x) * 4
-                        out[off:off + stride] = data[r * stride:(r + 1) * stride]
+                data = self._recv(rw * rhh * 4)
+                if len(data) != rw * rhh * 4:
+                    raise AutoError("RFB 矩形数据长度不对")
+                stride = rw * 4
+                for r in range(rhh):
+                    off = ((y + r) * self.w + x) * 4
+                    out[off:off + stride] = data[r * stride:(r + 1) * stride]
+                    painted[(y + r) * self.w + x:(y + r) * self.w + x + rw] = \
+                        b"\x01" * rw
+            if not self._want_full or not painted.count(0):
                 if len(out) != self.w * self.h * 4:
                     raise AutoError("RFB 帧大小不对")
+                self._fb = out                # 留着给下一轮增量续接
                 return bytes(out)
-            if t == 1:                                  # SetColourMapEntries
-                self._recv(3)
-                n = int.from_bytes(self._recv(2), "big")
-                self._recv(n * 6)
-            elif t == 2:                                # Bell
-                pass
-            elif t == 3:                                # ServerCutText
-                self._recv(3)
-                n = int.from_bytes(self._recv(4), "big")
-                self._recv(n)
-            else:
-                raise AutoError(f"RFB 服务端发来不认识的消息类型 {t}")
+
+    def _skip_message(self, t: int) -> None:
+        """把一条非 FramebufferUpdate 的消息从流上读掉。"""
+        if t == 1:                                  # SetColourMapEntries
+            self._recv(3)
+            n = int.from_bytes(self._recv(2), "big")
+            self._recv(n * 6)
+        elif t == 2:                                # Bell
+            pass
+        elif t == 3:                                # ServerCutText
+            self._recv(3)
+            n = int.from_bytes(self._recv(4), "big")
+            self._recv(n)
+        else:
+            raise AutoError(f"RFB 服务端发来不认识的消息类型 {t}")
 
     def key_tap(self, keysym: int, hold: float = 0.06) -> None:
         self.sk.sendall(b"\x04\x01\x00\x00" + keysym.to_bytes(4, "big"))
@@ -322,7 +489,17 @@ def primary_button(frame: bytes, w: int, h: int) -> tuple[int, int] | None:
        文字），必须拆开一个个看，不能放在一个包围盒里。
     3. **形状过滤**。按钮是矮胖矩形（宽高比 2~4），表格行是细长条（实测 417×18，
        宽高比 23），蓝色文字是碎斑。用宽高比和面积把不像按钮的剔掉。
+
+    **带一个单槽缓存**（2026-11-11 加）：驱动器在「等画面稳下来」那段时间里会
+    拿着同一帧反复调这个函数——原来每轮白算 6.5ms。同一个 frame 对象直接复用
+    上一次的结果。判定本身是纯函数（同样的画面必然给出同样的按钮），而指纹相同
+    在我们这套判据里就等于同一屏，所以缓存不会把两屏混成一屏。
     """
+    global _BTN_CACHE
+    c = _BTN_CACHE
+    if c is not None and c[0] == frame:
+        return c[1]
+
     counts: dict[tuple[int, int, int], int] = {}
     # 隔行隔列采样做候选，够快也够准——按钮是实心块，采样丢不了它
     for y in range(0, h, 2):
@@ -385,8 +562,11 @@ def primary_button(frame: bytes, w: int, h: int) -> tuple[int, int] | None:
             if best is None or len(comp) > best[0]:
                 best = (len(comp), cx, cy)
     if best is None:
+        _BTN_CACHE = (frame, None)
         return None
-    return best[1], best[2]
+    pt = (best[1], best[2])
+    _BTN_CACHE = (frame, pt)
+    return pt
 
 
 # ------------------------------------------------------------ QEMU 监控命令 --
@@ -540,9 +720,11 @@ def is_dark(frame: bytes, w: int, h: int) -> bool:
 
 
 def _frame_no(p: Path) -> int:
-    """auto-<n>.ppm 里的 n，读不出来排到最后。
+    """auto-<n>.<后缀> 里的 n，读不出来排到最后。
 
     只给 save_frame 的向前剪用（见那儿说明为什么不能按字典序排）。
+    .ppm 和 .png 都认：早先的版本写 PPM，直接换后缀会让老 VM 目录里那些帧
+    逃过剪枝、越堆越多。
     """
     try:
         return int(p.stem.split("-", 1)[1])
@@ -550,27 +732,49 @@ def _frame_no(p: Path) -> int:
         return 1 << 30
 
 
-def save_frame(vdir: Path, n: int, frame: bytes, w: int, h: int) -> None:
-    """把一帧存成 PPM，只留最近 KEEP_FRAMES 张。
+def _png(w: int, h: int, rgb: bytes) -> bytes:
+    """RGB 串 → PNG 字节流。
 
-    RFB 的内存序是 B,G,R,pad，PPM 要 R,G,B，每组 4 字节里的 0 和 2 要换过来。
-    RFB 的第 0 行是画面顶部，PPM 也是，行序不用动。
+    自己写而不用 Pillow： Pillow 不是系统 Python 的自带模块，而这段代码跑在用户
+    的机器上（vmkit.py 是当脚本跑的，装 app 的时候不会去 pip install 任何东西）。
+    PNG 的结构对这个用途足够简单：一个 IHDR、一个用 zlib 压起来的 IDAT（每行前面
+    加一个 0 表示「不过滤」）、一个 IEND。zlib 和 struct 都是标准库。
     """
-    ppm = vdir / f"auto-{n}.ppm"
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    stride = w * 3
+    raw = bytearray()
+    for y in range(h):
+        raw += b"\x00"
+        raw += rgb[y * stride:(y + 1) * stride]
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+            + chunk(b"IEND", b""))
+
+
+def save_frame(vdir: Path, n: int, frame: bytes, w: int, h: int) -> None:
+    """把一帧存成 PNG，只留最近 KEEP_FRAMES 张。
+
+    RFB 的内存序是 B,G,R,pad，PNG 要 R,G,B。原来是一个 Python 循环逐像素换
+    （62ms/张），现在三道切片赋值：帧里 B 通道是 frame[0::4]、G 是 [1::4]、
+    R 是 [2::4]，按 3 的步长写进目标就是 R,G,B 交错。三道都是 C 级。
+    """
+    png = vdir / f"auto-{n}{FRAME_SUFFIX}"
     try:
-        with open(ppm, "wb") as f:
-            f.write(b"P6\n%d %d\n255\n" % (w, h))
-            out = bytearray(w * h * 3)
-            for i in range(w * h):
-                o = i * 4
-                b = frame[o:o + 4]
-                out[i * 3:i * 3 + 3] = bytes((b[2], b[1], b[0]))
-            f.write(out)
+        out = bytearray(w * h * 3)
+        out[0::3] = frame[2::4]
+        out[1::3] = frame[1::4]
+        out[2::3] = frame[0::4]
+        with open(png, "wb") as f:
+            f.write(_png(w, h, bytes(out)))
     except OSError:
         return
-    # 向前剪：只留最近这么多张，别让一个 30 分钟的安装在磁盘上堆 600 张 1.4MB
+    # 向前剪：只留最近这么多张，别让一个 30 分钟的安装在磁盘上堆 600 张
     #
-    # **按文件名里的序号排序，不能按文件名字典序。** "auto-9.ppm" > "auto-39.ppm"
+    # **按文件名里的序号排序，不能按文件名字典序。** "auto-9.png" > "auto-39.png"
     # （'9'=0x39 > '3'=0x33），字典序和数值序从 n>=10 起分叉。原来写的是
     # `key=lambda p: p.name`，于是留下的「最近 24 张」其实是一个字典序窗口：
     # 实测跑 40 个动作后 auto-10.ppm~auto-22.ppm 被删掉，而更老的
@@ -579,7 +783,8 @@ def save_frame(vdir: Path, n: int, frame: bytes, w: int, h: int) -> None:
     # 根本不存在。后果正好和这个功能的目的相反：安装退化成 manual 时，用户和
     # 我们第一眼要看的「它停在什么屏幕上」那一帧不在盘上。2026-11-11 审计补上。
     try:
-        olds = sorted(vdir.glob("auto-*.ppm"), key=_frame_no)
+        olds = sorted([*vdir.glob("auto-*.png"), *vdir.glob("auto-*.ppm")],
+                      key=_frame_no)
         for p in olds[:-KEEP_FRAMES]:
             p.unlink()
     except OSError:
@@ -608,16 +813,28 @@ def disk_used(vdir: Path) -> int:
 # -------------------------------------------------------------------- 驱动器 --
 
 def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
-         emit=None) -> str:
+         emit=None, stage=None) -> str:
     """把本地安装器的图形向导自己点完。
 
     返回值见模块 docstring。**任何异常都不往外抛**：自动安装失败就该退回手动，
     让一个 Python 栈打到安装日志里对用户没有任何帮助。
+
+    `stage` 是可选的第二阶段回调（2026-11-11 加）：(id, 标签)。它和 `emit` 分开是
+    因为两者在 app 里长得不一样——stage 换的是标题那一行，emit 是往日志里追加一行。
+    等安装器画面那 20~40 秒原来是纯静默的，app 上就挂着「启动安装器」四个字，
+    用户看不出它在等什么；现在那段时间有自己的标题。
     """
     def say(msg: str, level: str = "info") -> None:
         if emit:
             try:
                 emit(msg, level)
+            except Exception:
+                pass
+
+    def phase(sid: str, label: str) -> None:
+        if stage:
+            try:
+                stage(sid, label)
             except Exception:
                 pass
 
@@ -630,24 +847,41 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
     # 先连 RFB，连不上就重试：install 一起步 QEMU 就在了，但 VNC 要等固件把
     # ramfb 初始化出来才听得见。一上来只连一次，连不上就整个自动安装失败——
     # 而那时安装器其实还要十几秒才露面。
+    #
+    # **重试期间要说人话**（2026-11-11 加）。原来这 120 秒是静默的：app 那边显示
+    # 「自动安装中」，底下什么都没有，用户既不知道它在等什么，也看不出卡了没有。
+    # 而这一段恰恰是最长的静默期——固件初始化加 ISO 引导实测要 20~40 秒。
+    phase("wait", "等安装器画面出现")
     rfb = None
     deadline = time.time() + 120
+    waited = 0.0
     while time.time() < deadline:
-        if service_ready(vm):
+        if service_ready(vm, timeout=1.0):
             say("客人机的服务已经起来了，不用点安装器")
             return "done"
         try:
             rfb = RFB(port)
             break
         except (OSError, AutoError):
-            time.sleep(2.0)
+            pass
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        nap = min(2.0, left)
+        time.sleep(nap)
+        waited += nap
+        if waited >= 10.0:
+            waited = 0.0
+            say(f"还在等安装器画面出来（VNC 127.0.0.1:{port}，"
+                f"固件初始化加光盘引导要几十秒）")
     if rfb is None:
         say(f"连不上这台虚拟机的 VNC（127.0.0.1:{port}），自动安装退成手动",
             "warn")
         return "manual"
 
+    phase("install", "自动操作安装器")
     say(f"已连上安装画面 {rfb.w}×{rfb.h}，开始自动安装")
-    seen: list = []                 # 见过的画面签名，用来认「又回到这一屏了」
+    mem = FrameMemory()
     last_sig = None                 # 上一帧（用来判断画面稳没稳）
     prev_sig = None                 # 上一帧（只用来判断画面在不在动）
     saw_copy = False                # 见过「盘上有数据、没按钮、画面在动」的帧
@@ -657,24 +891,47 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
     last_used = disk_used(vdir)      # 上一轮看到的盘占用
     grew_at = 0.0                    # 盘最后一次变大的时刻
     last_at = 0.0
+    still = 0                        # 连续多少轮画面没变（用来放慢轮询）
     acts = 0                        # 一共做了多少个动作（回车或点击）
     ejected = False
     budget_end = time.time() + budget_minutes * 60
+    frame: bytes | None = None       # 最近一次真的拿到的画面
+    rounds = 0                       # 取过多少轮帧（用来决定什么时候全屏重同步）
 
     try:
         with rfb:
             while time.time() < budget_end:
-                if service_ready(vm):
+                if service_ready(vm, timeout=1.0):
                     say(f"客人机服务已就绪，安装完成（自动操作了 {acts} 步）")
                     return "done"
                 try:
-                    rfb.request_full()
-                    frame = rfb.frame()
+                    # 平时只要变化的那一块，QEMU 就不用每轮把整块显存编一遍推过来
+                    # （见 request_incr 的说明）。每隔 RESYNC_EVERY 轮全屏要一次，
+                    # 免得万一漏了一个矩形，本地副本从此和服务端不一致——那种情况下
+                    # 画面判据会整个失效，而我们看不出来。
+                    #
+                    # rounds 从 0 起，所以第一轮就是全屏——本地还没有 framebuffer
+                    # 副本，增量请求无从续接。**每轮只发一个请求**：多发一个就会让
+                    # 响应和请求错开一位，后面的帧整个对不上（基准测试踩过，症状是
+                    # 假服务端线程炸掉、驱动器第一轮就退成 manual）。
+                    if rounds % RESYNC_EVERY == 0:
+                        rfb.request_full()
+                    else:
+                        rfb.request_incr()
+                    rounds += 1
+                    got = rfb.frame()
                 except (AutoError, OSError) as e:
                     say(f"取画面失败：{e}", "warn")
                     return "manual"
-                sig = (fingerprint(frame, rfb.w, rfb.h),
-                       primary_button(frame, rfb.w, rfb.h))
+                if got is None:
+                    # 画面压根没变。这不是错误，是增量模式的正常回答。
+                    if frame is None:
+                        continue             # 还一帧都没拿到过，再等等
+                    got = frame
+                else:
+                    frame = got
+                sig = (fingerprint(got, rfb.w, rfb.h),
+                       primary_button(got, rfb.w, rfb.h))
                 btn = sig[1]
 
                 # 没有主按钮时也要继续往下走。fnOS 第一屏的「下一步」是白底描边
@@ -687,6 +944,13 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                 if (btn is None and used > EJECT_MIN_DISK
                         and prev_sig is not None and prev_sig[1] is None
                         and not same_screen(sig, prev_sig)):
+                    if not saw_copy:
+                        # 说一句「这一步要几分钟」。复制阶段是全程最长的一段，
+                        # 而画面看起来就是一条几乎不动的进度条——不告诉用户的话，
+                        # 它看起来和卡死了没有区别（2026-11-11 实测：这一等就是
+                        # 十几分钟，日志里一个字都不多）。
+                        say("安装器正在往磁盘复制文件，这一步要几分钟，"
+                            "期间不用管它")
                     saw_copy = True
                 prev_sig = sig
 
@@ -716,12 +980,13 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                 #     的进度页和向导页都是浅色——这一条把「进度页卡住不动」
                 #     和「向导里退回上一屏」都排除掉了，实测两种都撞见过）
                 #   · 这一屏以前见过
-                if (used > EJECT_MIN_DISK and saw_dark
-                        and any(same_screen(sig, s) for s in seen)):
-                    save_frame(vdir, acts, frame, rfb.w, rfb.h)
-                    say("安装器重启后又回到了第一屏（光盘还挂着）。"
-                        "停下来处理，不重复操作——那一下会把刚装好的盘格式化掉。")
-                    return "reboot"
+                #
+                # **放在「画面已经稳了」那道门后面**（2026-11-11 挪进来的）。原来
+                # 它每轮都拿当前帧和 seen 里全部历史帧各比一次，跑满 200 个动作时
+                # 一轮就是 200 次 same_screen——进度页那几分钟里画面每轮都在变，
+                # 这一次全历史扫描一次都不会命中，纯白算。而「回到第一屏」这个状态
+                # 本身是要稳定下来的：切到一半的帧判不出来，等它稳了再判，结论一样，
+                # 而且动作点仍然在这道判断之后，安全性没变（不会先按了回车再发现）。
                 dark = is_dark(frame, rfb.w, rfb.h)
                 if dark:
                     saw_dark = True
@@ -730,11 +995,19 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                 # 进度页画面一直在动，这道判断自然把它挡住——不会去按一个没意义的回车。
                 if last_sig is None or not same_screen(sig, last_sig):
                     last_sig, last_at = sig, time.time()
-                    time.sleep(0.4)
+                    still += 1
+                    time.sleep(0.8 if still >= 4 else 0.4)
                     continue
+                still = 0
                 if time.time() - last_at < SETTLE_SECONDS:
                     time.sleep(0.3)
                     continue
+
+                if used > EJECT_MIN_DISK and saw_dark and mem.was_seen(sig):
+                    save_frame(vdir, acts, got, rfb.w, rfb.h)
+                    say("安装器重启后又回到了第一屏（光盘还挂着）。"
+                        "停下来处理，不重复操作——那一下会把刚装好的盘格式化掉。")
+                    return "reboot"
 
                 # 该拔光盘了。
                 #
@@ -756,22 +1029,22 @@ def drive(vm: dict, vdir: Path, *, budget_minutes: int = 45,
                             "（不拔的话重启又会退回安装器）")
 
                 # 同一个画面已经试过几种办法了？先回车，再点蓝按钮，都不行就撤。
-                tried = sum(1 for s in seen if same_screen(sig, s))
+                tried = mem.times_tried(sig)
                 if tried == 0:
                     say("按回车（默认按钮）")
-                    save_frame(vdir, acts, frame, rfb.w, rfb.h)
+                    save_frame(vdir, acts, got, rfb.w, rfb.h)
                     rfb.key_tap(KEY_RETURN)
                 elif tried == 1 and btn is not None:
                     say(f"回车没推进，改点主按钮 ({btn[0]},{btn[1]})")
-                    save_frame(vdir, acts, frame, rfb.w, rfb.h)
+                    save_frame(vdir, acts, got, rfb.w, rfb.h)
                     rfb.click(*btn)
                 else:
-                    save_frame(vdir, acts, frame, rfb.w, rfb.h)
+                    save_frame(vdir, acts, got, rfb.w, rfb.h)
                     say("回车和点按钮都试过了，屏幕还是没动。"
                         "自动安装停下来，剩下的请您在画面里点完", "warn")
                     return "manual"
                 acts += 1
-                seen.append(sig)
+                mem.remember(sig)
                 # 暗屏的记忆只在「对着一屏浅色画面动过手」之后才清掉。
                 # 重启那一趟是：浅色向导页 →（动作）→ 暗屏/GRUB → 浅色第一屏。
                 # 要是动作一发生就清，那么在暗屏上按的那个回车就会把记忆抹掉，

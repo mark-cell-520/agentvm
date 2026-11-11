@@ -122,6 +122,7 @@ class FakeRFB(threading.Thread):
         self.got = {}                    # 客户端发来的东西，按类型记
         self.encodings = []
         self.stop = False
+        self.silent = False              # 为真时一条更新都不回（模拟画面没变）
 
     def run(self):
         conn, _ = self.srv.accept()
@@ -162,9 +163,7 @@ class FakeRFB(threading.Thread):
                     x, y, rw, rh = struct.unpack(">HHHH", body[1:9])
                     self.got["request"] = (inc, x, y, rw, rh)
                     self.on_request(inc, x, y, rw, rh)
-                    conn.sendall(struct.pack(">BBH", 0, 0, 1)
-                                 + struct.pack(">HHHHi", x, y, rw, rh, 0)
-                                 + self._slice(x, y, rw, rh))
+                    self._send_update(conn, x, y, rw, rh)
                 elif t == 4:                          # KeyEvent
                     body = self._recv(conn, 7)
                     down, ks = body[0], struct.unpack(">I", body[3:7])[0]
@@ -191,6 +190,16 @@ class FakeRFB(threading.Thread):
 
     def on_request(self, inc, x, y, rw, rh):
         """每收到一次取帧请求就调一次。子类用它改盘的大小。"""
+
+    def _send_update(self, conn, x, y, rw, rh):
+        """回一条 FramebufferUpdate。抽出来是给子类覆写用的——TestSplitFramebufferUpdate
+        要模拟 RFC 6143 7.5.3 那种「一帧分几条才发完」的服务端，TestIncrementalUpdates
+        要一个只发脏矩形的。"""
+        if self.silent:
+            return                      # 增量模式下「画面没变」就是这样：一条都不发
+        conn.sendall(struct.pack(">BBH", 0, 0, 1)
+                     + struct.pack(">HHHHi", x, y, rw, rh, 0)
+                     + self._slice(x, y, rw, rh))
 
     def on_key(self, down, keysym):
         """每收到一个键盘事件就调一次。子类用它换画面。"""
@@ -660,15 +669,36 @@ class TestFramePruning(unittest.TestCase):
         那个，也就是安装停下来时用户第一眼要看的那一帧）反而不在盘上。"""
         d = Path(tempfile.mkdtemp())
         try:
-            nums = list(range(3, 10)) + list(range(10, 45))
-            for n in nums:
+            # 3..43，再由 save_frame 写下 44：盘上正好是 3..44 一段连续的帧，
+            # 和真实安装时一样（同一轮里只会写一种后缀，不会 44.ppm 和 44.png
+            # 同时在）。
+            for n in range(3, 44):
                 self._mk(d, n)
             # 帧内容是 B,G,R,pad 四字节一组，2x2 就是 4 组
             ai.save_frame(d, 44, px_bytes((9, 9, 9)) * 4, 2, 2)
-            left = sorted(ai._frame_no(p) for p in d.glob("auto-*.ppm"))
+            left = sorted(ai._frame_no(p)
+                          for p in [*d.glob("auto-*.png"), *d.glob("auto-*.ppm")])
             self.assertEqual(left, list(range(21, 45)))
             # 最后写的那一帧必须在：它是「它停在什么屏幕上」的唯一证据
             self.assertIn(44, left)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_old_ppm_frames_are_pruned_too(self):
+        """老 VM 目录里可能堆着上一版写的 .ppm。换后缀不能把它们漏掉，否则那些
+        1.4MB 的旧帧会一直躺在盘上，剪枝对它们无效。"""
+        d = Path(tempfile.mkdtemp())
+        try:
+            for n in range(3, 31):
+                self._mk(d, n)
+            ai.save_frame(d, 44, px_bytes((9, 9, 9)) * 4, 2, 2)
+            kept = [*d.glob("auto-*.png"), *d.glob("auto-*.ppm")]
+            # 新写的这一帧必须在
+            self.assertIn(d / "auto-44.png", kept)
+            # 总数不超上限——老 ppm 也占名额
+            self.assertLessEqual(len(kept), ai.KEEP_FRAMES)
+            # 而最早那批老 ppm 被剪掉了
+            self.assertFalse((d / "auto-3.ppm").exists())
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -677,11 +707,290 @@ class TestFramePruning(unittest.TestCase):
         try:
             (d / "auto-xyz.ppm").touch()
             (d / "auto-5.ppm").touch()
-            got = sorted(d.glob("auto-*.ppm"), key=ai._frame_no)
+            got = sorted([*d.glob("auto-*.png"), *d.glob("auto-*.ppm")],
+                         key=ai._frame_no)
             self.assertEqual(got[0].name, "auto-5.ppm")
             self.assertEqual(got[1].name, "auto-xyz.ppm")
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def test_frame_is_a_real_png_and_far_smaller_than_ppm(self):
+        """存 PNG 而不是 PPM（2026-11-11 改）。这一条钉两件事：文件真的是 PNG
+        （magic 对得上，我们和 Preview 才打得开），以及它确实比 PPM 小两个数量级
+        ——PPM 一张 1.4MB、24 张常驻 34MB，而那些帧在安装结束前一张都用不上。"""
+        d = Path(tempfile.mkdtemp())
+        try:
+            f = button_screen()
+            ai.save_frame(d, 7, f, W, H)
+            p = d / "auto-7.png"
+            data = p.read_bytes()
+            self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertLess(len(data), W * H * 3 // 20)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestScreenSignatures(unittest.TestCase):
+    """指纹与 same_screen 的判据必须三个通道都看得见。
+
+    2026-11-11 加这一类：那一轮把指纹从「每点 3 字节」改成「每点 4 字节」时，第一版
+    用 `bytes[a:b:16]` 去切，而那个步长按**字节**算——切出来是单字节，等于只采样蓝
+    通道的一个字节。fnOS 那个纯蓝按钮的蓝是 219、浅底是 245，差 26 低于 FP_TOL=40，
+    整块按钮从判据里消失，而当时 43 条测试一条都没报。下面第一条就是那时候该有
+    却没有的那条。
+    """
+
+    def test_r_channel_difference_is_seen(self):
+        """只有红分量不同的两帧必须判不同屏。蓝通道单独看不出来这个差异。"""
+        a = blank()
+        b = bytearray(a)
+        for i in range(2, len(b), 4):
+            b[i] = 0                       # 只把红打成 0，蓝绿不动
+        self.assertNotEqual(ai.fingerprint(a, W, H), ai.fingerprint(bytes(b), W, H))
+        sa = (ai.fingerprint(a, W, H), None)
+        sb = (ai.fingerprint(bytes(b), W, H), None)
+        self.assertFalse(ai.same_screen(sa, sb))
+
+    def test_g_channel_difference_is_seen(self):
+        a = blank()
+        b = bytearray(a)
+        for i in range(1, len(b), 4):
+            b[i] = 0
+        self.assertFalse(ai.same_screen((ai.fingerprint(a, W, H), None),
+                                        (ai.fingerprint(bytes(b), W, H), None)))
+
+    def test_single_pixel_change_is_below_the_threshold(self):
+        """一个像素变了不算换屏——这正是 1% 那道坎存在的理由。真实使用里一个闪烁
+        的文本光标就会造成这个量级的变化。"""
+        b = bytearray(button_screen())
+        b[100 * W * 4 + 50 * 4 + 2] ^= 0xFF
+        a = button_screen()
+        self.assertTrue(ai.same_screen((ai.fingerprint(a, W, H),
+                                         ai.primary_button(a, W, H)),
+                                        (ai.fingerprint(bytes(b), W, H),
+                                         ai.primary_button(bytes(b), W, H))))
+
+    def test_primary_button_is_cached_for_the_same_frame(self):
+        """单槽缓存：同一帧连问几次只算一次。驱动器在「等画面稳下来」那段时间里
+        正是这么干的，原来每轮白算 6.5ms。"""
+        ai._BTN_CACHE = None
+        f = button_screen()
+        self.assertEqual(ai.primary_button(f, W, H), (697, 483))
+        ai._BTN_CACHE = (b"sentinel-must-be-replaced-entirely", None)
+        self.assertEqual(ai.primary_button(f, W, H), (697, 483))
+
+    def test_cache_does_not_confuse_two_different_frames(self):
+        """缓存不能把两屏混成一屏。"""
+        ai._BTN_CACHE = None
+        self.assertEqual(ai.primary_button(button_screen(), W, H), (697, 483))
+        self.assertIsNone(ai.primary_button(blank(), W, H))
+        self.assertEqual(ai.primary_button(button_screen(), W, H), (697, 483))
+
+
+class TestIncrementalUpdates(unittest.TestCase):
+    """增量更新（incremental=1）：本地副本、脏矩形、以及「没更新」不是错误。
+
+    这一整类是 2026-11-11 那次优化的回归。那次改动的主体是：驱动器原来每轮都发
+    全屏请求，QEMU 就得把整块显存按 Raw 编一遍、推 1.9MB 过来，而安装一跑几千轮
+    ——等于让 QEMU 在整个安装期间持续白干活，还和安装器自己抢宿主机 CPU。改成
+    增量之后 QEMU 只编变化区域。
+
+    现有的 FakeRFB 忽略 incremental 标志、总发全屏，所以这批测试必须自己造一个
+    认得这个标志的服务端，否则这条路径等于没测。
+    """
+
+    class Incremental(FakeRFB):
+        """认得 incremental：增量请求只发「脏矩形」，全屏请求才发整帧。
+
+        脏矩形的内容取自 frames[1] 的同一块区域——服务端的画面已经翻到下一帧了，
+        只是按协议只把变了的那一块发过来。
+        """
+
+        def __init__(self, frames):
+            super().__init__(frame=frames[0])
+            self.frames = list(frames)
+            self.full_requests = 0
+            self.incr_requests = 0
+            self.incr_bytes = 0
+
+        def _send_update(self, conn, x, y, rw, rh):
+            inc = self.got.get("request", (0, 0, 0, 0, 0))[0]
+            if not inc:
+                self.full_requests += 1
+                super()._send_update(conn, x, y, rw, rh)
+                return
+            self.incr_requests += 1
+            # 只发左上角 120×12 那一小块：这就是「脏矩形」
+            dx, dy, dw, dh = 40, 40, 120, 12
+            saved, self.frame = self.frame, self.frames[1]
+            try:
+                data = self._slice(dx, dy, dw, dh)
+            finally:
+                self.frame = saved
+            self.incr_bytes += len(data)
+            conn.sendall(struct.pack(">BBH", 0, 0, 1)
+                         + struct.pack(">HHHHi", dx, dy, dw, dh, 0) + data)
+
+    def test_dirty_rectangle_is_applied_to_the_local_copy(self):
+        """增量帧只带脏矩形，但 frame() 交出去的必须是一整幅画面——脏矩形之外的
+        部分从本地副本续接。这一条是增量模式能不能用的前提。"""
+        base = button_screen()
+        nxt = rect(base, 40, 40, 160, 52, (200, 30, 30))     # 左上角多一块红
+        srv = self.Incremental([base, nxt])
+        srv.frame = base
+        srv.start()
+        try:
+            with ai.RFB(srv.port) as rfb:
+                rfb.request_full()
+                first = rfb.frame()
+                self.assertEqual(first, base)
+                rfb.request_incr()
+                second = rfb.frame(timeout=5.0)
+                self.assertIsNotNone(second)
+                self.assertEqual(len(second), rfb.w * rfb.h * 4)
+                self.assertEqual(second, nxt)
+                self.assertEqual(srv.incr_requests, 1)
+                # 脏矩形 120×12×4 = 5760 字节，而全屏是 1.9MB。省下来的正是
+                # QEMU 那边每轮要编一遍的量。
+                self.assertEqual(srv.incr_bytes, 120 * 12 * 4)
+        finally:
+            srv.stop = True
+
+    def test_no_update_at_all_is_not_an_error(self):
+        """画面没变时服务端一条都不发。这不是故障，增量模式的正常回答就是 None
+        ——调用方该直接用上一帧。原来全屏模式这里会抛「等 RFB 帧超时」。"""
+        srv = FakeRFB(frame=button_screen())
+        srv.start()
+        try:
+            with ai.RFB(srv.port) as rfb:
+                rfb.request_full()
+                self.assertEqual(rfb.frame(), button_screen())
+                # 让服务端从此闭嘴：只认增量请求且不回任何东西
+                srv.silent = True
+                rfb.request_incr()
+                self.assertIsNone(rfb.frame(timeout=0.4))
+        finally:
+            srv.stop = True
+
+    def test_full_request_still_waits_for_the_whole_screen(self):
+        """全屏那条路不能被增量改动带坏：仍然要等到整个画面画满。"""
+        srv = self.Incremental([button_screen()])
+        srv.start()
+        try:
+            with ai.RFB(srv.port) as rfb:
+                rfb.request_full()
+                f = rfb.frame()
+                self.assertEqual(f, button_screen())
+                self.assertEqual(srv.full_requests, 1)
+        finally:
+            srv.stop = True
+
+
+class TestFrameMemory(unittest.TestCase):
+    """动作帧的两段记忆（2026-11-11 加）。
+
+    这两条钉的是一个真实的内存问题和一个真实的漏判风险，它们是同一处改动的两面：
+    原来把所有动作帧的签名都留在一个 list 里，跑满 ACT_LIMIT=200 要 24MB；而「重启后
+    又回到第一屏」要认的恰恰是最早那一屏。改成两段之后，最早那 32 帧一直记得，最近
+    16 帧用来判断「这一屏试过几招」，内存降到 5.8MB。
+    """
+
+    def sig(self, rgb):
+        f = blank(rgb)
+        return (ai.fingerprint(f, W, H), ai.primary_button(f, W, H))
+
+    def test_the_first_screen_is_remembered_after_many_actions(self):
+        """跑了 200 个动作之后，第一屏还必须认得出——漏判它就会把刚装好的盘
+        重新格式化一遍，这是整个驱动器里最危险的一个动作。"""
+        m = ai.FrameMemory()
+        first = self.sig((245, 245, 245))
+        m.remember(first)
+        for i in range(200):
+            m.remember(self.sig((i % 200 + 20, 100, 100)))
+        self.assertTrue(m.was_seen(first))
+
+    def test_memory_stays_bounded(self):
+        m = ai.FrameMemory()
+        for i in range(200):
+            m.remember(self.sig((i % 200 + 20, 100, 100)))
+        self.assertEqual(len(m.early), ai.EARLY_KEEP)
+        self.assertEqual(len(m.recent), ai.RECENT_KEEP)
+        # 200 × 120KB 会到 24MB，两段合起来必须远小于那个数
+        self.assertLess(len(m), 64)
+
+    def test_the_two_segments_do_not_overlap(self):
+        """重叠会让「试过几次」把同一帧数两遍，于是第三次本该撤退的场面第二次就撤了
+        ——一个只是反应慢的安装器会被当成点不动。"""
+        m = ai.FrameMemory()
+        s = self.sig((245, 245, 245))
+        for _ in range(ai.EARLY_KEEP):
+            m.remember(s)
+        # early 满了，同一帧再记一次只能进 recent
+        m.remember(s)
+        self.assertEqual(m.times_tried(s), ai.EARLY_KEEP + 1)
+        self.assertEqual(len(m.early), ai.EARLY_KEEP)
+        self.assertEqual(len(m.recent), 1)
+
+    def test_recent_window_forgets_the_far_past(self):
+        """隔了十几屏再回到同一屏，recent 不再记得它——这是故意的：那时重新按一次
+        回车没有什么害处，而 early 仍然兜着重启检测那一头。"""
+        m = ai.FrameMemory()
+        old = self.sig((10, 10, 10))
+        for _ in range(ai.EARLY_KEEP):
+            m.remember(self.sig((200, 200, 200)))
+        m.remember(old)                        # 进 recent
+        # 后面的画面和 old 差得足够远（FP_TOL 是 40，用灰度差 90 以上），
+        # 否则 same_screen 会把它们当成同一屏，这条就什么也没测
+        for i in range(ai.RECENT_KEEP + 5):
+            m.remember(self.sig((100 + i * 5, 100 + i * 5, 100 + i * 5)))
+        self.assertFalse(m.was_seen(old))
+        self.assertEqual(m.times_tried(old), 0)
+
+
+class TestSplitFramebufferUpdate(unittest.TestCase):
+    """全屏请求可能分几条 FramebufferUpdate 才发完（RFC 6143 7.5.3）。
+
+    原来只读第一条就返回，没画到的地方留在初始化的全 0 里——一张半屏真画面、半屏
+    纯黑的图。而 is_dark 的判据正是「平均亮度低」，半黑帧会被当成「客人机重启了」，
+    把重启循环的判据放大成误报。2026-11-11 修：读到整个画面都画满为止。
+    """
+
+    class Split(FakeRFB):
+        """把一帧拆成上下两条发，中间还插一条 Bell。"""
+
+        def _send_update(self, conn, x, y, rw, rh):
+            # Bell（消息类型 2）：客户端必须先把它从流上读掉，否则后面的字节全错位
+            conn.sendall(b"\x02")
+            half = rh // 2
+            for (yy, hh) in ((y, half), (y + half, rh - half)):
+                conn.sendall(struct.pack(">BBH", 0, 0, 1)
+                             + struct.pack(">HHHHi", x, yy, rw, hh, 0)
+                             + self._slice(x, yy, rw, hh))
+
+    def test_waits_until_the_whole_screen_is_painted(self):
+        srv = self.Split()
+        srv.start()
+        try:
+            with ai.RFB(srv.port) as rfb:
+                rfb.request_full()
+                f = rfb.frame()
+                self.assertEqual(len(f), rfb.w * rfb.h * 4)
+                # 下半屏必须是真的画面，不是全 0
+                mid = (rfb.h // 2) * rfb.w * 4
+                self.assertNotEqual(f[mid:mid + rfb.w * 4], b"\x00" * (rfb.w * 4))
+        finally:
+            srv.stop = True
+
+    def test_normal_single_update_still_works(self):
+        """没被拆的正常情况不能因为这次修复变慢或变坏。"""
+        srv = FakeRFB(frame=button_screen())
+        srv.start()
+        try:
+            with ai.RFB(srv.port) as rfb:
+                rfb.request_full()
+                self.assertEqual(rfb.frame(), button_screen())
+        finally:
+            srv.stop = True
 
 
 class TestDiskUsed(unittest.TestCase):
