@@ -358,15 +358,21 @@ struct VMDetailView: View {
                     Button("打开窗口") { state.startMacVM(vm) }
                         .buttonStyle(.borderedProminent)
                         .disabled(state.backend.busy)
+                    // 「显示窗口」不给 macOS：它的画面就在这个 app 里，
+                    // 没有第二个可切过去的窗口。原来这里和别的 VM 共用同一个
+                    // 按钮，而 vmkit 的 cmd_open 对 macOS 第一句就是 die
+                    // 「命令行没有窗口可切」——点下去必然只弹一个报错对话框，
+                    // 用户除了点「好」什么都不能做。同上面 651 行注释里说的
+                    // 「别摆一个只能失败的按钮」。2026-11-11 审计补上。
                 } else {
                     // 控制台是日常操作虚拟机的主入口：装系统、看启动、进桌面，
                     // 都在这个内嵌的 VNC 画面里。不依赖原生窗口是否存在。
                     Button("控制台") { state.consoleVM = vm }
                         .buttonStyle(.borderedProminent)
                         .disabled(state.backend.busy)
+                    Button("显示窗口") { state.action("open", name: vm.name) }
+                        .disabled(state.backend.busy)
                 }
-                Button("显示窗口") { state.action("open", name: vm.name) }
-                    .disabled(state.backend.busy)
             } else {
                 Button("启动") { state.action("start", name: vm.name) }
                     .disabled(state.backend.busy)

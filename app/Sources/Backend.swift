@@ -21,7 +21,24 @@ final class Backend: ObservableObject {
     @Published var progress: Double = 0
     @Published var progressDetail = ""
     @Published var logLines: [LogLine] = []
-    @Published var errorMessage: String?
+
+    /// 每被写一次就调一次。AppState 用它 bump 自己的 revision。
+    ///
+    /// 为什么需要这个回调，而不是让 AppState 在自己写的地方各自补 revision：
+    /// errorMessage 有 8 个写入点，其中 5 个在 Backend 自己身上（run 和
+    /// installDetached 的两个 guard、terminationHandler 里「没拿到日志路径」、
+    /// cancel 的兜底），AppState 根本看不见那些路径。而漏掉的后果完全一样——
+    /// 见 AppState.revision 的注释：ContentView 的 .alert(item:) 不呈现，
+    /// 用户看不到任何原因。已实测踩过三次（2026-11-11 审计：check 失败时
+    /// 界面只说「宿主机检查没全过」而下面一条明细都没有）。
+    var onErrorMessageChanged: (() -> Void)?
+    @Published var errorMessage: String? {
+        didSet {
+            // 只在真的变了时通知：handleEvent 里 error 事件每次都会重写同一个值
+            // （同一个错误会连着来好几条），每次都 bump 会让 revision 白涨。
+            if oldValue != errorMessage { onErrorMessageChanged?() }
+        }
+    }
 
     /// 最近一次命令的完整输出，出问题时给用户看。
     @Published var rawOutput = ""
@@ -84,12 +101,19 @@ final class Backend: ObservableObject {
 
     /// 跑一条命令。`onEvent` 在每个事件到达时调用，可能在任意线程；
     /// 需要更新 UI 的调用方自己 dispatch 回主线程。
+    ///
+    /// `completion` **一定会被调用**，包括起不来的那两条路。调用方全都把它当成
+    /// 必然执行的回调：SettingsView.save 靠它把 `saving` 复位（不复位的话
+    /// 「保存」「保存并重启」两个按钮从此永久禁用），StorageView 的各处
+    /// flash()/fail() 也靠它收尾。原来起不来时只 `return false`，completion
+    /// 一次都不执行，调用方就悬在中间状态。2026-11-11 审计补上。
     @discardableResult
     func run(_ args: [String],
              onEvent: @escaping ([String: Any]) -> Void,
              completion: (() -> Void)? = nil) -> Bool {
         guard let script = locateScript() else {
             errorMessage = "找不到 vmkit.py。app 资源目录里没有 backend/。"
+            completion?()
             return false
         }
         // 不做 busy 互斥。读目录、读列表、跑检查在启动时是三条并发命令，
@@ -159,6 +183,8 @@ final class Backend: ObservableObject {
         } catch {
             running -= 1
             errorMessage = "启动失败：\(error.localizedDescription)"
+            // 同上：起不来也要收尾，不然调用方永远等不到 completion。
+            completion?()
             return false
         }
     }
@@ -228,6 +254,8 @@ final class Backend: ObservableObject {
                          completion: @escaping () -> Void) -> Bool {
         guard let script = locateScript() else {
             errorMessage = "找不到 vmkit.py。app 资源目录里没有 backend/。"
+            // 见 run() 的注释：起不来也要收尾。
+            completion()
             return false
         }
         running += 1
@@ -292,6 +320,8 @@ final class Backend: ObservableObject {
         } catch {
             running -= 1
             errorMessage = "启动失败：\(error.localizedDescription)"
+            // 同上：起不来也要收尾。
+            completion()
             return false
         }
     }
@@ -334,7 +364,14 @@ final class Backend: ObservableObject {
             readMore()
             guard let self else { return }
             // 进程没了就是安装结束了。最后再读一次，把缓冲区里剩的收干净。
-            if kill(pid, 0) != 0 {
+            //
+            // 判活走 installPidAlive，**不能写 kill(pid, 0)**。原来这里就是裸的
+            // kill(pid, 0)，而它正是 installPidAlive 注释里描述的那个最坏情况：
+            // 安装进程已经退出、那个 pid 又被系统复用给一个无关进程时，裸判活
+            // 永远为真——定时器永不 cancel、running 永不归零、busy 恒真、
+            // installEnded 永不来、向导钉在安装页且「停止」点下去没有任何效果，
+            // 用户什么都做不了只能强杀 app。2026-11-11 审计补上。
+            if !self.installPidAlive(pid) {
                 readMore()
                 timer.cancel()
                 DispatchQueue.main.async {
@@ -363,7 +400,8 @@ final class Backend: ObservableObject {
             tailOffset = UInt64(data.count)
             parser.ingest(data, onEvent: onEvent)
         }
-        if kill(pid, 0) != 0 {
+        // 同一个理由：不能写 kill(pid, 0)。见 tailLog 里那段注释。
+        if !installPidAlive(pid) {
             // 已经结束了，不需要再尾
             running -= 1
             completion()
@@ -378,6 +416,19 @@ final class Backend: ObservableObject {
     /// 读 vmkit 写下的 install.pid，不用 pgrep 匹配命令行：命令行里参数顺序
     /// 不固定，写出来的模式很容易对不上，还可能误匹配到别的进程。
     ///
+    /// 判活本身在 installPidAlive 里，那儿的注释说明了为什么不能用 kill(pid, 0)。
+    func installAlive(name: String) -> Int32? {
+        let pidFile = Backend.vmsDirectory
+            .appendingPathComponent(name)
+            .appendingPathComponent("install.pid")
+        guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
+              let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0 else { return nil }
+        return installPidAlive(pid) ? pid : nil
+    }
+
+    /// 这个 pid 是不是一个活着的安装进程。
+    ///
     /// 判活不能用 `kill(pid, 0)`：**僵尸进程照样返回成功**，而安装是被强杀之后
     /// 最常见的状态就是僵尸。用 os.kill 会永远认为上一次还在跑——app 从此拒绝
     /// 再接任何安装，而用户看到的是一个永远不动的「正在安装」。用 ps 排除 Z 状态。
@@ -388,13 +439,12 @@ final class Backend: ObservableObject {
     /// 一个毫无关系的进程。只判「活着」会把一个早就结束的安装当成永远在跑：
     /// 顶部横幅钉在「正在安装」、running 不归零于是 busy 恒为真、所有按钮全灰，
     /// 用户什么都做不了只能强杀 app。实测踩过（2026-11-10）。
-    func installAlive(name: String) -> Int32? {
-        let pidFile = Backend.vmsDirectory
-            .appendingPathComponent(name)
-            .appendingPathComponent("install.pid")
-        guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
-              let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-              pid > 0 else { return nil }
+    ///
+    /// 三个调用方（cancel、resumeWatching、tailLog 的轮询）原来各写各的判据，
+    /// 其中尾随那两处用的是裸 kill(pid, 0)——也就是上面说的那个最坏情况：
+    /// 0.5 秒的轮询定时器永不 cancel、running 永不归零、向导钉在安装页且
+    /// 「停止」点下去没有任何效果。2026-11-11 审计补上。
+    func installPidAlive(_ pid: Int32) -> Bool {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/ps")
         // state 和 command 都要：前者排僵尸，后者核对是不是我们的安装进程。
@@ -407,23 +457,23 @@ final class Backend: ObservableObject {
             try p.run()
             // ps 是几十毫秒就完的小命令，同步等不会卡界面；而调用方（cancel、
             // resumeWatching）都在用户操作的路径上，本来就该等一下结果。
+            // 尾随的轮询跑在后台队列上，同样不该为了一条 ps 去异步化。
             p.waitUntilExit()
         } catch {
             // ps 起不来就别猜：宁可当作没在跑，让用户重新触发一次
-            return nil
+            return false
         }
         let out = (try? pipe.fileHandleForReading.readToEnd())
             .flatMap { String(data: $0, encoding: .utf8) } ?? ""
         let line = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        if line.isEmpty || line.hasPrefix("Z") { return nil }
+        if line.isEmpty || line.hasPrefix("Z") { return false }
         // 归属判据：安装进程只有两种——vmkit.py 自己（Linux/Windows/local），
         // 以及 vmz（macOS，VZ 只有 Swift API）。对不上就当作没在跑，那个方向
         // 是安全的：最坏是让用户重点一次安装，不会把人锁死在灰屏界面上。
         let cmd = line.dropFirst()
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard cmd.contains("vmkit.py") || cmd.contains("/vmz")
-                || cmd.hasSuffix(" vmz") else { return nil }
-        return pid
+        return cmd.contains("vmkit.py") || cmd.contains("/vmz")
+            || cmd.hasSuffix(" vmz")
     }
 
     // 抓屏（vmkit.py screenshot）在 app 里已经不需要了：控制台是真 VNC 客户端，

@@ -26,8 +26,19 @@ vmz_log=$(mktemp)
 sign_err=$(mktemp)
 trap 'rm -f "$vmz_log" "$sign_err"' EXIT
 
+# die() 必须自己定义。install.sh 里有一个，但 `sh build.sh` 是独立进程，不继承
+# 函数。原来第 31 行直接调了 install.sh 那个 die：没装 Xcode 命令行工具时输出
+# 的是 "build.sh: line 31: die: command not found"，退出码 127，而那句
+# 「需要 Xcode 命令行工具：xcode-select --install」一个字符都不出现——它正是
+# 这一行唯一的目的。set -e 也救不了：|| 列表的退出码是 127，照样退出。
+# 实测用一个坏 SDK 名复现过。2026-11-11 审计补上。
+die() {
+    echo "build.sh: $*" >&2
+    exit 1
+}
+
 # 没装命令行工具时 xcrun 报裸错误、set -e 直接退出，用户看不到「要装工具」。
-SDK=$(xcrun --sdk macosx --show-sdk-path) \
+SDK=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null) \
   || die "需要 Xcode 命令行工具：xcode-select --install"
 # vmz 编到仓库里的临时位置，再拷进 app 的 Resources。不进 git
 # （.gitignore 里有 vmz 一行），装机时 install.sh 会另编一份到

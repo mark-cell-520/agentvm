@@ -57,6 +57,30 @@ final class VNCClient: ObservableObject {
     init(host: String, port: UInt16) {
         self.host = host
         self.port = port
+        // 「当前是不是就在 queue 上」的标记。publish 写 queueConnected 之前要
+        // 问一句，因为 queue.sync 从队列内部调会死锁，而 publish 既有从主线程
+        // 进来的调用方（connect/disconnect，用户点的），也有从 queue 上进来的
+        // （fail/pump/receive）。DispatchQueue 没有公开的「当前队列」API，
+        // setSpecific/getSpecific 这一对是标准做法。
+        queue.setSpecific(key: Self.inQueueKey, value: 1)
+    }
+
+    private static let inQueueKey = DispatchSpecificKey<Int>()
+
+    /// 写 queueConnected，保证一定发生在 queue 上。
+    ///
+    /// 这个字段存在的全部理由就是「不在主线程写、只在自己的队列上写」（见它的
+    /// 注释）。而 publish 有两个从主线程进来的调用方——connect() 和
+    /// disconnect()，都是从 .onDisappear 或用户点按钮进来的。它们原来直接把
+    /// queueConnected 写在主线程上，而 key / pointer / wheel 在 queue 上读它：
+    /// 字段加了，漏了这一条路径，还是同一个 data race。
+    /// 2026-11-11 审计补上。
+    private func setQueueConnected(_ v: Bool) {
+        if DispatchQueue.getSpecific(key: Self.inQueueKey) != nil {
+            queueConnected = v            // 已经在队列上，直接写
+        } else {
+            queue.sync { queueConnected = v }
+        }
     }
 
     // ------------------------------------------------------------ 内部状态 --
@@ -113,7 +137,15 @@ final class VNCClient: ObservableObject {
         // cancel()（只有 disconnect/fail 会停），一直每 250ms 触发并把
         // FramebufferUpdateRequest 发到当前连接上；旧的 TCP 连接也敞着不收数据。
         // 连上之后反复点「重连」十几次，就是十几个定时器叠加着打请求。
+        //
+        // **排队的重连 work item 也必须 cancel。** 断线会进退避等待（1/2/4…秒），
+        // 用户在等待期间点「重连」走到这里，而 reconnectWork 还挂着：到点它照样
+        // 执行，里面又是一次 connect()，把用户刚点出来、已经握手上的一条连接
+        // cancel 掉重新连——症状是「点了重连，画面连上一下又重来」。
+        // 2026-11-11 审计补上（disconnect() 里那一处 cancel 早就有了）。
         stopKeepAlive()
+        reconnectWork?.cancel()
+        reconnectWork = nil
         conn?.cancel()
         conn = nil
         reconnectAttempts = 0
@@ -569,7 +601,7 @@ final class VNCClient: ObservableObject {
                          width: Int? = nil, height: Int? = nil) {
         // queueConnected 在自己的队列上同步改：key / pointer / wheel 跑在这个
         // 队列上读它。放在 DispatchQueue.main.async 里改就还是跨线程。
-        if let connected { queueConnected = connected }
+        if let connected { setQueueConnected(connected) }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if let connected { self.connected = connected }

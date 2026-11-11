@@ -101,8 +101,9 @@ stop: ## Stop the VM (autostart 装过的话重启后会再起来，见 autostar
 #  - bash -n 查不出「全角标点紧跟变量名」。那不是语法错，是 bash 的变量名
 #    解析把高位字节并进了名字：`"$X，y"` 里的名字是 X<U+FF0C>，set -u 下
 #    直接 unbound variable。见 docs/PITFALLS.md M20。
-test: ## Unit-test the local-ISO auto-install driver (offline, no VM needed)
+test: ## Unit-test the auto-install driver and the vmkit audit fixes (offline, no VM)
 	@python3 -I scripts/test-autoinstall.py
+	@python3 -I scripts/test-vmkit-audit.py
 
 lint: ## Syntax-check every script
 	@bash scripts/lint-wide-punct.sh

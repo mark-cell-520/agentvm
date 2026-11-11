@@ -1393,3 +1393,179 @@ bootindex 选）。判据是「见过盘上有数据、没按钮、画面在动�
 
 十一、**测试里用 `\x00` 填盘等于什么都没测。** `disk_used` 看的是 `st_blocks`，而
 APFS 把全零段当稀疏文件——写 1MB 的零，`st_blocks` 还是 0。必须写非零字节。
+
+---
+
+## M34. 2026-11-11 第十三轮全局审计：二十四个 bug，每个都有「什么操作 → 什么错误结果」
+
+**用户原话：「继续全局审计，修复 bug」。** 三个子代理分头审 Swift app（约 5900 行）、
+`scripts/vmkit.py`（约 4800 行）、自动安装链路，我逐条复核后修。这一轮的共同点：
+**每一条都是「写了一半的状态被当成写完了的状态」**——半成品 VM 被报成就、
+装失败的机器被标 ready、退出的安装进程被当成还在跑、写一半的 vm.json 让命令裸栈。
+新增 `scripts/test-vmkit-audit.py`（34 条，全离线），`make test` 现在跑两个文件共 77 条。
+
+### 一类：假绿——失败和成功走同一条出口
+
+一、**`while ... else` 里的 warn 不改变控制流。** `start_linux` 等 SSH 等满 5 分钟只是
+warn 一句然后照常 `return None`，`cmd_install_linux` 紧接着就 `vm["ready"] = True`、
+给出 ssh 命令、印「虚拟机已就绪」。用户拿命令去连，连不上，而 `vm_broken` 返回空串、
+`_refuse_existing` 说「已存在，加 --force」——所有状态查询都说正常。已改成
+`start_linux` 返回布尔，假就 die 并给出 open / screenshot / 日志三条排查路。
+Windows 那条（`cmd_install_windows`）同源同修。
+
+二、**这类 bug 的通用形状：把「做了检查」当成「检查通过了」。** 上面那条是
+`warn()` 之后继续走；install.pid 那条是「is_file() 读一下」之后继续走（见下）；
+`--force` 那条是「vm.json 重写了」但盘没清。修法都是让失败的那一支真的离开主路。
+
+### 二类：互斥形同虚设
+
+三、**`install.pid` 的检查与落盘之间隔着几百毫秒。** 原来是
+`is_file() 读一下 → catalog 读取 → find_vmz() → argv 组装 → Popen → write_text`，
+两条几乎同时执行的 `install --detach` 都能通过检查，各自起一个安装进程，然后各自写
+install.pid，后写的覆盖前一条的——两个安装同时 qemu-img create 同一个盘、同时
+save_vm 同一个 vm.json、同时起两个 QEMU 抢同一组端口。
+
+四、**第一版修法（O_EXCL + unlink 重试）是错的，实测八个线程四个赢家。** 每个输家都
+读到占位的 `0`、`_pid_alive(0)` 为假、`unlink`、然后重试——unlink 把别人刚建出来的
+文件也删了。已改成 `flock(LOCK_EX|LOCK_NB)`：内核保证同一时刻一个持有者，上一个持有者
+进程退出时自动释放，「崩了/被强杀了、文件还在」天然能接手。fd 存在模块级变量里，
+被 GC 会提前放锁。`test_concurrent_claims_only_one_wins` 就是把那一版钉住的回归
+测试——用第一版算法跑它，`3 != 1` 失败。
+
+五、**`--force` 的语义被理解成「跳过存在性检查」而不是「清掉目标重建」。** 三处：
+本地安装包那条路（原来只写一个全新的 vm.json，旧 data.img 连数据一起复用、
+`start_local` 看到「VM 已在运行」就直接返回、附加盘条目从配置里消失但文件还在盘上）、
+`clone --force`（目标不清，qemu-img create 报错；目标在跑时 `cp -c` 会把盘从 QEMU
+脚下抽走）、以及 `--force` 清盘会 unlink 掉 install.pid 本身——所以清完必须重新占锁。
+
+### 三类：clone 的底册指错了文件
+
+六、**Linux clone 的 overlay 把 `vm_dir(src)/"disk.qcow2"` 当底册，而注释写的是
+「底册还是同一个云镜像」。** 那是源虚拟机自己的 overlay。`cmd_delete` 对 VM 目录是
+无条件 `_rmtree`，所以删掉源 VM 之后，克隆的 disk.qcow2 指着不存在的文件，QEMU 起不来
+（`Could not open backing file`），而克隆的 vm.json 完好、`vm_broken` 也查不出来——
+用户拿到一台「配置齐全但永远启动不了」的机器，且没有任何线索指向那次删除。
+已改成 `qemu-img info --output=json` 读真正的 `backing-filename`；读不到就整盘复制
+（占空间，但至少是台能用的机器）；`cmd_delete` 新增依赖检查，拒绝删被当底册的盘。
+
+七、**`qcow2_backing` 必须一律 `resolve()`。** macOS 上 `/var` 是指向 `/private/var`
+的符号链接，调用方传进来的路径两种形式都可能有。不归一的话依赖检查会静默漏掉
+（`/var/folders/...` 和 `/private/var/folders/...` 被当成两个文件）。自己写测试量出来的。
+
+### 四类：跨线程/跨进程的判据不一致
+
+八、**`kill(pid, 0)` 判活，pid 一被复用就把整个 app 锁死。** `installAlive()` 早就用
+`ps` 排 Z 状态 + 核对进程名修好了这个坑，注释里还把最坏情况写得清清楚楚（横幅钉在
+「正在安装」、busy 恒真、所有按钮全灰、只能强杀 app），但 `tailLog` 和 `resumeTailing`
+这两处仍是裸的 `kill(pid, 0)`——0.5 秒轮询定时器永不 cancel。已抽成
+`installPidAlive(_:)` 三处共用。
+
+九、**`backend.errorMessage` 有 8 个写入点，其中 5 个在 Backend 自己身上**（两个
+guard、terminationHandler、cancel 的兜底），AppState 看不见。而 `revision` 的注释自己
+论证过：`backend` 不是 `@Published`，不碰 `revision` 的话 `.alert(item:)` 不呈现。
+已改成 `errorMessage` 带 `didSet` 钩子，AppState 在 init 里装一个回调（dispatch 回主线程
+再 `revision += 1`）——一处覆盖全部 8 个写入点，包括以后新增的。
+
+十、**`Backend.run` 返回 false 时不调 completion，把调用方悬在中间状态。**
+`SettingsView.save` 靠 completion 把 `saving` 复位，不复位的话「保存」「保存并重启」
+两个按钮从此永久禁用。文档注释还写着「调用方多半不关心，标成 @discardableResult」——
+实际所有调用方都把 completion 当成了必然执行的回调。
+
+十一、**`UInt64(Double)` 在溢出或为负时是 trap，不是抛错。** `macParseSize("99999999999G")`
+和 `("-5G")` 都用 swiftc 实测过，进程以 133（SIGTRAP）退出。而 macvm.json 是用户手改的
+文件（加共享目录、改端口转发都要动它）。同一个函数上面几行还在重新校验 shares 和
+forwards「配置可能被手改过」，ram/disk 这两个会 trap 的漏了。已 clamp 到 [0, UInt64.max]，
+NaN 和负数当 0 让后续校验去报错。
+
+十二、**`.ckpt` 断点续传的 checkpoint 文件只被读、从来没人写。** 全仓库 grep 只有
+`macPartialBytes` 一处引用，所以它恒返回 0。两个后果：`接着已下的 X 继续` 这句日志永远
+不出现；`lastBytes = resume` 从 0 起算而 `.part` 可能有十几 GB，第一次 0.5 秒采样算出
+「已下体积 ÷ 0.5 秒」——界面显示一个几十 GB/s 的假速度和假 ETA。已改成读 `.part` 自己的
+大小：curl 是单连接顺序写的，文件大小就是「已确认落盘的字节数」，而调用方本来就向下
+取整到 8MB 段边界，残尾会被重下覆盖。
+
+十三、**`connect()` 不收回还没执行的重连 work item。** 断线进退避等待（1/2/4…秒），
+用户在等待期间点「重连」，而 `reconnectWork` 还挂着：到点它照样执行，里面又是一次
+connect()，把用户刚点出来、已经握手上的一条连接 cancel 掉重新连。
+
+十四、**`disconnect()` 在主线程写 `queueConnected`。** 这个字段存在的全部理由就是
+「只在自己的队列上写」，而 `disconnect()` 是从 `.onDisappear` 主线程调进来的。已用
+`setSpecific`/`getSpecific` 判「我是不是已经在这条队列上」，是就同步写、不是就
+`queue.sync`——`queue.sync` 从队列内部调会死锁，而 publish 两个方向都有调用方。
+
+### 五类：摆一个只能失败的按钮
+
+十五、**macOS 虚拟机运行中，「显示窗口」必然只弹一个报错对话框。** `cmd_open` 对 macOS
+第一句就是 die「命令行没有窗口可切」。同文件 651 行的注释刚把「摆一个只能失败的按钮」
+列为要修的问题，macOS 这条漏了一个。已改成不给 macOS 显示这个按钮。
+
+### 六类：名字白名单不统一
+
+十六、**`install` 和 `clone --new-name` 自己写了一份更宽的名字校验。**
+`name.replace("-","").replace("_","").isalnum()` 比 `check_vm_name` 的
+`[A-Za-z0-9][A-Za-z0-9._-]{0,62}` 宽：Python 的 `isalnum()` 对 Unicode 字母数字都为真，
+于是 `install --name 虚拟机` 能建出目录 `~/.agentvm/vms/虚拟机`，而随后
+start/stop/status/delete 全都在 `main()` 的 `check_vm_name` 上 die——一台 list 看得见、
+delete 删不掉的虚拟机，只能手工 rm。install 是 `main()` 里最早分派的几个命令之一，
+走不到 4741 行那道统一校验。已两处都换成 `check_vm_name`（顺带：原来同一句检查在
+`cmd_install` 里写了两遍，复制粘贴留下的），并且把它挪到 `_install_signal_guard`
+之前——那个信号处理器里就用 `vm_dir(name)` 拼路径。
+
+### 七类：判据不够锐
+
+十七、**`vm_broken` 的 `else` 把「未知 kind」和「linux」合并了。** 一台其实是 local 的
+VM 只要 kind 字段坏了，就会被判成「缺 disk.qcow2、seed.iso」，`_refuse_existing` 于是
+劝用户 `--force` 重装。已改成如实说「kind 是 'xxx'，不是认识的那几种」。
+
+十八、**`load_vm` 对缺 kind 的 vm.json 直接下标，坏文件就让命令裸栈。** 第一版修法是让
+`load_vm` die——实测那是个倒退：`status --name` 和 `list` 本来能把它显示成「没装完」并给
+一个 `--force` 入口（`vm_broken` 的全部意义就是这个），die 之后这条路也没了；更糟的是
+`install --name X --force` 自己也要 `load_vm`，于是错误消息里推荐的那条恢复路径本身就跑
+不通。已改成 `setdefault` 补齐 `name`/`kind` 两个键（正常文件里的值一个都不覆写），
+问题交给 `vm_broken` 报。**这一条的教训：修「崩栈」的时候要顺手确认一下那个函数还被谁
+调用，特别是被恢复路径调用。**
+
+十九、**`save_frame` 的「只留最近 N 张」按文件名字典序做的，不是按序号。**
+`"auto-9.ppm" > "auto-39.ppm"`（`'9'`=0x39 > `'3'`=0x33），字典序和数值序从 n>=10 起
+分叉。实测跑 40 个动作后 `auto-10.ppm`~`auto-22.ppm` 全被删掉，而更老的
+`auto-3.ppm`~`auto-9.ppm` 留着；跑满 200 个动作时最后那一帧 `auto-199.ppm` 根本不存在。
+后果正好和这个功能的目的相反：安装退化成 manual 时，用户第一眼要看的「它停在什么屏幕上」
+那一帧不在盘上。回归测试用第一版算法跑会失败（留下一批 21..44 之外的老帧）。
+
+二十、**`service_ready` 的 SSH 分支在 `web_port` 非空时永远走不到。** vmkit 给每台
+`kind=="local"` 的 VM 都同时分配两个端口（web_port 转发到 guest:5666，ssh_port 转发到
+guest:22）。装一台普通 Linux 时 sshd 起来了、5666 上什么都没有——hostfwd 接受连接后关掉，
+第一个分支 `return False`，于是 `drive()` 每一轮都判「服务没起来」，把整个 budget 耗完
+返回 timeout，而系统早就装好并跑起来了。`local_qemu_args` 的注释明写「ssh_port 备用——
+有些安装器装完会起 sshd」，代码把这条唯一的备用路径堵死了。已改成两个都试，任一真应就算就绪。
+
+二十一、**nrect == 0 的空更新会返回一张假黑帧。** `out` 初始化成全 0，而 `is_dark()` 的
+判据正是「平均亮度 < 60」——假黑帧会被当成「客人机重启了」，把 `saw_dark` 无端置上，
+放大重启循环判据的误报面。本实现总是发 incremental=0 的全屏请求，正常不会触发，但已改成
+直接 `continue` 多等一轮。
+
+### 八类：打包与安装脚本
+
+二十二、**`app/build.sh` 调用了从未定义的 `die`。** `die()` 只在 `install.sh` 里定义，
+而 `sh build.sh` 是独立进程，不继承函数。没装 Xcode 命令行工具时输出的是
+`build.sh: line 31: die: command not found`，退出码 127，而那句「需要 Xcode 命令行工具」
+一个字符都不出现——它正是这一行唯一的目的。用一个假 xcrun 复现过，已补本地 `die()`。
+
+二十三、**`install.sh` 的 `app_is_stale` 只比 mtime，不核对 backend 文件清单。**
+`AgentVM.app` 在 `.gitignore` 里、git 不跟踪，纯粹是本地残留。机器上留着一份由旧版
+build.sh（`autoinstall.py` 加进拷贝清单之前）编出来的 app、且此后没有源文件比它新时，
+`app_is_stale` 说「不旧」，于是打印「已从本地构建拷贝」，而那个 app 的
+`Resources/backend/` 里没有 `autoinstall.py` → 从 app 里装自己的 ISO 直接
+FileNotFoundError，终端下手工跑的一条不少。已加 `app_backend_complete`，和 build.sh 的
+拷贝清单逐项对齐；用一个缺文件的假 app 双向实测过（缺 → 重新编译，齐 → 复用）。
+
+二十四、**vsock 重试日志里的秒数算错了 16.7 倍。** `maxRetries * 1500 / 60`——那是把
+毫秒除以 60（ms→分的除数）而不是 1000（ms→秒），算出来 1500，日志告诉用户「等了 1500 秒」，
+把 90 秒说成 25 分钟。已改成由 `retryIntervalMs * maxRetries / 1000` 派生，改常量时只有
+一处会跟着变。
+
+### 这一轮的方法论
+
+**「先写一个会失败的测试，再动手改」在这一轮救了两次。** 第十八条（`load_vm` die）
+和第四条（O_EXCL 锁）都是先写完实现、跑自己写的回归测试才发现修错了：一个把恢复路径
+堵死了，一个八个线程四个赢家。两条都不是靠读代码看出来的——读代码时两个版本都「讲得通」。

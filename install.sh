@@ -137,8 +137,35 @@ app_is_stale() {
     [ -n "$newer" ]
 }
 
+# 复用的那份 app 里，后端脚本是不是齐的。
+#
+# app_is_stale 只比 mtime，而 AgentVM.app 在 .gitignore 里、git 不跟踪——它纯粹
+# 是本地残留。机器上留着一份由**旧版 build.sh**（autoinstall.py 加进拷贝清单
+# 之前）编出来的 app、且此后没有任何源文件的 mtime 比那个二进制更新时，
+# app_is_stale 说「不旧」，于是 install.sh 打印「已从本地构建拷贝」，而那个 app
+# 的 Resources/backend/ 里没有 autoinstall.py → 从 app 里装自己的 ISO 直接
+# FileNotFoundError，终端下手工跑的一条不少。
+#
+# 这正是下面第 3 步已经为 vmz 的 entitlement 加了「复用旧构建」兜底校验的同一
+# 类问题（那儿的注释写得很清楚：签名校验全绿，macOS 虚拟机一启动就崩），backend
+# 文件清单却没有对应的一道。2026-11-11 审计补上。
+#
+# 清单必须和 build.sh 的拷贝动作逐项对齐：改了那儿就要改这儿。
+app_backend_complete() {
+    local app="$1" b="$1/Contents/Resources/backend"
+    [ -x "$app/Contents/MacOS/AgentVM" ] || return 0
+    [ -f "$b/vmkit.py" ] || return 1
+    [ -f "$b/winarm-vm.py" ] || return 1
+    [ -f "$b/autoinstall.py" ] || return 1
+    [ -f "$b/catalog.json" ] || return 1
+    # lib/ 是目录：vmkit.py import 这里的 qga.py。少拷贝一个目录，从 app 里起的
+    # Linux 虚拟机全都用不上 guest agent，症状是「关机不优雅」。
+    [ -f "$b/lib/qga.py" ] || return 1
+    return 0
+}
+
 if [ -d "$APP_SRC" ] && [ -x "$APP_SRC/Contents/MacOS/AgentVM" ] \
-        && ! app_is_stale; then
+        && ! app_is_stale && app_backend_complete "$APP_SRC"; then
     cp -R "$APP_SRC" /Applications/
     ok "已从本地构建拷贝（源码没有比它新）"
 else

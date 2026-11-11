@@ -97,6 +97,14 @@ final class AppState: ObservableObject {
     @Published var showPassword = false
 
     init() {
+        // 必须第一个设：Backend 自己身上那 5 个写 errorMessage 的地方（起不来、
+        // 被取消、尾随时断线）AppState 看不见，只能让它写的时候通知过来。
+        // 见 Backend.onErrorMessageChanged 的注释。
+        backend.onErrorMessageChanged = { [weak self] in
+            // errorMessage 可能从 readabilityHandler 那个后台线程写进来，
+            // 而 revision 是 @Published，只能在主线程碰。
+            DispatchQueue.main.async { self?.revision += 1 }
+        }
         refreshCatalog()
         refreshStatus()
         runCheck()

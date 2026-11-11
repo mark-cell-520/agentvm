@@ -476,16 +476,32 @@ func macParseForwards(_ list: [String]) throws -> [MacVMForward] {
 
 /// "8G" / "512M" / "80G" → 字节。
 /// 和 vmkit 的 parse_size 同一套语义：G 按 1024³，不是 10⁹。
+///
+/// ** clamping 到 [0, UInt64.max]，不直接 `UInt64(v * mult)`。**
+/// `UInt64(Double)` 在值超出表示范围或为负时是 **trap**，不是抛错：负值报
+/// "cannot be converted to UInt64 because the result would be less than
+/// UInt64.min"，溢出同样，进程以 133（SIGTRAP）退出。用 swiftc 实测过两种。
+///
+/// macvm.json 是用户手改的文件（加共享目录、改端口转发都要动它），把 ram 写成
+/// "99999999999G" 或 "-5G" 是能发生的。原来这里直接转，于是点「启动」就崩，
+/// 而这个函数自己上面几行还在重新校验 shares 和 forwards「配置可能被手改过」——
+/// ram/disk 这两个会 trap 的漏了。2026-11-11 审计补上。
 func macParseSize(_ s: String) -> UInt64 {
     let t = s.trimmingCharacters(in: .whitespaces).uppercased()
-    var mult: UInt64 = 1
+    var mult: Double = 1
     var num = t
     if t.hasSuffix("G") { mult = 1024 * 1024 * 1024; num = String(t.dropLast()) }
     else if t.hasSuffix("M") { mult = 1024 * 1024; num = String(t.dropLast()) }
     else if t.hasSuffix("T") { mult = 1024 * 1024 * 1024 * 1024; num = String(t.dropLast()) }
     else if t.hasSuffix("K") { mult = 1024; num = String(t.dropLast()) }
     let v = Double(num.trimmingCharacters(in: .whitespaces)) ?? 0
-    return UInt64(v * Double(mult))
+    let bytes = v * mult
+    // NaN 和负数一律当 0：那是「读不出来」，让调用方的后续校验去报错，
+    // 比在这儿 trap 掉整个进程好。Inf 夹到 UInt64.max，那之后的值交给
+    // macAssertFreeSpace 和 VZConfiguration 自己拒。
+    guard bytes.isFinite, bytes > 0 else { return 0 }
+    if bytes >= Double(UInt64.max) { return UInt64.max }
+    return UInt64(bytes)
 }
 
 func macHuman(_ bytes: UInt64) -> String {
@@ -609,7 +625,8 @@ func macReadPIDFile(_ name: String) -> (host: String, pid: Int32)? {
 /// 「读不了这个 IPSW」，而用户按提示重跑多少次都一样。
 ///
 /// 现在下载写 .part、完成才 rename 成正式名，所以「正式名存在且大小对」
-/// 才等于下完了。进行中的下载在 .part 里，由 checkpoint 文件记录进度。
+/// 才等于下完了。进行中的下载在 .part 里，由 .part 自己的大小记录进度
+/// （见 macPartialBytes）。
 func macDownloadedBytes(_ dest: URL) -> Int64 {
     guard let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path),
           let size = attrs[.size] as? UInt64 else { return 0 }
@@ -618,17 +635,22 @@ func macDownloadedBytes(_ dest: URL) -> Int64 {
 
 /// 进行中的下载写到哪儿了。
 ///
-/// checkpoint 文件里存的是「已确认完整落盘的字节数」，每 64 MB 更新一次
-/// （不是每一段：25 GB / 8 MB = 3200 段，每段写一次元数据太碎）。
-/// 中断时最多重下 64 MB——拿几秒钟换 3200 次小写入，值。
+/// **读 .part 文件自己的大小，不读 checkpoint 文件。** 原来这里读
+/// `part.appendingPathExtension("ckpt")`，而全仓库没有任何代码写过那个文件
+/// （2026-11-11 grep 确认：只有这一处引用）。于是它恒返回 0，两个后果：
+///   · 856 行「接着已下的 X 继续」这句日志永远不会出现；
+///   · 865 行 `lastBytes = resume` 从 0 起算，而 .part 可能已经有十几 GB，
+///     第一次 0.5 秒采样算出的速度是「已下体积 ÷ 0.5 秒」——界面显示一个
+///     几十 GB/s 的假速度和假 ETA，AppState 直接把它印在进度条下面。
+///
+/// 而 .part 的大小就是这个函数想要的「已确认完整落盘的字节数」：curl 是单连接
+/// 顺序写的（见 macFetchWithCurl 的注释），写进去的就是落盘的。唯一的残尾是
+/// 中断那一瞬间的最后一段，而调用方已经向下取整到 8 MB 段边界，残尾会被重下
+/// 覆盖——比每 64 MB 写一次元数据的方案还简单，且少一个要维护的文件。
 func macPartialBytes(_ part: URL) -> Int64 {
-    let ck = part.appendingPathExtension("ckpt")
-    guard let text = try? String(contentsOf: ck, encoding: .utf8),
-          let v = Int64(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-          v > 0 else { return 0 }
-    // 不能超过文件实际大小。checkpoint 比文件大说明上一次写坏了。
-    let size = (try? FileManager.default.attributesOfItem(atPath: part.path)[.size] as? UInt64) ?? 0
-    return min(v, Int64(size))
+    let size = (try? FileManager.default
+        .attributesOfItem(atPath: part.path)[.size] as? UInt64) ?? 0
+    return Int64(size)
 }
 
 /// 装一次同步 HTTP 结果的盒子。Swift 的闭包捕获值语义在多线程下不好使，
@@ -1370,10 +1392,20 @@ final class MacVMRuntime: NSObject, VZVirtualMachineDelegate, ObservableObject {
 ///      客人机里有个听 vsock 的东西。启动日志里会把这句话打出来，
 ///      不装作已经通了。
 final class MacVsockProxy {
-    /// 重试间隔和次数。vzvm 用 1500 ms × 60（合计 90 秒）——客人机从开机到
-    /// 服务就绪实测要几十秒，间隔太短只是空转。
-    private static let retryInterval = DispatchTimeInterval.milliseconds(1500)
+    /// 重试间隔（毫秒）和次数。vzvm 用 1500 ms × 60（合计 90 秒）——客人机从
+    /// 开机到服务就绪实测要几十秒，间隔太短只是空转。
+    private static let retryIntervalMs = 1500
     private static let maxRetries = 60
+
+    /// 一共等多少秒，给日志用。
+    ///
+    /// 必须由间隔 × 次数算出来，不能写死。原来两处都写成
+    /// `maxRetries * 1500 / 60`——那是把毫秒除以 60（ms→分的除数）而不是 1000
+    /// （ms→秒），算出来 1500，日志告诉用户「等了 1500 秒」，把 90 秒说成
+    /// 25 分钟。改上面两个常量时只有这一处会跟着变。2026-11-11 审计补上。
+    private static var totalWaitSeconds: Int {
+        retryIntervalMs * maxRetries / 1000
+    }
 
     private let vmQueue: DispatchQueue
     private let lock = NSLock()
@@ -1558,7 +1590,7 @@ final class MacVsockProxy {
             self.retry(client: client, guestPort: guestPort, attempt: attempt,
                        reason: "客人机还没监听 vsock 端口 \(guestPort)")
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + Self.retryInterval,
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Self.retryIntervalMs),
                                           execute: watchdog)
 
         // VZVirtioSocketDevice 必须在 VM 的队列上 touch，见类注释坑2。
@@ -1614,7 +1646,7 @@ final class MacVsockProxy {
         }
         guard attempt < Self.maxRetries else {
             MacEmit.log("等客人机监听 vsock 端口 \(guestPort) 等不到"
-                + "（等了 \(Self.maxRetries * 1500 / 60) 秒，最后一句：\(reason)），"
+                + "（等了 \(Self.totalWaitSeconds) 秒，最后一句：\(reason)），"
                 + "这条连接放弃。", level: "warn")
             close(client)
             return
@@ -1622,10 +1654,11 @@ final class MacVsockProxy {
         if attempt == 0 {
             // 说清楚在等什么。用户看到的是「ssh 卡住不动」，不知道卡在哪。
             MacEmit.log("客人机还没监听 vsock 端口 \(guestPort)（\(reason)）。"
-                + "先挂着这条连接等它，最多 \(Self.maxRetries * 1500 / 60) 秒"
+                + "先挂着这条连接等它，最多 \(Self.totalWaitSeconds) 秒"
                 + "——客户端看到的是握手慢，不是连接被拒。")
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + Self.retryInterval) {
+        DispatchQueue.global().asyncAfter(
+            deadline: .now() + .milliseconds(Self.retryIntervalMs)) {
             [weak self] in
             self?.connect(client: client, guestPort: guestPort, attempt: attempt + 1)
         }

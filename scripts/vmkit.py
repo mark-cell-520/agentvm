@@ -60,6 +60,7 @@ stdout 每行一个 JSON 对象，界面直接解析：
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -343,9 +344,31 @@ def load_vm(name: str) -> dict:
     if not p.is_file():
         die(f"没有这个虚拟机：{name}。用 list 看现有的。")
     try:
-        return json.loads(p.read_text())
+        vm = json.loads(p.read_text())
     except json.JSONDecodeError as e:
         die(f"{p} 不是合法 JSON：{e}")
+    # name 和 kind 两个键必须存在——后面到处是 `vm["kind"]` 这种直接下标。
+    #
+    # **不在这儿 die。** 第一版对缺字段的文件直接 die，实测那是个倒退：
+    # status --name 和 list 本来能把它显示成「没装完」并给一个 --force 入口
+    # （vm_broken 的全部意义就是这个），die 之后这条路也没了；更糟的是
+    # install --name X --force 自己也要 load_vm，于是错误消息里推荐的那条恢复
+    # 路径本身就跑不通。现在补齐默认值让下标访问安全，真正的问题由 vm_broken
+    # 报出来（见那儿对「认不出的 kind」的处理）。
+    #
+    # 背景：vm.json 是会被写一半的。_save_vm_impl 是原子 replace，但旧版本、
+    # 外部工具、磁盘满都会留下「合法 JSON 但缺字段」的文件。而 cmd_open、
+    # cmd_window、cmd_stop、cmd_disk 原来都直接 `vm["kind"]`——一个坏文件就让
+    # 整条命令 KeyError 裸栈，用户只是想看一眼这台机器，得到的却是一段 Python
+    # 堆栈。本文件其余地方早就注释过「vm.json 一律用 .get」，这几处是漏的。
+    # 2026-11-11 审计补上。
+    if not isinstance(vm, dict):
+        die(f"{p} 内容不是一个对象：{vm!r}")
+    # setdefault 而不是 vm["kind"] = ...：文件里已经有值的（正常情况）不能被
+    # 覆写，只有真缺的时候才补空串。
+    vm.setdefault("name", name)
+    vm.setdefault("kind", "")
+    return vm
 
 
 def save_vm(vm: dict) -> None:
@@ -1234,7 +1257,19 @@ def cmd_install_linux(vm: dict, distro: dict) -> dict:
     linux_seed(vm, distro)
 
     Emit.stage("boot", "首次启动")
-    start_linux(vm, wait_ssh=True)
+    # SSH 等不到就**不能**置 ready。见 start_linux 里那段注释：原来失败和成功
+    # 走同一条出口，装失败的机器会被记成装好，用户拿给出的 ssh 命令去连，
+    # 连不上，而所有状态查询都说正常。
+    if not start_linux(vm, wait_ssh=True):
+        save_vm(vm)
+        die(f"虚拟机 {name} 没装完：等了 5 分钟 SSH 都没就绪。\n"
+            f"VM 还在跑，先看看它卡在哪儿：\n"
+            f"  {_self_cmd()} open --name {name}\n"
+            f"  {_self_cmd()} screenshot --name {name}\n"
+            f"日志：{vm_dir(name) / 'qemu.log'}\n"
+            f"确认是客人机自己的问题（apt 卡住、cloud-init 报错）之后，"
+            f"加 --force 重装：\n"
+            f"  {_self_cmd()} install --name {name} --force")
 
     ssh_cmd = (f"ssh -i {vm['ssh_key']} -p {vm['ssh_port']} "
                f"{vm['user']}@127.0.0.1")
@@ -1823,7 +1858,8 @@ def linux_ssh_ready(vm: dict, timeout: float = 8) -> bool:
     return r.returncode == 0
 
 
-def start_linux(vm: dict, wait_ssh: bool = False) -> None:
+def start_linux(vm: dict, wait_ssh: bool = False) -> bool:
+    """起一台 Linux 虚拟机。返回 SSH 到底等没等到（不等时恒为真）。"""
     if qemu_pid(vm):
         ok(f"VM 已在运行（pid {qemu_pid(vm)}）")
         return
@@ -1859,7 +1895,7 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
         die(f"QEMU 启动失败，看 {d / 'qemu.log'}")
 
     if not wait_ssh:
-        return
+        return True
     Emit.stage("ssh", "等 SSH 就绪")
     deadline = time.time() + 300
     t0 = time.time()
@@ -1867,14 +1903,22 @@ def start_linux(vm: dict, wait_ssh: bool = False) -> None:
         if linux_ssh_ready(vm):
             ok(f"SSH 已就绪，用时 {int(time.time() - t0)} 秒")
             _wait_guest_agent(vm)
-            return
+            return True
         if not qemu_pid(vm):
             die(f"QEMU 中途退出了，看 {d / 'qemu.log'}")
         Emit.progress("ssh", (time.time() - t0) / 300,
                       int(time.time() - t0), 300, 0)
         time.sleep(3)
+    # 返回假，让调用方知道这台**没装成**。
+    #
+    # 原来这里只是 warn 一句然后照常 return None，控制流接着往下走，失败和成功
+    # 走的是同一条出口。后果是一串假绿：ready=True、ssh_command 已给出、
+    # vm_broken 返回空串、_refuse_existing 会说「已存在，加 --force」而不是
+    # 「上次没装完」。用户拿给出的命令去连，连不上，而所有状态查询都说正常。
+    # 2026-11-11 审计补上。
     warn("等了 5 分钟 SSH 仍未就绪。VM 还在跑，用 open 看窗口，"
          f"或 screenshot 抓画面，或看 {d / 'qemu.log'}")
+    return False
 
 
 def _wait_guest_agent(vm: dict, timeout: float = 180.0) -> bool:
@@ -2209,9 +2253,11 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
         deadline = time.time() + vm.get("wait_minutes", 40) * 60
         t0 = time.time()
         last_shot = 0.0
+        ssh_up = False
         while time.time() < deadline:
             if w.ssh_ready(cfg):
                 ok(f"SSH 已就绪，用时 {int(time.time() - t0)} 秒")
+                ssh_up = True
                 break
             if not w.qemu_running(cfg):
                 # 不能只说「看 qemu.log」。实测那个文件在这种情况下是空的：
@@ -2241,6 +2287,18 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
             time.sleep(5)
         else:
             warn("超时仍未就绪，VM 还在跑。看日志或 open 开窗口。")
+        # 超时**不能**置 ready。原来这里 warn 一句就照常往下走，失败和成功走
+        # 同一条出口：装失败的 Windows 会被记成装好，界面给「远程桌面 / VNC」
+        # 入口，用户连上一个没装完的系统。同 start_linux 里那段注释。
+        if not ssh_up:
+            save_vm(vm)
+            die(f"虚拟机 {name} 没装完：等了 "
+                f"{vm.get('wait_minutes', 40)} 分钟 SSH 都没就绪。\n"
+                f"VM 还在跑，先看看它卡在哪儿：\n"
+                f"  {_self_cmd()} open --name {name}\n"
+                f"  {_self_cmd()} screenshot --name {name}\n"
+                f"确认是 Setup 卡住或 virtio 盘没被识别之后，加 --force 重装：\n"
+                f"  {_self_cmd()} install --name {name} --force")
     except winarm()._Die as e:
         die(str(e))
 
@@ -2262,6 +2320,13 @@ def cmd_install_windows(vm: dict, distro: dict) -> dict:
         ok("虚拟机窗口已打开")
     except Exception as e:  # noqa: BLE001 — 收尾失败不能把安装判失败
         warn(f"安装已完成，但打开窗口没成功：{e}。用 start --name {name} 再试")
+
+    # winarm 的 free_vnc_display() 在 5900+display 被占时会自动 +1，真实编号
+    # 写进 <vm>/vnc.display。不回读的话 vm.json 里还是旧编号，界面给的
+    # 「open vnc://127.0.0.1:xxxxx」连的是没人听的端口，而 status 显示一切
+    # 正常。cmd_start / cmd_window 两条路早就接了 _sync_windows_vnc，安装这条
+    # 自己直接调 w.cmd_start 的路漏了。2026-11-11 审计补上。
+    _sync_windows_vnc(vm)
 
     vm["ready"] = True
     vm["ssh_command"] = (f"ssh -i {vm['ssh_key']} -p {vm['ssh_port']} "
@@ -2439,6 +2504,92 @@ def _vmz_install_env() -> dict:
     return env
 
 
+# install.pid 上那把 flock 的 fd。**必须留着不关**：进程退出时内核才释放锁，
+# 而这个进程就是整个安装期间要占着锁的那一个。存到模块级变量，免得被 GC 掉
+# （GC 会调 close，锁就提前放了）。
+_INSTALL_LOCK_FD: int | None = None
+
+
+def _claim_install_lock(name: str) -> Path:
+    """占住这台虚拟机的 install.pid，返回那个路径。
+
+    **互斥必须由 flock 做，不能只靠 O_CREAT|O_EXCL。** O_EXCL 只保证「建文件」
+    那一下不重复，而这里要保证的是整个安装期间只有一个人在里面。第一版写的是
+    O_EXCL + 「上一个死了就 unlink 重试」，实测八个线程同时抢有四个赢家：每个
+    输家都读到占位的 0、判定「没在跑」、unlink、然后重试——unlink 把别人刚建出
+    来的文件也一起删了，锁就形同虚设。2026-11-11 自己写测试量出来的。
+
+    flock(LOCK_EX|LOCK_NB) 由内核保证同一时刻只有一个持有者，而且上一个持有者
+    进程退出时内核自动释放——「上一个崩了/被强杀了，文件还在」这种情况天然能
+    接手，不需要 unlink 重试那一套。
+
+    文件内容仍然写 pid：app 的「停止」和「接上还在跑的安装」都读它。写的是
+    os.getpid()，也就是真正干活的那个进程（后台子进程，或前台安装本身）。
+    拿到 flock 之后还多查一句 _pid_alive：正常情况下拿不到锁就进不来，这一句
+    只为旧版本留下的「有 pid 没锁」文件兜底。
+    """
+    global _INSTALL_LOCK_FD
+    d = vm_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    pidf = d / "install.pid"
+    try:
+        fd = os.open(str(pidf), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        die(f"建不了 {pidf}：{e}")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        try:
+            other = int(pidf.read_text().strip())
+        except (OSError, ValueError):
+            other = 0
+        die(f"这个虚拟机的安装已经在跑（pid {other or '?'}）。等它结束，"
+            f"或先停掉它：\n"
+            f"  kill {other or '?'}\n"
+            f"日志：{d / 'install.log'}")
+    # 拿到锁了。文件里可能还写着上一个的 pid，它已经不在了（否则锁在它手上），
+    # 但如果不是「旧版本留下的有 pid 没锁」而是真有活进程，如实拒绝。
+    try:
+        old = int(os.pread(fd, 32, 0).decode().strip() or "0")
+    except (OSError, ValueError):
+        old = 0
+    if old > 0 and old != os.getpid() and _pid_alive(old):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+        die(f"这个虚拟机的安装已经在跑（pid {old}）。等它结束，或先停掉它：\n"
+            f"  kill {old}\n"
+            f"日志：{d / 'install.log'}")
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    os.lseek(fd, 0, os.SEEK_SET)
+    # fd 必须留着：进程退出时内核才释放锁。存到模块级变量，免得被 GC 掉。
+    if _INSTALL_LOCK_FD is not None:
+        try:
+            os.close(_INSTALL_LOCK_FD)
+        except OSError:
+            pass
+    _INSTALL_LOCK_FD = fd
+    return pidf
+
+
+def _set_install_pid(pidf: Path, pid: int) -> None:
+    """把 install.pid 的内容改写成 pid。只改内容，不重新建文件——重建等于放弃
+    那把 flock。写失败不致命：app 那边读到空或读不到会按「没在跑」处理，最坏是
+    让用户重点一次安装。"""
+    try:
+        fd = os.open(str(pidf), os.O_WRONLY | os.O_TRUNC)
+        try:
+            os.write(fd, str(pid).encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _install_signal_guard(name: str) -> None:
     """安装期间收到 SIGTERM/SIGINT 时，把这次装的那台客人机一起带走。
 
@@ -2544,18 +2695,26 @@ def spawn_detached_install(args) -> int:
     _refuse_existing(name, args)
     d = vm_dir(name)
 
-    # 先看有没有一个安装已经在跑。原来没有任何检查：连点两次安装（或 app 的
-    # install.pid 轮询有个窗口期）就会起第二个安装进程，两边同时 qemu-img
-    # create 同一个 disk.qcow2、同时 save_vm 写同一个 vm.json、同时起两个
-    # QEMU 抢同一组端口——磁盘和配置都损坏，而两份日志交错在一起无法复盘。
-    # install.pid 写了（下面），但原来只有 app 读，vmkit 自己从不看。
+    # 父进程只做一次便宜的存在性检查，把最常见的情况（连点两次）提前挡掉并给一句
+    # 能照着做的话。真正的互斥在子进程里：下面 Popen 出来的那个进程会再跑一遍
+    # cmd_install，由 _claim_install_lock 用 flock 占住 install.pid 并写上自己的
+    # pid。父进程不占锁——它几十毫秒就退出了，占着没有任何意义，反而会让子进程
+    # 以为自己输给了别人。
+    #
+    # 原来这里是「is_file() 读一下 → …几百毫秒后 Popen → write_text」，检查和
+    # 落盘之间隔着 catalog 读取、find_vmz()、argv 组装，两条几乎同时执行的
+    # install 都能通过检查，各自起一个安装进程，然后各自写 install.pid，后写的
+    # 覆盖前一条的——两个安装同时 qemu-img create 同一个 disk.qcow2、同时 save_vm
+    # 同一个 vm.json、同时起两个 QEMU 抢同一组端口，磁盘和配置都损坏，而两份日志
+    # 交错在一起无法复盘。install.pid 是这里唯一的互斥手段，而它是在子进程起来
+    # 之后才落盘的。2026-11-11 审计补上。
     pidf = d / "install.pid"
     if pidf.is_file():
         try:
             old = int(pidf.read_text().strip())
-        except ValueError:
+        except (OSError, ValueError):
             old = 0
-        if old > 0 and _pid_alive(old):
+        if old > 0 and old != os.getpid() and _pid_alive(old):
             die(f"这个虚拟机的安装已经在跑（pid {old}）。等它结束，或先停掉它：\n"
                 f"  kill {old}\n"
                 f"日志：{d / 'install.log'}")
@@ -2625,6 +2784,11 @@ def spawn_detached_install(args) -> int:
             argv.append(a)
         # 口令不能顺着 argv 传给子进程，换成 0600 文件指过去
         argv = _forward_password(argv, name, args.password)
+        # 环境跟着父进程走，不加任何标记。子进程占 install.pid 靠的是 flock：
+        # 父进程没占，所以子进程不会「输给自己」。第一版在这儿设过
+        # AGENTVM_INSTALL_CHILD 让子进程别占锁，那是在父进程也占的前提下才有
+        # 必要——改成父进程只做存在性检查之后，这个标记不再需要，删掉少一个隐式
+        # 契约。2026-11-11。
         env = None
 
     # 追加而不是覆盖：重跑一次不会把上次的日志冲掉，出问题时能回看
@@ -2637,7 +2801,10 @@ def spawn_detached_install(args) -> int:
     # pid 落盘。GUI 靠它判断「这个安装还在跑吗、要不要接着显示进度」。
     # 不用 pgrep 匹配命令行：命令行里参数顺序不固定，写出来的模式很容易对不上，
     # 而且会误匹配到别的进程。
-    (d / "install.pid").write_text(str(proc.pid))
+    # 父进程只是把子进程的 pid 抄一份在这儿，方便 app 在子进程还没跑到占锁那一步
+    # 时也能读到东西；子进程随后会用自己的 pid 覆写（_claim_install_lock）。
+    # 不重新建文件——那会放弃锁，也让 app 有一小段时间读到不存在的文件。
+    _set_install_pid(pidf, proc.pid)
     Emit.done({"name": name, "log": str(logf), "pid": proc.pid,
                "detached": True})
     return 0
@@ -2706,22 +2873,85 @@ def _reopen_install_log(name: str) -> None:
             except OSError:
                 pass
     try:
-        (vm_dir(name) / "install.pid").write_text(str(os.getpid()))
+        _set_install_pid(vm_dir(name) / "install.pid", os.getpid())
     except OSError:
         pass
 
 
 def cmd_install(args) -> int:
     name = args.name
+    # 白名单必须排在**所有**用 name 拼路径的东西之前：下面
+    # _install_signal_guard 的信号处理器里就用 vm_dir(name) 拼路径，
+    # resolve_password 也要拿它建 0600 文件。排在 platform 检查之后、
+    # _install_signal_guard 之后都来不及。
+    #
+    # 用全仓库共用的那份白名单，**不能自己写一份宽的**。
+    # 原来这里（和 cmd_clone 的 --new-name）写的是
+    # `name.replace("-","").replace("_","").isalnum()`，比 check_vm_name 的
+    # `[A-Za-z0-9][A-Za-z0-9._-]{0,62}` 宽：Python 的 isalnum() 对 Unicode
+    # 字母数字都为真，于是 `install --name 虚拟机` 能建出目录
+    # ~/.agentvm/vms/虚拟机，而随后 start/stop/status/delete 全都在 main() 的
+    # check_vm_name 上 die。产物是一台 list 看得见、delete 删不掉的虚拟机，
+    # 只能手工 rm。而且 install 是 main() 里最早分派的几个命令之一，走不到
+    # 4741 行那道统一校验。2026-11-11 审计补上。
+    # （顺带：这里原来同一句检查写了两遍，复制粘贴留下的。）
+    check_vm_name(name)
     resolve_password(args)
     _install_signal_guard(name)
     if platform.machine() != "arm64" or platform.system() != "Darwin":
         die("只在 Apple Silicon 的 macOS 上有效。")
-    if not name.replace("-", "").replace("_", "").isalnum():
-        die(f"名字只能含字母数字和 - _：{name}")
-    if not name.replace("-", "").replace("_", "").isalnum():
-        die(f"名字只能含字母数字和 - _：{name}")
+    # 占 install.pid。**前台和后台子进程都走这一句**，而且这是唯一真正的互斥点。
+    #
+    # 前台不占的话，它会和后台那条互不设防：前台安装从来不写 install.pid
+    # （只有 spawn_detached_install 写），于是「终端里跑着一个前台 install」的
+    # 同时再跑一次 `install --detach`，后台父进程读到的还是空文件，照常起第二个
+    # 安装。后台子进程（就是不带 --detach 再跑一遍 cmd_install 的那个）占这把锁，
+    # 于是两个子进程之间也互斥——原来它们是各写各的 install.pid，后写的覆盖前一条。
+    # 释放靠 main() 里 install 那段 finally 的 unlink，以及 _install_signal_guard
+    # 的信号处理器（os._exit 不走 finally）。
+    #
+    # 为什么不需要 AGENTVM_INSTALL_CHILD 之类的标记区分「我是子进程」：
+    # spawn_detached_install 的父进程只做存在性检查、不占锁，所以子进程不会
+    # 「输给自己」。第一版让父进程也占、再用环境变量告诉子进程别占，那是多余的。
+    _claim_install_lock(name)
     _refuse_existing(name, args)
+
+    # --force 必须在分叉之前、在下载之前就把旧目录清掉。
+    #
+    # 两个顺序上的理由：
+    #   · 必须在本地包那条路之前：那条路会用 local_source_from_url 把用户贴的
+    #     网址下到 <vm>/iso/，下完再删目录等于把几 GB 的下载一起扔掉；
+    #   · 必须在 catalog 那条路自己那段之前：它下面 2860 行起也有一份一样的
+    #     处理，而目录已经没了之后 vm_file(name).exists() 为假，那份会自然跳过，
+    #     不会二次清盘。
+    # 原来本地包这条路上什么都没有：只写一个全新的 vm.json 就往下跑，三个后果
+    # 叠加——(a) cmd_install_local 里 `if disk.exists(): ok("磁盘已存在")`，
+    # 旧 data.img 连数据一起复用，而 --help 写的是「同名就整个目录删掉重装」；
+    # (b) start_local 第一句就是 `if qemu_pid(vm): ok("VM 已在运行")`，安装器
+    # 压根没重启，autoinstall 对着那台已经进系统的旧 VM 点；(c) 新 vm.json 是
+    # 全新字典，没有 disks / shares 键，附加盘条目从配置里消失但文件还在盘上，
+    # 成为孤儿。_refuse_existing 里「加 --force 会清掉 <dir> 重新装」这句话
+    # 在这条路上因此是不成立的。2026-11-11 审计补上。
+    if args.force and vm_file(name).exists():
+        # macOS 的进程号在 macvm.pid 里，qemu_pid 收的字典没 kind 就永远返回
+        # None——那会对一个正在跑的 macOS VM 说「没在运行」然后删盘。
+        old = load_vm(name)
+        if qemu_pid(old if old else {"name": name}):
+            die(f"{name} 正在运行。先 stop 再 --force 重装，"
+                f"不然会删掉正在用的盘。")
+        # 后台安装那条路：父进程在分叉之前就打开了 install.log（append 模式），
+        # 而下面这一删会把它一起 unlink。先记下「我们是那个后台子进程」，
+        # 好在删完之后把 stdout 重新接回新文件。
+        detached = (vm_dir(name) / "install.pid").is_file()
+        warn(f"--force：清掉 {vm_dir(name)} 重新装（里面的数据一起没）")
+        _rmtree(vm_dir(name))
+        # 锁必须重新占。上面 _rmtree 把 install.pid 一起 unlink 了，而 flock 是绑在
+        # 那个（已经不在了的）inode 上的：fd 还开着、锁还算占着，但路径上已经没有
+        # 文件，别人新建一个就是另一把锁。不补这一句的话，--force 重装的整个安装期
+        # 间是没有任何互斥的。2026-11-11 审计补上。
+        _claim_install_lock(name)
+        if detached:
+            _reopen_install_log(name)
 
     # 本地安装包这条路不走 catalog：没有下载地址、没有校验和、没有推荐配置，
     # 全靠用户给的一个路径。所以先把它分叉出来，别让后面的 catalog 查找绊倒。
@@ -2803,30 +3033,20 @@ def cmd_install(args) -> int:
 
     cat = load_catalog()
     distro = find_distro(cat, args.distro)
-    if not name.replace("-", "").replace("_", "").isalnum():
-        die(f"名字只能含字母数字和 - _：{name}")
     # _refuse_existing 已经在函数开头拦过一次，这里再拦是因为 catalog 查找
     # （可能因为 distro 名字不对而 die）和本地包那条路都在它之后。重复调用
     # 是幂等的：给了 --force 或目录不存在就立刻返回。
+    # 名字的白名单在函数开头用 check_vm_name 统一过了，这里不再自己写一份
+    # （原来这儿还有一句更宽的 isalnum 检查，2026-11-11 审计删掉）。
     _refuse_existing(name, args)
     if vm_file(name).exists():
-        # --force 必须真的清掉旧盘。原来只重写 cloud-init 种子，旧的文件系统
-        # 和旧数据原样留着：用户以为得到一台干净机器，实际上一轮的脏数据全在，
-        # 而 --help 写的是「覆盖重装」。这种事比不给 --force 更糟——至少那个
-        # 会明确报错。
-        # macOS 的进程号在 macvm.pid 里，qemu_pid 收的字典没 kind 就永远
-        # 返回 None——那会对一个正在跑的 macOS VM 说「没在运行」然后删盘。
-        old = load_vm(name) if vm_file(name).exists() else {}
+        # --force 的停机和清盘已经在函数开头做过了（见那儿的长注释：必须做在
+        # 本地包那条路和下载之前）。走到这里 vm.json 还在，只有一种情况——
+        # 两次调用之间又有人建了一台同名的。只补停机检查并清掉，不重复 warn。
+        old = load_vm(name)
         if qemu_pid(old if old else {"name": name}):
             die(f"{name} 正在运行。先 stop 再 --force 重装，不然会删掉正在用的盘。")
-        # 后台安装那条路：父进程在分叉之前就打开了 install.log（append 模式），
-        # 而下面这一删会把它一起 unlink。先记下「我们是那个后台子进程」，
-        # 好在删完之后把 stdout 重新接回新文件。
-        detached = (vm_dir(name) / "install.pid").is_file()
-        warn(f"--force：清掉 {vm_dir(name)} 重新装（里面的数据一起没）")
         _rmtree(vm_dir(name))
-        if detached:
-            _reopen_install_log(name)
 
     # 一律 .get()：一个写了一半的 vm.json 缺 ssh_port 时，这里 KeyError 崩掉，
     # 而用户只是想装一个跟那个坏字段无关的新虚拟机。
@@ -3209,7 +3429,7 @@ def cmd_stop(args) -> int:
     if not pid:
         ok("VM 没在运行")
         return 0
-    if vm["kind"] == "windows":
+    if vm.get("kind") == "windows":
         w = winarm()
         # 原来只设 VM_DIR。winarm 的 Cfg() 于是回落到默认的 ~/.winarm/ci_key，
         # 和安装时用的 vm["ssh_key"] 不是同一把钥匙，关机流程第一步的 SSH 认证
@@ -3219,6 +3439,21 @@ def cmd_stop(args) -> int:
             w.cmd_stop(w.Cfg())
         except w._Die as e:
             die(str(e))
+        # 发完 -9 必须等它真的退干净再返回。
+        #
+        # winarm 的 cmd_stop 结尾是 `kill -9; ok("已强杀")`，没有等待——而 kill
+        # 是异步的：信号发出去到进程变成僵尸/消失之间有一段窗口，这时候 ps 还
+        # 看得见它。紧接着任何「起虚拟机」都会走 qemu_running → 看到「VM 已在
+        # 运行」→ 什么都不做就返回。用户改的 CPU/内存/显示模式一个都没生效，
+        # 而日志说停过了。
+        # Linux/local 那条路（下面几行）早就写了这段轮询，Windows 是委托给
+        # winarm 的，那道保护没覆盖到。cmd_delete 也会走到这儿：stop 报完
+        # 「已强杀」就删 data.img，而 QEMU 可能还在往那个文件里写。
+        # 2026-11-11 审计补上。
+        for _ in range(50):
+            if not qemu_pid(vm):
+                break
+            time.sleep(0.2)
         return 0
     # Linux：guest agent → SSH → ACPI → 强杀，一路降级。
     # qcow2 被强杀有丢数据风险，所以前面每一层都值得试；而 agent 排在 SSH
@@ -3381,8 +3616,16 @@ def vm_broken(vm: dict) -> str:
         need = ("disk.img",)
     elif kind in ("windows", "local"):
         need = ("data.img",)
-    else:
+    elif kind == "linux":
         need = ("disk.qcow2", "seed.iso")
+    else:
+        # 认不出的 kind **不能**按 linux 判。原来这儿是个 `else`，把「未知」
+        # 和「linux」合并了：一台其实是 local 的 VM 只要 kind 字段坏了（手改过、
+        # 或者安装早期写的那一版），就会被判成「缺 disk.qcow2、seed.iso」，
+        # _refuse_existing 于是劝用户 --force 重装——照 cmd_install 那边的行为，
+        # 用户照做才发现是另一回事。如实说「认不出」比猜一个强。
+        # 2026-11-11 审计补上。
+        return f"vm.json 里的 kind 是 {kind!r}，不是认识的那几种"
     d = vm_dir(name)
     missing = [f for f in need if not (d / f).is_file()]
     if missing:
@@ -3607,6 +3850,66 @@ def _vm_qcow2(vm: dict) -> Path | None:
     return None
 
 
+def qcow2_backing(path: Path) -> Path | None:
+    """这个 qcow2 真正的底册是哪个文件，没有底册返回 None。
+
+    用 `qemu-img info --output=json` 读 backing-filename，不靠猜。**相对路径
+    要按 qcow2 自己所在目录解析**——qemu-img 存的就是当时 `-b` 传进去的那个
+    字符串，用户或旧版本传相对路径时它是相对的，直接当绝对路径用会找错文件。
+
+    读不出来（文件不在、不是 qcow2、qemu-img 报错）时返回 None，由调用方决定
+    是降级还是报错——这里不 die：list_snapshots 之类的只读路径也用得上。
+
+    一律 resolve()：macOS 上 /var 是指向 /private/var 的符号链接，而调用方
+    （clone 建 overlay、delete 比依赖）传进来的路径可能两种形式都有。不归一的话
+    「/var/folders/.../base.qcow2」和「/private/var/folders/.../base.qcow2」会被
+    当成两个不同的文件，依赖检查静默漏掉。2026-11-11 自己写测试量出来的。
+    """
+    if not path.is_file():
+        return None
+    r = run([find_tool("qemu-img"), "info", "--output=json", str(path)],
+            check=False)
+    try:
+        info = json.loads(r.stdout or "{}")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    bf = info.get("backing-filename")
+    if not bf:
+        return None
+    p = Path(bf)
+    return (p if p.is_absolute() else path.parent / p).resolve()
+
+
+def vm_qcow2_files(vm: dict) -> list[Path]:
+    """这台虚拟机哪些盘是 qcow2（可能被别人当底册）。"""
+    out = []
+    f = vm_dir(vm.get("name", "")) / "disk.qcow2"
+    if f.is_file():
+        out.append(f)
+    for d in vm.get("disks", []):
+        p = Path(d["file"])
+        if d.get("format") == "qcow2" and p.is_file():
+            out.append(p)
+    return out
+
+
+def qcow2_backing_dependents(vm: dict) -> list[str]:
+    """哪些虚拟机把 vm 的 qcow2 盘当底册。给 delete 用来拒绝制造一台起不来的克隆。"""
+    mine = {p.resolve() for p in vm_qcow2_files(vm)}
+    if not mine:
+        return []
+    out = []
+    for v in all_vms():
+        if v.get("name") == vm.get("name"):
+            continue
+        for cand in vm_qcow2_files(v):
+            b = qcow2_backing(cand)
+            if b is not None and b.resolve() in mine:
+                out.append(v.get("name", "?"))
+                break
+    return sorted(set(out))
+
+
 def list_snapshots(path: Path) -> list[dict]:
     """列出 qcow2 里的内部快照。
 
@@ -3777,14 +4080,32 @@ def cmd_clone(args) -> int:
     """
     src = load_vm(args.name)
     new = args.new_name
-    if not new.replace("-", "").replace("_", "").isalnum():
-        die(f"名字只能含字母数字和 - _：{new}")
+    # 用共用的白名单。原来这里自己写了一句 isalnum()，比 check_vm_name 宽
+    # （"虚拟机".isalnum() 为真），于是能克隆出一台别的命令一律拒绝管理的 VM：
+    # list 看得见、delete 删不掉，只能手工 rm。2026-11-11 审计补上。
+    check_vm_name(new)
     if vm_file(new).exists() and not args.force:
         die(f"{new} 已存在。换个名字，或加 --force 覆盖。")
+    # --force 必须真的清掉目标、且目标不能在运行。
+    #
+    # 原来 --force 只用来跳过上面那句 die，没有任何清理动作，于是：
+    #   · Linux：第二次 clone 时 qemu-img create 发现目标 disk.qcow2 已存在，
+    #     直接报错，整条 clone 以一句「命令失败：qemu-img create …」结束；
+    #   · local/windows：`cp -c` 会把目标 data.img 换成源的 CoW 克隆，而目标的
+    #     QEMU 还攥着旧 inode 继续写；同时 save_vm 用新分配的端口覆写目标的
+    #     vm.json，之后 status 报的 SSH/VNC 端口和 QEMU 实际监听的对不上。
+    # 源那份运行检查（下面）早就有了，目标这份是漏的。2026-11-11 审计补上。
+    if args.force and vm_file(new).exists():
+        dst = load_vm(new)
+        if qemu_pid(dst if dst else {"name": new}):
+            die(f"{new} 正在运行，先 stop 再覆盖克隆——"
+                f"不然会把正在用的盘从 QEMU 脚下抽走。")
+        warn(f"--force：清掉 {vm_dir(new)} 重新克隆（里面的数据一起没）")
+        _rmtree(vm_dir(new))
     # macOS 客人机的克隆在 vmz 里：系统盘走 clonefile，而机器标识和 NVRAM
     # 必须重新生成（同一个 machineIdentifier 跑两台是未定义行为，
     # 实际表现是 iCloud 互相顶、Handoff 串台）。
-    if src["kind"] == "macos":
+    if src.get("kind") == "macos":
         vmz = find_vmz()
         if not vmz:
             die("找不到 vmz，克隆不了 macOS 虚拟机。")
@@ -3804,15 +4125,38 @@ def cmd_clone(args) -> int:
     Emit.stage("clone", f"克隆 {src['name']} → {new}")
 
     # 系统盘
-    if src["kind"] == "linux":
+    if src.get("kind") == "linux":
         base = vm_dir(src["name"]) / "disk.qcow2"
         if not base.is_file():
             die(f"源的盘不在：{base}")
-        # 再叠一层 overlay，底册还是同一个云镜像。多个 VM 共用一份底册，
-        # 各自写入时才真正占空间。
-        run([find_tool("qemu-img"), "create", "-f", "qcow2",
-             "-b", str(base), "-F", "qcow2", str(d_new / "disk.qcow2")])
-        ok("已建 overlay 磁盘（与源共用底册）")
+        # 底册必须是源盘**真正的 backing 文件**，也就是 install 时那个共用的
+        # 云镜像（~/.agentvm/images/<id>.qcow2）。原来这里直接把
+        # `vm_dir(src) / "disk.qcow2"` 当底册——那是源虚拟机自己的 overlay，
+        # 注释却写着「底册还是同一个云镜像」。后果：删掉源 VM（cmd_delete 是
+        # 无条件 _rmtree）之后，克隆的 disk.qcow2 指向一个不存在的文件，
+        # QEMU 起不来（Could not open backing file），而克隆的 vm.json 完好、
+        # vm_broken 也查不出来——用户拿到一台「配置齐全但永远启动不了」的机器。
+        # 2026-11-11 审计补上。
+        backing = qcow2_backing(base)
+        if backing is not None and backing.is_file():
+            # 再叠一层 overlay，底册还是同一个云镜像。多个 VM 共用一份底册，
+            # 各自写入时才真正占空间。
+            run([find_tool("qemu-img"), "create", "-f", "qcow2",
+                 "-b", str(backing), "-F", "qcow2", str(d_new / "disk.qcow2")])
+            ok(f"已建 overlay 磁盘（与源共用底册 {backing.name}）")
+        else:
+            # 源盘没有底册（整盘拷贝来的、或者 backing 已经丢了）。这时候不能
+            # 再叠 overlay：叠一个指向不存在文件的 overlay，克隆出来永远起不来。
+            # 改成整盘复制——占一整份空间，但至少是台能用的机器。
+            # 原来的写法正是这个情况，只是没人告诉过用户。
+            r = run(["cp", "-c", str(base), str(d_new / "disk.qcow2")],
+                    check=False)
+            if r.returncode != 0 or not (d_new / "disk.qcow2").is_file():
+                run(["cp", str(base), str(d_new / "disk.qcow2")])
+                warn("clonefile 不可用，退回普通拷贝，会占一整份空间")
+            else:
+                ok("已用 APFS clonefile 复制磁盘（不占额外空间）")
+            warn("源盘没有共用的云镜像底册，克隆出来的是独立一整份")
     else:
         base = vm_dir(src["name"]) / "data.img"
         if not base.is_file():
@@ -3836,7 +4180,7 @@ def cmd_clone(args) -> int:
     # die「VM 不完整，缺 seed.iso。重新 install。」——用户拿到一个起不来的 VM，
     # 而提示让他重装，等于这个克隆白做。Linux 那条路是主力机型，这个坑必踩。
     src_seed = vm_dir(src["name"]) / "seed.iso"
-    if src["kind"] == "linux":
+    if src.get("kind") == "linux":
         if not src_seed.is_file():
             die(f"源的种子盘不在：{src_seed}。给源跑一次 install 或 configure "
                 f"补上，再克隆。")
@@ -4004,6 +4348,20 @@ def cmd_delete(args) -> int:
         if qemu_pid(vm):
             warn("VM 还在跑，先关机再删")
             cmd_stop(args)
+        # 别把别人当底册用的盘删掉。
+        #
+        # clone 建的是 qcow2 overlay，底册指向源盘（或共用的云镜像）。而这里
+        # 对 VM 目录是无条件 _rmtree——底册一没，那台克隆的 disk.qcow2 就指着
+        # 一个不存在的文件，QEMU 起不来（Could not open backing file），而它的
+        # vm.json 完好、vm_broken 也查不出来。用户拿到一台「配置齐全但永远
+        # 启动不了」的机器，且没有任何线索指向这次删除。2026-11-11 审计补上。
+        dependents = qcow2_backing_dependents(vm)
+        if dependents:
+            die(f"{name} 的盘被这些虚拟机当底册用着：{'、'.join(dependents)}。"
+                f"删掉它，它们会变成「配置齐全但永远启动不了」。\n"
+                f"先删这些克隆（它们没有独立数据）：\n"
+                + "\n".join(f"  {_self_cmd()} delete --name {n}"
+                            for n in dependents))
     elif (d / "macvm.json").is_file():
         # macOS 虚拟机没有 vm.json（它的配置在 macvm.json 里），
         # 但删的时候照样要先停机、照样要卸自启 plist。漏了这一段，

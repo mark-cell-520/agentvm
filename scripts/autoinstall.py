@@ -231,6 +231,15 @@ class RFB:
             if t == 0:                                  # FramebufferUpdate
                 self._recv(1)
                 nrect = int.from_bytes(self._recv(2), "big")
+                # 一个矩形都没有的空更新：不返回假黑帧。
+                #
+                # out 初始化成全 0，nrect == 0 时它就是一张纯黑图。而 is_dark()
+                # 的判据正是「平均亮度 < 60」——一张假黑帧会被当成「客人机重启了」，
+                # 把 saw_dark 无端置上，放大重启循环判据的误报面（见 drive() 里
+                # 那段）。本实现总是发 incremental=0 的全屏请求，正常不会走到这儿，
+                # 但代价只是多等一轮，比送一张假画面进去安全。2026-11-11 审计补上。
+                if nrect == 0:
+                    continue
                 out = bytearray(self.w * self.h * 4)
                 for _ in range(nrect):
                     rh = self._recv(12)
@@ -475,7 +484,20 @@ def service_ready(vm: dict, timeout: float = 3.0) -> bool:
     不能只 TCP connect：QEMU 的 user 模式网络在 hostfwd 端口上来者不拒，
     客人机没监听时它也先把连接接住，连不上客人机时才关掉。所以必须真发一个
     请求、读到真响应：Web 端口要读到 "HTTP/"，SSH 端口要读到 "SSH-"。
+
+    **两个端口都要试，任何一个真的应了就当成就绪。** 原来是 if web / elif ssh：
+    web_port 一有值，ssh 那条路一次都走不到。而 vmkit 给每台 kind=="local" 的
+    VM 都同时分配两个端口（web_port 转发到 guest:5666，ssh_port 转发到 guest:22）。
+    装一台普通 Linux（Debian/Ubuntu server 之类，不是 fnOS 那种 NAS）时，
+    sshd 起来了、5666 上什么都没有——hostfwd 接受连接后关掉，第一个分支
+    return False，于是 drive() 每一轮都判「服务没起来」，把整个 budget
+    （默认 40 分钟）耗完返回 timeout，再打印「请您在画面里点完」，而系统早就
+    装好并跑起来了。vmkit 里 local_qemu_args 的注释明写「ssh_port 备用——
+    有些安装器装完会起 sshd」，代码把这条唯一的备用路径堵死了。
+    2026-11-11 审计补上。
     """
+    got: list[bool] = []
+    # web 端口：发一个 GET，读到 HTTP 响应头才算。
     web = vm.get("web_port")
     if web:
         try:
@@ -483,21 +505,20 @@ def service_ready(vm: dict, timeout: float = 3.0) -> bool:
                                           timeout=timeout) as sk:
                 sk.settimeout(timeout)
                 sk.sendall(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                got = sk.recv(64)
-            return got.startswith(b"HTTP/")
+                got.append(sk.recv(64).startswith(b"HTTP/"))
         except OSError:
-            return False
+            got.append(False)
+    # ssh 端口：读 banner。
     port = vm.get("ssh_port")
     if port:
         try:
             with socket.create_connection(("127.0.0.1", int(port)),
                                           timeout=timeout) as sk:
                 sk.settimeout(timeout)
-                got = sk.recv(64)
-            return got.startswith(b"SSH-")
+                got.append(sk.recv(64).startswith(b"SSH-"))
         except OSError:
-            return False
-    return False
+            got.append(False)
+    return any(got)
 
 
 def is_dark(frame: bytes, w: int, h: int) -> bool:
@@ -516,6 +537,17 @@ def is_dark(frame: bytes, w: int, h: int) -> bool:
         total += (frame[o] + frame[o + 1] + frame[o + 2]) // 3
         n += 1
     return n > 0 and total / n < 60
+
+
+def _frame_no(p: Path) -> int:
+    """auto-<n>.ppm 里的 n，读不出来排到最后。
+
+    只给 save_frame 的向前剪用（见那儿说明为什么不能按字典序排）。
+    """
+    try:
+        return int(p.stem.split("-", 1)[1])
+    except (IndexError, ValueError):
+        return 1 << 30
 
 
 def save_frame(vdir: Path, n: int, frame: bytes, w: int, h: int) -> None:
@@ -537,9 +569,17 @@ def save_frame(vdir: Path, n: int, frame: bytes, w: int, h: int) -> None:
     except OSError:
         return
     # 向前剪：只留最近这么多张，别让一个 30 分钟的安装在磁盘上堆 600 张 1.4MB
+    #
+    # **按文件名里的序号排序，不能按文件名字典序。** "auto-9.ppm" > "auto-39.ppm"
+    # （'9'=0x39 > '3'=0x33），字典序和数值序从 n>=10 起分叉。原来写的是
+    # `key=lambda p: p.name`，于是留下的「最近 24 张」其实是一个字典序窗口：
+    # 实测跑 40 个动作后 auto-10.ppm~auto-22.ppm 被删掉，而更老的
+    # auto-3.ppm~auto-9.ppm 留着；跑满 ACT_LIMIT=200 时有 100 帧（n=100..199）
+    # 在 save_frame 写下它的同一个调用里就被删掉，最后那一帧 auto-199.ppm
+    # 根本不存在。后果正好和这个功能的目的相反：安装退化成 manual 时，用户和
+    # 我们第一眼要看的「它停在什么屏幕上」那一帧不在盘上。2026-11-11 审计补上。
     try:
-        olds = sorted(vdir.glob("auto-*.ppm"),
-                      key=lambda p: p.name)
+        olds = sorted(vdir.glob("auto-*.ppm"), key=_frame_no)
         for p in olds[:-KEEP_FRAMES]:
             p.unlink()
     except OSError:

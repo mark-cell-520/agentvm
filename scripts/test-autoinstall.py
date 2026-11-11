@@ -21,6 +21,7 @@ Web 界面 HTTP 200 全程无人点击），那一遍的成本是十几分钟和
 
 import importlib.util
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -499,9 +500,20 @@ class TestDriveWithScriptedRFB(unittest.TestCase):
 
 
 class TestMonitorSend(unittest.TestCase):
+    def setUp(self):
+        # 每个 _mon 建一个临时目录，而 tearDown 原来不存在——五条测试漏五个
+        # mkdtemp 目录，跑一次 make test 就在 /tmp 堆五个不带自动清理的目录。
+        # 2026-11-11 审计补上。
+        self._dirs = []
+
+    def tearDown(self):
+        for d in self._dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
     def _mon(self, reply):
         srv = socket.socket(socket.AF_UNIX)
         d = tempfile.mkdtemp()
+        self._dirs.append(d)
         p = Path(d) / "monitor.sock"
         srv.bind(str(p))
         srv.listen(1)
@@ -602,6 +614,74 @@ class TestServiceReady(unittest.TestCase):
 
     def test_no_ports(self):
         self.assertFalse(ai.service_ready({}, timeout=0.2))
+
+    def test_ssh_is_tried_when_web_port_answers_nothing(self):
+        """web_port 有值但 5666 上什么都没有时，ssh_port 那条路必须还能走到。
+
+        vmkit 给每台 kind=="local" 的 VM 都同时分配两个端口：web_port 转发到
+        guest:5666，ssh_port 转发到 guest:22。装一台普通 Linux（Debian/Ubuntu
+        server 之类，不是 fnOS 那种 NAS）时 sshd 起来了、5666 上什么都没有——
+        而 hostfwd 会先把连接接住再关掉。原来是 `if web: ... elif ssh:`，
+        web 一有值 ssh 那条一次都走不到，于是 drive() 每一轮都判「服务没起来」，
+        把整个 budget 耗完返回 timeout，而系统早就装好并跑起来了。
+        2026-11-11 审计补上。
+        """
+        dead, t1 = self._serve(b"")           # 5666：接住就关，什么都没有
+        live, t2 = self._serve(b"SSH-2.0-OpenSSH_9.6\r\n", read_first=False)
+        try:
+            self.assertTrue(ai.service_ready(
+                {"web_port": dead, "ssh_port": live}, timeout=1))
+        finally:
+            t1.join(timeout=2)
+            t2.join(timeout=2)
+
+    def test_ssh_not_ready_and_web_not_ready_is_not_ready(self):
+        """两个都在但都不应——不能因为「试过两个」就当成就绪。"""
+        dead, t1 = self._serve(b"")
+        live, t2 = self._serve(b"not-a-banner", read_first=False)
+        try:
+            self.assertFalse(ai.service_ready(
+                {"web_port": dead, "ssh_port": live}, timeout=1))
+        finally:
+            t1.join(timeout=2)
+            t2.join(timeout=2)
+
+
+class TestFramePruning(unittest.TestCase):
+    """save_frame 的「只留最近 KEEP_FRAMES 张」必须按序号，不能按文件名字典序。"""
+
+    def _mk(self, d, n):
+        with open(d / f"auto-{n}.ppm", "wb") as f:
+            f.write(b"P6\n2 2\n255\n" + b"\x00" * 12)
+
+    def test_keeps_the_highest_numbers_not_the_lexicographically_largest(self):
+        """"auto-9.ppm" > "auto-39.ppm"（'9'=0x39 > '3'=0x33），字典序和数值序
+        从 n>=10 起分叉。按字典序剪，留下的是一批老帧，而最后那一帧（n 最大的
+        那个，也就是安装停下来时用户第一眼要看的那一帧）反而不在盘上。"""
+        d = Path(tempfile.mkdtemp())
+        try:
+            nums = list(range(3, 10)) + list(range(10, 45))
+            for n in nums:
+                self._mk(d, n)
+            # 帧内容是 B,G,R,pad 四字节一组，2x2 就是 4 组
+            ai.save_frame(d, 44, px_bytes((9, 9, 9)) * 4, 2, 2)
+            left = sorted(ai._frame_no(p) for p in d.glob("auto-*.ppm"))
+            self.assertEqual(left, list(range(21, 45)))
+            # 最后写的那一帧必须在：它是「它停在什么屏幕上」的唯一证据
+            self.assertIn(44, left)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_frame_no_puts_unparseable_last(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            (d / "auto-xyz.ppm").touch()
+            (d / "auto-5.ppm").touch()
+            got = sorted(d.glob("auto-*.ppm"), key=ai._frame_no)
+            self.assertEqual(got[0].name, "auto-5.ppm")
+            self.assertEqual(got[1].name, "auto-xyz.ppm")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestDiskUsed(unittest.TestCase):
