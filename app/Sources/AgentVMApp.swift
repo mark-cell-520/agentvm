@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @main
 struct AgentVMApp: App {

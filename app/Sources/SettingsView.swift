@@ -125,11 +125,13 @@ struct ConfigForm: View {
                     }
                 }
             } header: {
+                // 「只是个起点，下面每一样都能改」这句原来单独占一段 footer。
+                // 实测四段内容加起来 744pt，而这张 sheet 的可视高度只有
+                // 464pt——脚注每多一行，下面就多埋掉一行真设置。
+                // 2026-11-11 用户截图：磁盘大小、登录名、密码整段在可视区外。
+                // 说明性文字改挂 .help()，鼠标停上去照样看得到，不占地方。
                 Text("先选一档")
-            } footer: {
-                Text("只是个起点，下面每一样都能改。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .help("只是个起点，下面每一样都能改。")
             }
 
             Section {
@@ -151,17 +153,14 @@ struct ConfigForm: View {
                                                   set: { state.vmDisk = $0; state.markTuned() })) {
                     ForEach(diskOptions, id: \.self) { Text($0) }
                 }
-                Text("磁盘是稀疏文件，写到了才真占空间，所以给大一点不浪费。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             } header: {
+                // 两段劝告（稀疏盘不占地方、内存 CPU 别贪大）原来都是 footer，
+                // 合计约 80pt 的固定高度，把下面的「账号」段整段顶出可视区。
+                // 内容没删，改成鼠标停在标题上就能看到。
                 Text("硬件")
-            } footer: {
-                Text("内存和 CPU 别贪大。QEMU 的客人机线程是真实线程，占太满会把 "
-                     + "macOS 自己的界面线程挤下去，表象是键盘鼠标失灵。"
-                     + "上面留了 2 GB 给 macOS。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .help("磁盘是稀疏文件，写到了才真占空间，所以给大一点不浪费。\n"
+                        + "内存和 CPU 别贪大：QEMU 的客人机线程是真实线程，占太满会把\n"
+                        + "macOS 自己的界面线程挤下去，表象是键盘鼠标失灵。")
             }
 
             Section {
@@ -192,11 +191,9 @@ struct ConfigForm: View {
                 }
                 Toggle("显示密码", isOn: $state.showPassword)
             } header: {
+                // 同上：脚注改成 .help()，把垂直高度让给真设置。
                 Text("账号")
-            } footer: {
-                Text("SSH 公钥会自动生成并装进虚拟机，所以密码只是备用的登录方式。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .help("SSH 公钥会自动生成并装进虚拟机，所以密码只是备用的登录方式。")
             }
         }
         .formStyle(.grouped)

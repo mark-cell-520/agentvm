@@ -1,6 +1,42 @@
 import SwiftUI
 import AppKit
 
+/// 让承载本视图的 sheet 窗口可以缩放，并且一开始就给够高度。
+///
+/// 为什么必须走 AppKit：**SwiftUI 的 sheet 默认拖不动。** 2026-11-11 实测，
+/// 用 AXSetSize 直接拉新建虚拟机那张 sheet，返回 kAXErrorCannotSetAttributeValue，
+/// 尺寸一动不动；`.frame(minWidth:idealWidth:)` 也只让 sheet 拿到最小尺寸
+/// （760x560），缩放按钮依然不出现。
+///
+/// 而这张 sheet 里的配置表单实测 744pt 高、可视区只有 464pt——磁盘大小、
+/// 登录名、密码整段落在下面 280pt，用户既拖不大窗口、macOS 又把滚动条藏了，
+/// 于是「下面的东西选不了」。用户原话：「无法进行选择，也无法放缩小」。
+///
+/// 能用的只有这一手：找到 sheet 那个 NSWindow，往 styleMask 里塞 .resizable，
+/// 再把初始高度补到内容需要的大小。onAppear 之后窗口已经存在；延后几次是
+/// 为了赶上 sheet 的出场动画（动画中 setContentSize 会被动画盖掉）。
+struct ScalableSheet: ViewModifier {
+    var minHeight: Double = 700
+
+    func body(content: Content) -> some View {
+        content.onAppear {
+            for delay in [0.0, 0.2, 0.5, 1.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    for w in NSApp.windows where w.sheetParent != nil {
+                        if !w.styleMask.contains(.resizable) {
+                            w.styleMask.insert(.resizable)
+                        }
+                        if w.frame.height < minHeight {
+                            w.setContentSize(NSSize(
+                                width: max(w.frame.width, 900), height: minHeight))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 向导的步骤。提到包作用域，好让 AppState 指定「打开时直接停在安装页」。
 enum WizardStep: Int, CaseIterable {
     case pick = 0, config = 1, installing = 2, done = 3
@@ -36,7 +72,12 @@ struct NewVMWizard: View {
             Divider()
             footer
         }
-        .frame(width: 760, height: 560)
+        // minWidth/minHeight 是缩放的下限，也是 ScalableSheet 补尺寸之前
+        // 那一瞬的初始尺寸。真正的「能拖大」靠 ScalableSheet（见文件顶部注释）：
+        // SwiftUI 的 sheet 不会因为给了 idealWidth 就带缩放按钮。
+        .frame(minWidth: 800, idealWidth: 900,
+               minHeight: 640, idealHeight: 700)
+        .modifier(ScalableSheet(minHeight: 720))
     }
 
     // ------------------------------------------------------------ 框架 --
@@ -71,23 +112,45 @@ struct NewVMWizard: View {
 
     @ViewBuilder
     private var footer: some View {
-        HStack {
-            if state.backend.busy {
-                ProgressView().scaleEffect(0.6).frame(width: 18)
-                Text(state.backend.stageLabel).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            // 「开始安装」点不了的时候，必须在这儿说清楚差什么。
+            //
+            // 原来是光把按钮置灰：用户看到的是一颗灰钮、左边一个转圈，
+            // 既不知道该补哪一项，也分不清是自己在等还是 app 卡住了。
+            // 2026-11-11 用户截图报「一直无法安装」，界面零解释。
+            if step == .config, let why = installBlockedReason {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.caption)
+                    Text(why)
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 6)
             }
-            Spacer()
-            if step == .pick {
-                Button("取消") { dismiss() }
-                Button("下一步") { step = .config }
-                    .disabled(state.pickedDistro == nil)
-                    .keyboardShortcut(.defaultAction)
-            } else if step == .config {
-                Button("上一步") { step = .pick }
-                Button("开始安装") { state.startInstall(); step = .installing }
-                    .disabled(!canInstall)
-                    .keyboardShortcut(.defaultAction)
-            } else if step == .installing {
+            HStack {
+                if state.backend.busy {
+                    ProgressView().scaleEffect(0.6).frame(width: 18)
+                    Text(state.backend.stageLabel.isEmpty
+                         ? "后端正在执行上一条命令" : state.backend.stageLabel)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if step == .pick {
+                    Button("取消") { dismiss() }
+                    Button("下一步") { step = .config }
+                        .disabled(state.pickedDistro == nil)
+                        .keyboardShortcut(.defaultAction)
+                } else if step == .config {
+                    Button("上一步") { step = .pick }
+                    Button("开始安装") { state.startInstall(); step = .installing }
+                        .disabled(installBlockedReason != nil)
+                        .keyboardShortcut(.defaultAction)
+                } else if step == .installing {
                 // 安装页必须永远有出口。
                 //
                 // 原来这里只有「停止」一个按钮，而它 .disabled(!busy)：安装失败
@@ -107,9 +170,11 @@ struct NewVMWizard: View {
                 Button("关闭") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 10)
+            .padding(.bottom, 12)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
         .onChange(of: state.installFinished) { _, finished in
             if finished { step = .done }
         }
@@ -124,33 +189,37 @@ struct NewVMWizard: View {
         }
     }
 
-    private var canInstall: Bool {
-        guard let d = state.pickedDistro else { return false }
+    /// 「开始安装」为什么点不了。nil 就是能装。
+    ///
+    /// 原来是把这些判据全塞进 `canInstall` 一个布尔量，置灰之后界面上
+    /// 一个字都不解释。用户对着灰钮完全不知道该补什么——2026-11-11 的
+    /// 原话是「一直无法安装」，而他唯一能看到的线索是页脚一个转圈。
+    /// 现在同一套判据既决定按钮亮不亮，也直接生成给人看的那句话。
+    private var installBlockedReason: String? {
+        if state.backend.busy {
+            return "后端正忙，等它跑完（左边那个转圈停下）再点"
+        }
+        guard state.pickedDistro != nil else { return "先回上一步选一个系统" }
         let name = state.vmName.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return false }
-        // 名字会当目录名和主机名用。判据必须和 vmkit 的 check_vm_name 逐字一致：
-        // 首字符是字母或数字，其余可以是字母、数字、点、- 或 _，总长不超过 63
-        // （见 scripts/vmkit.py 的 _VM_NAME_RE）。
-        //
-        // 原来是 `$0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"`——Swift 的
-        // isLetter 对中文为真，于是「虚拟机」这种名字能过 app 这一关，vmkit 一秒
-        // 后 die 在「名字只能以字母数字开头」上，而错误弹窗显示的却是被覆盖后的
-        // 「安装没起来，没拿到日志路径」。用户在向导里被弹回配置页，既不知道错在
-        // 哪也找不到入口。2026-11-11 审计补上。
-        // （SettingsView 的帮助文字同样写着旧规则，一并改。）
-        let first = name.unicodeScalars.first!
-        let headOK = CharacterSet.alphanumerics.contains(first)
+        if name.isEmpty { return "给虚拟机起个名字" }
+        if !nameOK { return "名字只能以字母或数字开头，其余用字母、数字、. - _，最长 63 个字符" }
+        if state.vmPassword.count < 4 { return "密码至少 4 位，客人机第一次登录要用" }
+        return nil
+    }
+
+    /// 名字合不合法。判据必须和 vmkit 的 check_vm_name 逐字一致：
+    /// 首字符是字母或数字，其余可以是字母、数字、点、- 或 _，总长不超过 63
+    /// （见 scripts/vmkit.py 的 _VM_NAME_RE）。
+    private var nameOK: Bool {
+        let name = state.vmName.trimmingCharacters(in: .whitespaces)
+        guard let first = name.unicodeScalars.first,
+              CharacterSet.alphanumerics.contains(first) else { return false }
         let tailOK = name.unicodeScalars.dropFirst().allSatisfy {
             CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz"
                                      + "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                                      + "0123456789._-").contains($0)
         }
-        let nameOK = headOK && tailOK && name.unicodeScalars.count <= 63
-        // 密码下限。VZMacGuestProvisioningOptions 会校验，太短的话第一次启动
-        // 静默不建账号——界面看不出问题，用户登不进去也不知道为什么。
-        // 在这儿就挡住，比装完 40 分钟才发现强。
-        let pwOK = state.vmPassword.count >= 4
-        return nameOK && pwOK && !state.backend.busy && !d.id.isEmpty
+        return tailOK && name.unicodeScalars.count <= 63
     }
 }
 

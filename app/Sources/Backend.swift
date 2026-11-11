@@ -50,6 +50,58 @@ final class Backend: ObservableObject {
         didSet { DispatchQueue.main.async { self.busy = self.running > 0 } }
     }
 
+    /// 我们起的、还没收到终止通知的子进程 pid。
+    ///
+    /// 为什么单独记一份：`running` 的递减全靠 terminationHandler 和尾随定时器，
+    /// 两条路任一条漏了（handler 没被调用、后一次 tailLog 把前一个定时器覆盖掉），
+    /// running 就永远停在正数。而 busy 是从它派生的，界面上几乎每个按钮都挂着
+    /// `.disabled(state.backend.busy)`——结果是整个 app 灰掉，用户只能强杀。
+    /// 2026-11-11 用户截图正是如此：「开始安装」灰着、页脚一个转圈，
+    /// 而机器上没有任何 vmkit/vmz 进程在跑。
+    private var livePids = Set<Int32>()
+
+    /// busy 的看门狗。见 startBusyWatchdog。
+    private var busyWatchdog: DispatchSourceTimer?
+    private var watchdogStrikes = 0
+
+    init() {
+        startBusyWatchdog()
+    }
+
+    /// 起一条看门狗，专治「busy 永远不灭」。
+    ///
+    /// 判据：busy 为真，但既没有我们起的子进程、也没有在尾随安装日志——
+    /// 那就只能是 running 漏递减了。此时把 running 归零，让界面活过来。
+    ///
+    /// 为什么不更激进（比如给每条命令加超时）：装一个 Windows 要几十分钟，
+    /// 按时间一刀切会把正常安装掐死。而这个判据只认「真的什么都没有」，
+    /// 误伤不了正在跑的安装。
+    private func startBusyWatchdog() {
+        guard busyWatchdog == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        t.schedule(deadline: .now() + 5, repeating: 5)
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.running > 0 else { self.watchdogStrikes = 0; return }
+            // 有活的子进程，或者在尾随一个安装日志：都是正常在跑。
+            if !self.livePids.isEmpty || self.tailTimer != nil {
+                self.watchdogStrikes = 0
+                return
+            }
+            self.watchdogStrikes += 1
+            // 连续两次账目不平才动手，避开「进程刚起、pid 还没登记」那一瞬。
+            guard self.watchdogStrikes >= 2 else { return }
+            self.watchdogStrikes = 0
+            self.running = 0
+            self.livePids.removeAll()
+            self.appendLog(.init(level: "warn",
+                                 text: "后端卡在一个不会结束的状态上，已自动恢复；"
+                                     + "刚才那个操作如果没有跑完，请再点一次。"))
+        }
+        busyWatchdog = t
+        t.resume()
+    }
+
     // ------------------------------------------------------------ 定位 --
 
     /// 虚拟机数据目录，和 vmkit.py 的 ROOT 一致：~/.agentvm/vms。
@@ -169,6 +221,8 @@ final class Backend: ObservableObject {
             DispatchQueue.main.async {
                 outHandle.readabilityHandler = nil
                 errHandle.readabilityHandler = nil
+                // 记账要和 running 同步减，看门狗靠它判断「真的什么都没有」。
+                self?.livePids.remove(p.processIdentifier)
                 self?.running -= 1
                 self?.rawOutput += raw.text
                 if p.terminationStatus != 0 { self?.progress = 0 }
@@ -179,6 +233,7 @@ final class Backend: ObservableObject {
         do {
             try proc.run()
             process = proc
+            livePids.insert(proc.processIdentifier)
             return true
         } catch {
             running -= 1
@@ -304,6 +359,10 @@ final class Backend: ObservableObject {
         proc.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 handle.readabilityHandler = nil
+                // proc 被这个闭包强引用着，取它的 pid 不需要 self；
+                // 但 livePids 在 Backend 上，必须显式写 self.（lint 的
+                // typecheck 会抓这个，见 Makefile 里那段注释。）
+                self?.livePids.remove(proc.processIdentifier)
                 guard let url = logURL, installPid > 0 else {
                     // 连日志路径都没拿到，说明起就没起来
                     self?.running -= 1
@@ -327,6 +386,7 @@ final class Backend: ObservableObject {
         do {
             try proc.run()
             process = proc
+            livePids.insert(proc.processIdentifier)
             return true
         } catch {
             running -= 1
